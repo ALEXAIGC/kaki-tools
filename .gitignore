@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+
+# Local runtime data must never enter source control.
+history.json
+images/
+settings.json

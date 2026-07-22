@@ -1,0 +1,33 @@
+{
+  "name": "kaki-tools",
+  "productName": "Kaki Tools",
+  "version": "0.1.0",
+  "description": "Kaki Tools — 跨平台个人效率小工具,第一个模块:剪贴板历史(Paste 风格)",
+  "author": "openclaw",
+  "main": "main/index.js",
+  "scripts": {
+    "start": "electron .",
+    "icon": "node scripts/gen-app-icon.js",
+    "pack": "electron-builder --mac dir",
+    "dist": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^38.2.0"
+  },
+  "build": {
+    "appId": "com.openclaw.kakitools",
+    "productName": "Kaki Tools",
+    "files": [
+      "main/**",
+      "renderer/**",
+      "package.json"
+    ],
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.productivity"
+    },
+    "win": {
+      "target": "nsis"
+    }
+  }
+}
