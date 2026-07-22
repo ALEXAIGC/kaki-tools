@@ -148,13 +148,10 @@ function render() {
     const index = document.createElement('span')
     index.className = 'card-index'
     index.textContent = String(idx + 1).padStart(2, '0')
-    const type = document.createElement('span')
-    type.className = 'type'
-    type.textContent = (item.pinned ? '固定 · ' : '') + (item.type === 'text' ? '文本' : '图片')
     const time = document.createElement('span')
     time.className = 'time'
     time.textContent = fmtTime(item.createdAt)
-    head.append(index, type, time)
+    head.append(index, time)
 
     const body = document.createElement('div')
     if (item.type === 'text') {

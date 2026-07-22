@@ -33,6 +33,8 @@ No actionable P0, P1, or P2 differences remain.
 - Initial implementation capture: `/tmp/kaki-ui-build-1784683032/01-implementation.png`.
 - Full and focused comparisons confirmed that the generated concept's taller composition had been compressed without hiding controls or changing the main task.
 - No P0/P1/P2 visual corrections were required after the normalized comparison.
+- User-directed category cleanup capture: `/tmp/kaki-ui-category-cleanup-1784683617/01-category-cleanup.png`.
+- Removed the duplicate top type filter and repeated per-card type label. The left library is now the single category navigation surface; cards retain only index, time, content, and metadata.
 
 ## Follow-up Polish
 
