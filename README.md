@@ -129,6 +129,18 @@ npm run deskflow:build
 的 `extraFiles`,最终 `deskflow-core` 会位于 app 的 `Contents/MacOS/` 下并随应用一起签名,
 从而继承 Kaki Tools 的辅助功能授权(与 `kaki-fast-paste` 同一机制)。
 
+### Apple Silicon 与 Intel
+
+构建脚本会自动跟随主机架构(`uname -m`),`deskflow-core`、`kaki-fast-paste` 和
+electron-builder 都会产出**当前架构**的二进制。因此:
+
+- **Apple Silicon (arm64)**:直接 `npm run dist`,产出 `Kaki Tools-*-arm64.dmg`
+- **Intel (x86_64)**:同样直接 `npm run dist`,产出 `Kaki Tools-*-x64.dmg`
+
+在 Intel Mac 上只需先装好工具链(`brew install cmake ninja qt pkgconf`)并
+`git clone` 本仓库 + `~/Downloads/deskflow_repo`,其余和 Apple Silicon 完全一致,
+无需改任何代码。原生二进制不能跨架构通用,所以**每台机器在各自架构上构建**是最省事的方式。
+
 每次功能优化按一次软件更新发布：递增 `package.json` 版本号后运行
 `npm run release:local`。该流程会在覆盖 `/Applications/Kaki Tools.app` 前后校验
 完整代码签名，并把上一版放到应用数据目录的 `updates/` 下作为回退；签名异常时会停止，

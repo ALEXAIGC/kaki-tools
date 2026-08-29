@@ -4,7 +4,14 @@ set -euo pipefail
 # 本机安全更新：先验证构建产物，再复制到临时目录并二次验证；任何签名检查失败都不会覆盖已安装应用。
 app_name='Kaki Tools.app'
 project_root=$(cd "$(dirname "$0")/.." && pwd)
-source_app="$project_root/dist/mac-arm64/$app_name"
+# electron-builder 输出目录带架构后缀：arm64 → mac-arm64，x86_64 → mac-x64。
+arch=$(uname -m)
+case "$arch" in
+  arm64) dist_dir="mac-arm64" ;;
+  x86_64) dist_dir="mac-x64" ;;
+  *) dist_dir="mac" ;;
+esac
+source_app="$project_root/dist/$dist_dir/$app_name"
 installed_app="/Applications/$app_name"
 stage_dir=$(mktemp -d "${TMPDIR:-/tmp}/kaki-tools-update.XXXXXX")
 stage_app="$stage_dir/$app_name"
