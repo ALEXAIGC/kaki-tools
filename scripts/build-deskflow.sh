@@ -15,18 +15,33 @@ built="$build_dir/bin/deskflow-core"
 dev_bin="$project_root/native/bin/deskflow-core"
 bundle_dir="$project_root/native/deskflow"
 identity="${KAKI_IDENTITY:-Kaki Tools Dev}"
+arch=$(uname -m)                       # arm64 / x86_64
+prefix=$(brew --prefix)                # /opt/homebrew (Apple Silicon) or /usr/local (Intel)
 
 [ -d "$repo" ] || { echo "Deskflow 源码目录不存在：$repo(可用 DESKFLOW_REPO 指定)" >&2; exit 1; }
 
+# Older AppleClang (14) does not implement C++20's "down with typename"; deskflow
+# omits `typename` in PriorityQueue.h. Patch it idempotently for local builds.
+pq="$repo/src/lib/base/PriorityQueue.h"
+if [ -f "$pq" ] && ! grep -q "typename Container::value_type" "$pq"; then
+  echo "==> 应用 PriorityQueue.h 的 C++20 兼容补丁(旧 AppleClang)..."
+  /usr/bin/sed -i '' \
+    -e 's/using value_type = Container::value_type;/using value_type = typename Container::value_type;/' \
+    -e 's/using size_type = Container::size_type;/using size_type = typename Container::size_type;/' \
+    -e 's/using iterator = Container::iterator;/using iterator = typename Container::iterator;/' \
+    -e 's/using const_iterator = Container::const_iterator;/using const_iterator = typename Container::const_iterator;/' \
+    "$pq"
+fi
+
 if [ ! -f "$built" ] || [ "${1:-}" = "--rebuild" ]; then
-  echo "==> 配置并编译 deskflow-core..."
+  echo "==> 配置并编译 deskflow-core($arch)..."
   cmake -S "$repo" -B "$build_dir" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_INSTALLER=OFF \
     -DBUILD_OSX_BUNDLE=OFF \
-    -DCMAKE_OSX_ARCHITECTURES=arm64 \
-    -DCMAKE_PREFIX_PATH="/opt/homebrew/opt/qt;/opt/homebrew/opt/openssl@3" \
-    -DOPENSSL_ROOT_DIR="/opt/homebrew/opt/openssl@3"
+    -DCMAKE_OSX_ARCHITECTURES="$arch" \
+    -DCMAKE_PREFIX_PATH="$prefix/opt/qt;$prefix/opt/openssl@3" \
+    -DOPENSSL_ROOT_DIR="$prefix/opt/openssl@3"
   cmake --build "$build_dir" --target deskflow-core
 fi
 
