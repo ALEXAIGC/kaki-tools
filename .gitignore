@@ -7,3 +7,11 @@ dist/
 history.json
 images/
 settings.json
+
+# Compiled / packaged native artifacts (sources like native/kaki-fast-paste.m stay).
+native/bin/
+native/deskflow/
+
+# Legacy top-level entry files — the real entry is main/index.js.
+/index.js
+/app.js

@@ -58,7 +58,6 @@ tell application "System Events"
 end tell`
 
 function setScript(x, y, w, h) {
-  // 尺寸设两次:部分窗口(有最小宽度约束或跨屏时)一次 set size 不完全生效
   return `
 tell application "System Events"
   set p to first application process whose frontmost is true
@@ -139,14 +138,10 @@ function arrange(key, opts = {}) {
         return
       }
       const [px, py, pw, ph] = out.split('|').map(Number)
-      if (![px, py, pw, ph].every(Number.isFinite)) {
-        log('窗口信息解析失败:', out.slice(0, 120))
-        return
-      }
+      if (![px, py, pw, ph].every(Number.isFinite)) return log('窗口信息解析失败:', out.slice(0, 120))
       const display = screen.getDisplayMatching({ x: px, y: py, width: Math.max(pw, 1), height: Math.max(ph, 1) })
-      const t = targetRect(layout.rect, display.workArea)
-      log(`窗口 (${px},${py} ${pw}x${ph}) → 屏幕工作区`, display.workArea, '→ 目标', t)
-      execFile('osascript', ['-e', setScript(t.x, t.y, t.width, t.height)], { timeout: 60000 }, err2 => {
+      const target = targetRect(layout.rect, display.workArea)
+      execFile('osascript', ['-e', setScript(target.x, target.y, target.width, target.height)], { timeout: 60000 }, err2 => {
         if (err2) handleMacError('设置窗口', err2)
         else log('排列完成:', key)
       })

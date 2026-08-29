@@ -1,15 +1,18 @@
 {
   "name": "kaki-tools",
   "productName": "Kaki Tools",
-  "version": "0.1.0",
-  "description": "Kaki Tools — 跨平台个人效率小工具,第一个模块:剪贴板历史(Paste 风格)",
+  "version": "0.8.0",
+  "description": "Kaki Tools — 跨平台个人效率小工具:剪贴板历史、窗口排列、跨屏键鼠协同(Deskflow)",
   "author": "openclaw",
   "main": "main/index.js",
   "scripts": {
-    "start": "electron .",
+    "start": "npm run native:build && electron .",
+    "native:build": "bash scripts/build-native.sh",
+    "deskflow:build": "bash scripts/build-deskflow.sh",
     "icon": "node scripts/gen-app-icon.js",
-    "pack": "electron-builder --mac dir",
-    "dist": "electron-builder"
+    "pack": "npm run native:build && npm run deskflow:build && electron-builder --mac dir",
+    "release:local": "npm run pack && bash scripts/install-local-update.sh",
+    "dist": "npm run native:build && npm run deskflow:build && electron-builder"
   },
   "devDependencies": {
     "electron": "^38.2.0"
@@ -22,12 +25,39 @@
       "renderer/**",
       "package.json"
     ],
+    "extraFiles": [
+      {
+        "from": "native/bin/kaki-fast-paste",
+        "to": "MacOS/kaki-fast-paste"
+      },
+      {
+        "from": "native/deskflow/deskflow-core",
+        "to": "MacOS/deskflow-core"
+      },
+      {
+        "from": "native/deskflow/Frameworks",
+        "to": "Frameworks"
+      },
+      {
+        "from": "native/deskflow/PlugIns",
+        "to": "PlugIns"
+      },
+      {
+        "from": "native/deskflow/qt.conf",
+        "to": "Resources/qt.conf"
+      }
+    ],
     "mac": {
       "target": "dmg",
+      "identity": "Kaki Tools Dev",
+      "timestamp": "none",
       "category": "public.app-category.productivity"
     },
     "win": {
       "target": "nsis"
     }
+  },
+  "dependencies": {
+    "lucide": "^1.35.0"
   }
 }

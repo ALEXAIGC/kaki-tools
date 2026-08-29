@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self'">
+  <title>Kaki Tools 设置</title>
+  <link rel="stylesheet" href="settings.css">
+</head>
+<body>
+  <main>
+    <header><span class="eyebrow">KAKI TOOLS</span><h1>设置</h1><p>快捷键冲突时不会覆盖 macOS 或其他应用，请选择新的组合。</p></header>
+
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-tab="clipboard" role="tab">剪贴板</button>
+      <button class="tab" data-tab="kvm" role="tab">跨屏协同</button>
+    </nav>
+
+    <div class="tab-panel active" id="panel-clipboard">
+      <section aria-labelledby="shortcuts-title">
+        <div class="section-title"><h2 id="shortcuts-title">快捷键</h2><span>点击快捷键框，再按一次组合键</span></div>
+        <label><span>呼出剪贴板</span><input id="panel-hotkey" readonly aria-label="呼出剪贴板快捷键"></label>
+        <label><span>区域截图</span><input id="screenshot-hotkey" readonly aria-label="区域截图快捷键"></label>
+        <p class="hint">区域截图使用 macOS 原生选区；完成后图片会自动保存到剪贴板历史。</p>
+        <button id="save" class="primary">保存快捷键</button>
+      </section>
+      <section aria-labelledby="history-title">
+        <div class="section-title"><h2 id="history-title">本地历史</h2><span id="history-limit">普通历史保留最近 500 条</span></div>
+        <button id="clear-history" class="secondary">清空普通历史</button>
+        <p class="hint">固定项会一同清空；收藏标签页中的内容会保留。</p>
+      </section>
+    </div>
+
+    <div class="tab-panel" id="panel-kvm">
+      <section aria-labelledby="desklink-title">
+        <div class="section-title"><h2 id="desklink-title">跨屏协同 · Mac ↔ Mac</h2><span id="desklink-state">未连接</span></div>
+        <p class="hint">基于 Deskflow。两台 Mac 都装 Kaki Tools、都在「辅助功能」里授权。把鼠标滑到主控屏幕右边缘即切到另一台，反向滑回左边缘切回。</p>
+
+        <div class="role-block">
+          <h3>本机作为主机（控制另一台）</h3>
+          <p class="hint">点「开启主机」，把地址和指纹发给另一台即可，无需填写对方信息。</p>
+          <div class="desklink-actions"><button id="desklink-host" class="primary">开启主机</button><button id="desklink-stop" class="secondary">停止</button></div>
+          <div id="desklink-host-info" class="desklink-info" hidden>
+            <div class="info-row"><span>主机地址</span><code id="host-addr">—</code><button class="mini" data-copy="host-addr">复制</button></div>
+            <div class="info-row"><span>主机指纹</span><code id="host-fp">—</code><button class="mini" data-copy="host-fp">复制</button></div>
+          </div>
+        </div>
+
+        <div class="role-block">
+          <h3>本机作为客户端（被另一台控制）</h3>
+          <label><span>主机地址</span><input id="desklink-hostname" placeholder="从主机复制" aria-label="主机地址"></label>
+          <label><span>主机指纹</span><input id="desklink-fingerprint" placeholder="从主机复制" aria-label="主机指纹"></label>
+          <div class="desklink-actions"><button id="desklink-connect" class="primary">连接另一台 Mac</button></div>
+        </div>
+
+        <p class="hint">端口默认 24800（已自动配置）。指纹用于加密连接并防止中间人攻击。主机端会自动接受同一局域网内前来连接的客户端。</p>
+      </section>
+    </div>
+
+    <div id="status" role="status" aria-live="polite"></div>
+  </main>
+  <script src="settings.js"></script>
+</body>
+</html>

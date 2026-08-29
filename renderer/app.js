@@ -8,6 +8,12 @@ const actionPaste = document.getElementById('action-paste')
 const actionPlain = document.getElementById('action-plain')
 const actionPin = document.getElementById('action-pin')
 const actionDelete = document.getElementById('action-delete')
+const quitButton = document.getElementById('quit-app')
+const themeButtons = Array.from(document.querySelectorAll('[data-theme-value]'))
+const systemTheme = matchMedia('(prefers-color-scheme: light)')
+const thumbnailCache = new Map()
+const initialCardLimit = 80
+const cardBatchSize = 60
 
 let items = []
 let boards = []
@@ -15,9 +21,42 @@ let query = ''
 let filter = 'all'        // all | text | image | pinned
 let tab = 'history'       // history | 标签页名
 let sel = 0
+let visibleLimit = initialCardLimit
 
 const isMac = navigator.platform.toUpperCase().includes('MAC')
 const modLabel = isMac ? '⌘' : 'Ctrl+'
+
+window.addEventListener('error', event => {
+  window.kaki.diagnostic(`error: ${event.message} @ ${event.filename}:${event.lineno}`)
+})
+window.addEventListener('unhandledrejection', event => {
+  window.kaki.diagnostic(`unhandled rejection: ${String(event.reason)}`)
+})
+
+function applyTheme(preference, persist = true) {
+  const theme = ['system', 'light', 'dark'].includes(preference) ? preference : 'system'
+  const resolved = theme === 'system' ? (systemTheme.matches ? 'light' : 'dark') : theme
+  document.documentElement.dataset.themePreference = theme
+  document.documentElement.dataset.theme = resolved
+  document.documentElement.style.colorScheme = resolved
+  if (persist) localStorage.setItem('kaki-theme', theme)
+  themeButtons.forEach(button => {
+    const active = button.dataset.themeValue === theme
+    button.classList.toggle('active', active)
+    button.setAttribute('aria-pressed', String(active))
+  })
+}
+
+themeButtons.forEach(button => {
+  button.onclick = () => {
+    applyTheme(button.dataset.themeValue)
+    searchEl.focus()
+  }
+})
+systemTheme.addEventListener('change', () => {
+  if (document.documentElement.dataset.themePreference === 'system') applyTheme('system', false)
+})
+applyTheme(document.documentElement.dataset.themePreference || 'system', false)
 
 function fmtTime(ts) {
   const mins = Math.floor((Date.now() - ts) / 60000)
@@ -39,8 +78,8 @@ function filtered() {
     if (filter === 'text' && i.type !== 'text') return false
     if (filter === 'image' && i.type !== 'image') return false
     if (q) {
-      if (i.type !== 'text') return false
-      return i.text.toLowerCase().includes(q)
+      const searchable = [i.type === 'text' ? i.text : '', ...(i.tags || []), i.note || ''].join(' ').toLowerCase()
+      return searchable.includes(q)
     }
     return true
   })
@@ -50,8 +89,17 @@ function renderTabs() {
   tabsEl.textContent = ''
   const mk = (label, id, isBoard) => {
     const b = document.createElement('button')
-    b.className = 'tab' + (tab === id ? ' active' : '')
-    b.textContent = label
+    b.className = 'tab' + (tab === id ? ' active' : '') + (id === 'history' ? ' tab-history' : '')
+    if (id === 'history') {
+      const icon = document.createElement('i')
+      icon.dataset.lucide = 'clipboard'
+      icon.setAttribute('aria-hidden', 'true')
+      b.append(icon)
+    }
+    const text = document.createElement('span')
+    text.className = 'tab-label'
+    text.textContent = label
+    b.append(text)
     b.onclick = () => { tab = id; sel = 0; render(); searchEl.focus() }
     if (isBoard) b.oncontextmenu = e => { e.preventDefault(); window.kaki.boardContext(id) }
     tabsEl.append(b)
@@ -60,18 +108,31 @@ function renderTabs() {
   for (const b of boards) mk(b, b, true)
   const add = document.createElement('button')
   add.className = 'tab tab-add'
-  add.textContent = '＋'
+  add.setAttribute('aria-label', '新建标签页')
+  const addIcon = document.createElement('i')
+  addIcon.dataset.lucide = 'plus'
+  addIcon.setAttribute('aria-hidden', 'true')
+  add.append(addIcon)
   add.title = '新建标签页'
   add.onclick = () => showBoardPrompt({ mode: 'create' })
   tabsEl.append(add)
 }
 
 function updateSel() {
-  Array.from(cardsEl.children).forEach((el, i) => el.classList.toggle('selected', i === sel))
+  Array.from(cardsEl.children).forEach((el, i) => {
+    const selected = i === sel
+    el.classList.toggle('selected', selected)
+    el.setAttribute('aria-selected', String(selected))
+    el.tabIndex = selected ? 0 : -1
+  })
   updateActionbar(filtered())
 }
 
 function ensureVisible() {
+  if (sel >= visibleLimit) {
+    visibleLimit = Math.min(sel + cardBatchSize, filtered().length)
+    render()
+  }
   const el = cardsEl.children[sel]
   if (el) el.scrollIntoView({ inline: 'nearest', block: 'nearest' })
 }
@@ -129,10 +190,11 @@ function render() {
   // 标签页可能被删除,回退到剪贴板
   if (tab !== 'history' && !boards.includes(tab)) tab = 'history'
   renderTabs()
-  const list = filtered()
+  const fullList = filtered()
+  const list = fullList.slice(0, visibleLimit)
   syncFilters()
   updateCounts()
-  if (sel >= list.length) sel = Math.max(0, list.length - 1)
+  if (sel >= fullList.length) sel = Math.max(0, fullList.length - 1)
   cardsEl.textContent = ''
   emptyEl.hidden = list.length > 0
   emptyEl.textContent = tab === 'history'
@@ -142,6 +204,10 @@ function render() {
   list.forEach((item, idx) => {
     const card = document.createElement('div')
     card.className = 'card' + (idx === sel ? ' selected' : '') + (item.pinned ? ' pinned' : '') + (item.type === 'image' ? ' image-card' : '')
+    card.setAttribute('role', 'option')
+    card.setAttribute('aria-selected', String(idx === sel))
+    card.setAttribute('aria-label', item.type === 'text' ? `剪贴板条目 ${idx + 1}: ${item.text.slice(0, 120)}` : `剪贴板图片 ${idx + 1}, ${item.size.width} × ${item.size.height}`)
+    card.tabIndex = idx === sel ? 0 : -1
 
     const head = document.createElement('div')
     head.className = 'card-head'
@@ -160,7 +226,17 @@ function render() {
     } else {
       body.className = 'card-body img'
       const img = document.createElement('img')
-      img.src = item.thumb
+      img.alt = '剪贴板图片预览'
+      const cached = thumbnailCache.get(item.id)
+      if (cached) {
+        img.src = cached
+      } else {
+        window.kaki.getThumbnail(item.id).then(thumb => {
+          if (!thumb) return
+          thumbnailCache.set(item.id, thumb)
+          if (img.isConnected) img.src = thumb
+        }).catch(() => {})
+      }
       body.append(img)
     }
 
@@ -183,32 +259,74 @@ function render() {
       foot.textContent = meta
     }
 
+    let annotation = null
+    if ((item.tags && item.tags.length) || item.note) {
+      annotation = document.createElement('div')
+      annotation.className = 'card-annotation'
+      if (item.tags && item.tags.length) {
+        const tags = document.createElement('div')
+        tags.className = 'tag-list'
+        item.tags.slice(0, 3).forEach(tag => {
+          const chip = document.createElement('span')
+          chip.className = 'tag-chip'
+          chip.textContent = tag
+          tags.append(chip)
+        })
+        if (item.tags.length > 3) {
+          const extra = document.createElement('span')
+          extra.className = 'tag-chip tag-extra'
+          extra.textContent = `+${item.tags.length - 3}`
+          tags.append(extra)
+        }
+        annotation.append(tags)
+      }
+      if (item.note) {
+        const note = document.createElement('div')
+        note.className = 'card-note'
+        note.textContent = item.note.replace(/\s+/g, ' ')
+        annotation.append(note)
+      }
+    }
+
     const actions = document.createElement('div')
     actions.className = 'card-actions'
+    const metadataBtn = document.createElement('button')
+    const metadataIcon = document.createElement('i')
+    metadataIcon.dataset.lucide = 'tag'
+    metadataBtn.append(metadataIcon)
+    metadataBtn.title = '标签与备注'
+    metadataBtn.setAttribute('aria-label', metadataBtn.title)
+    metadataBtn.onclick = e => { e.stopPropagation(); showItemMetadata(item) }
+    actions.append(metadataBtn)
     if (!item.board) {
       const pinBtn = document.createElement('button')
       const pinIcon = document.createElement('i')
-      pinIcon.className = 'ph ' + (item.pinned ? 'ph-push-pin-slash' : 'ph-push-pin')
+      pinIcon.dataset.lucide = item.pinned ? 'pin-off' : 'pin'
       pinBtn.append(pinIcon)
       pinBtn.title = item.pinned ? '取消固定' : '固定'
+      pinBtn.setAttribute('aria-label', pinBtn.title)
       pinBtn.onclick = e => { e.stopPropagation(); window.kaki.togglePin(item.id) }
       actions.append(pinBtn)
     }
     const delBtn = document.createElement('button')
     const delIcon = document.createElement('i')
-    delIcon.className = 'ph ph-trash'
+    delIcon.dataset.lucide = 'trash-2'
     delBtn.append(delIcon)
     delBtn.title = item.board ? '从标签页移除' : '删除'
+    delBtn.setAttribute('aria-label', delBtn.title)
+    delBtn.className = 'card-delete'
     delBtn.onclick = e => { e.stopPropagation(); window.kaki.remove(item.id) }
     actions.append(delBtn)
 
-    card.append(head, body, foot, actions)
+    card.append(head, body, ...(annotation ? [annotation] : []), foot, actions)
     card.onclick = e => activate(item, e.shiftKey)
     card.oncontextmenu = e => { e.preventDefault(); window.kaki.itemContext(item.id, item.board) }
     card.onmouseenter = () => { sel = idx; updateSel() }
+    card.onfocus = () => { sel = idx; updateSel() }
     cardsEl.append(card)
   })
-  updateActionbar(list)
+  updateActionbar(fullList)
+  lucide.createIcons()
 }
 
 // ---- 新建 / 重命名标签页弹层 ----
@@ -252,9 +370,44 @@ document.getElementById('board-prompt-cancel').onclick = closeBoardPrompt
 
 window.kaki.onBoardPrompt(ctx => showBoardPrompt(ctx))
 
+// ---- 单条记录的标签与备注 ----
+const metadataEl = document.getElementById('item-metadata')
+const metadataForm = document.getElementById('item-metadata-box')
+const tagsInput = document.getElementById('item-tags')
+const noteInput = document.getElementById('item-note')
+let metadataItemId = null
+
+function showItemMetadata(item) {
+  metadataItemId = item.id
+  tagsInput.value = (item.tags || []).join('，')
+  noteInput.value = item.note || ''
+  metadataEl.hidden = false
+  lucide.createIcons()
+  tagsInput.focus()
+}
+function closeItemMetadata() {
+  metadataEl.hidden = true
+  metadataItemId = null
+  searchEl.focus()
+}
+metadataForm.addEventListener('submit', event => {
+  event.preventDefault()
+  if (!metadataItemId) return closeItemMetadata()
+  const tags = tagsInput.value.split(/[,，]/).map(tag => tag.trim()).filter(Boolean)
+  window.kaki.updateMetadata({ id: metadataItemId, tags, note: noteInput.value })
+  closeItemMetadata()
+})
+metadataEl.addEventListener('keydown', event => {
+  if (event.key === 'Escape') { event.preventDefault(); closeItemMetadata() }
+})
+metadataEl.onclick = event => { if (event.target === metadataEl) closeItemMetadata() }
+document.getElementById('item-metadata-close').onclick = closeItemMetadata
+document.getElementById('item-metadata-cancel').onclick = closeItemMetadata
+window.kaki.onItemMetadata(showItemMetadata)
+
 // ---- 键盘 ----
 window.addEventListener('keydown', e => {
-  if (!promptEl.hidden) return // 弹层打开时不响应面板快捷键
+  if (!promptEl.hidden || !metadataEl.hidden) return // 弹层打开时不响应面板快捷键
   if (e.key === 'Escape') { window.kaki.hide(); return }
   const list = filtered()
   const item = selectedItem(list)
@@ -262,6 +415,11 @@ window.addEventListener('keydown', e => {
     e.preventDefault()
     searchEl.focus()
     searchEl.select()
+    return
+  }
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'q') {
+    e.preventDefault()
+    window.kaki.quit()
     return
   }
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'p' && item) {
@@ -295,6 +453,7 @@ window.addEventListener('keydown', e => {
 searchEl.addEventListener('input', () => {
   query = searchEl.value
   sel = 0
+  visibleLimit = initialCardLimit
   render()
 })
 
@@ -302,6 +461,7 @@ document.querySelectorAll('[data-f]').forEach(control => {
   control.onclick = () => {
     filter = control.dataset.f
     sel = 0
+    visibleLimit = initialCardLimit
     render()
     searchEl.focus()
   }
@@ -323,6 +483,7 @@ actionDelete.onclick = () => {
   const item = selectedItem()
   if (item) window.kaki.remove(item.id)
 }
+quitButton.onclick = () => window.kaki.quit()
 
 // 鼠标滚轮纵向滚动 → 卡片区横向滚动
 cardsEl.addEventListener('wheel', e => {
@@ -332,9 +493,26 @@ cardsEl.addEventListener('wheel', e => {
   }
 }, { passive: false })
 
+// 横向滚到尾部时再追加一批卡片，避免大历史记录首次打开造成长时间白屏。
+cardsEl.addEventListener('scroll', () => {
+  const fullList = filtered()
+  const atEnd = cardsEl.scrollLeft + cardsEl.clientWidth >= cardsEl.scrollWidth - 80
+  if (atEnd && visibleLimit < fullList.length) {
+    visibleLimit = Math.min(visibleLimit + cardBatchSize, fullList.length)
+    render()
+  }
+}, { passive: true })
+
 function applyData(data) {
-  items = data.items || []
+  const nextItems = data.items || []
+  const activeImageIds = new Set(nextItems.filter(item => item.type === 'image').map(item => item.id))
+  for (const id of thumbnailCache.keys()) {
+    if (!activeImageIds.has(id)) thumbnailCache.delete(id)
+  }
+  items = nextItems
   boards = data.boards || []
+  // 保留已加载的缩略图和当前卡片批次；后台新增一条历史不应让可见图片重新走 IPC。
+  visibleLimit = Math.max(initialCardLimit, Math.min(visibleLimit, items.length || initialCardLimit))
   render()
 }
 
