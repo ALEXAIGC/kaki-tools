@@ -1,7 +1,7 @@
 {
   "name": "kaki-tools",
   "productName": "Kaki Tools",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Kaki Tools — 跨平台个人效率小工具:剪贴板历史、窗口排列、跨屏键鼠协同(Deskflow)",
   "author": "openclaw",
   "main": "main/index.js",

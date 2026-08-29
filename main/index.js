@@ -921,9 +921,9 @@ if (!gotLock) {
     deskflowCore?.stop()
     return { ok: true, state: deskflowCore?.status() }
   })
-  ipcMain.handle('desklink:set-direction', (_e, payload) => {
+  ipcMain.handle('desklink:set-layout', (_e, payload) => {
     try {
-      deskflowCore.setClientDirection(payload?.name, payload?.direction)
+      deskflowCore.setLayout(payload?.name, payload?.col, payload?.row)
       return { ok: true, state: deskflowCore.status() }
     } catch (error) { return { ok: false, message: error.message } }
   })

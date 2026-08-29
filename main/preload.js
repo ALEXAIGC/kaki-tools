@@ -15,7 +15,7 @@ contextBridge.exposeInMainWorld('kaki', {
   desklinkHost: payload => ipcRenderer.invoke('desklink:host', payload || {}),
   desklinkConnect: payload => ipcRenderer.invoke('desklink:connect', payload || {}),
   desklinkStop: () => ipcRenderer.invoke('desklink:stop'),
-  desklinkSetDirection: (name, direction) => ipcRenderer.invoke('desklink:set-direction', { name, direction }),
+  desklinkSetLayout: (name, col, row) => ipcRenderer.invoke('desklink:set-layout', { name, col, row }),
   copyText: text => ipcRenderer.invoke('clipboard:write', String(text ?? '')),
   onDesklinkStatus: cb => ipcRenderer.on('desklink:status', (_e, value) => cb(value)),
   onDesklinkError: cb => ipcRenderer.on('desklink:error', (_e, value) => cb(value)),

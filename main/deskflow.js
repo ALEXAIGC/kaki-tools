@@ -22,6 +22,12 @@ const path = require('path')
 const { execFileSync, spawn } = require('child_process')
 
 const DEFAULT_PORT = 24800
+// Deskflow's default grid: 5 columns x 3 rows. Each screen occupies one cell;
+// only directly-adjacent cells produce links. The host defaults to the center
+// (index 7 in Deskflow's own GUI).
+const GRID_COLS = 5
+const GRID_ROWS = 3
+const HOST_DEFAULT_POS = { col: 2, row: 1 }
 
 // Mirror Deskflow's Settings::cleanComputerName so the `core/computerName`
 // value always matches the name Deskflow derives from the host, and therefore
@@ -74,7 +80,7 @@ class DeskflowCore extends EventEmitter {
     this.lastError = null
     this._stdoutBuffer = ''
     this._stderrBuffer = ''
-    this._acceptedClients = new Map()
+    this._layout = new Map()
     this._restarting = false
   }
 
@@ -122,7 +128,7 @@ class DeskflowCore extends EventEmitter {
       fingerprint: this.identity().display,
       addresses: localAddresses(),
       peer: this.peer,
-      clients: [...this._acceptedClients].map(([name, direction]) => ({ name, direction })),
+      layout: Object.fromEntries(this._layout),
       running: !!this.child,
       error: this.lastError,
     }
@@ -140,42 +146,75 @@ class DeskflowCore extends EventEmitter {
     fs.writeFileSync(this._serverConfigFile(), text, 'utf8')
   }
 
-  // Build the text server config for the host plus the accepted clients, each
-  // placed in one of four directions relative to this Mac. Multiple clients on
-  // the same side split that edge into equal segments, so e.g. three clients on
-  // the right stack vertically along the host's right edge. Regenerating the
-  // whole file keeps the parser happy and makes layout changes trivial.
-  _serverConfigFor(clients) {
-    const OPPOSITE = { left: 'right', right: 'left', up: 'down', down: 'up' }
-    const DIRS = ['left', 'right', 'up', 'down']
-    const byDir = { left: [], right: [], up: [], down: [] }
-    for (const [name, dir] of clients) {
-      if (byDir[dir]) byDir[dir].push(name)
+  _layoutFile() { return path.join(this._dir(), 'layout.json') }
+
+  _loadLayout() {
+    this._layout = new Map()
+    try {
+      const data = JSON.parse(fs.readFileSync(this._layoutFile(), 'utf8'))
+      for (const [name, pos] of Object.entries(data || {})) {
+        if (pos && Number.isInteger(pos.col) && Number.isInteger(pos.row)) {
+          this._layout.set(cleanComputerName(name), { col: pos.col, row: pos.row })
+        }
+      }
+    } catch {}
+    // The host must always have a position; default to the grid center.
+    if (!this._layout.has(this.deviceName)) {
+      this._layout.set(this.deviceName, { ...HOST_DEFAULT_POS })
+    }
+  }
+
+  _saveLayout() {
+    fs.mkdirSync(this._dir(), { recursive: true })
+    fs.writeFileSync(this._layoutFile(), JSON.stringify(Object.fromEntries(this._layout), null, 2), 'utf8')
+  }
+
+  // First free cell, searching outward from the host by Manhattan distance.
+  _freeCell() {
+    const occupied = new Set()
+    for (const pos of this._layout.values()) {
+      occupied.add(pos.row * GRID_COLS + pos.col)
+    }
+    const host = this._layout.get(this.deviceName) || HOST_DEFAULT_POS
+    for (let d = 0; d < GRID_COLS + GRID_ROWS; d++) {
+      for (let row = 0; row < GRID_ROWS; row++) {
+        for (let col = 0; col < GRID_COLS; col++) {
+          if (Math.abs(col - host.col) + Math.abs(row - host.row) === d && !occupied.has(row * GRID_COLS + col)) {
+            return { col, row }
+          }
+        }
+      }
+    }
+    return null
+  }
+
+  // Build Deskflow's text server config from a grid layout (Map<name, {col,row}>).
+  // This mirrors ServerConfig::operator<< / adjacentScreenIndex: only cells that
+  // are directly adjacent horizontally or vertically produce a link.
+  _serverConfigFor(layout) {
+    const grid = new Array(GRID_COLS * GRID_ROWS).fill(null)
+    for (const [name, pos] of layout) {
+      if (pos.col >= 0 && pos.col < GRID_COLS && pos.row >= 0 && pos.row < GRID_ROWS) {
+        grid[pos.row * GRID_COLS + pos.col] = name
+      }
     }
 
     const lines = [
       '# Kaki Tools generated Deskflow server config',
       'section: screens',
-      `\t${this.deviceName}:`,
     ]
-    for (const name of clients.keys()) lines.push(`\t${name}:`)
-    lines.push('end', 'section: links', `\t${this.deviceName}:`)
-    for (const dir of DIRS) {
-      const list = byDir[dir]
-      if (!list.length) continue
-      if (list.length === 1) {
-        lines.push(`\t\t${dir} = ${list[0]}`)
-      } else {
-        const n = list.length
-        for (let i = 0; i < n; i++) {
-          const start = Math.round((i * 100) / n)
-          const end = Math.round(((i + 1) * 100) / n)
-          lines.push(`\t\t${dir}(${start},${end}) = ${list[i]}`)
-        }
+    for (const name of layout.keys()) lines.push(`\t${name}:`)
+    lines.push('end', 'section: links')
+    const dirs = [[1, 0, 'right'], [-1, 0, 'left'], [0, -1, 'up'], [0, 1, 'down']]
+    for (const [name, pos] of layout) {
+      lines.push(`\t${name}:`)
+      for (const [dc, dr, dirName] of dirs) {
+        const nc = pos.col + dc
+        const nr = pos.row + dr
+        if (nc < 0 || nc >= GRID_COLS || nr < 0 || nr >= GRID_ROWS) continue
+        const neighbor = grid[nr * GRID_COLS + nc]
+        if (neighbor && neighbor !== name) lines.push(`\t\t${dirName} = ${neighbor}`)
       }
-    }
-    for (const [name, dir] of clients) {
-      lines.push(`\t${name}:`, `\t\t${OPPOSITE[dir] || 'left'} = ${this.deviceName}`)
     }
     lines.push('end', '')
     return lines.join('\n')
@@ -187,13 +226,13 @@ class DeskflowCore extends EventEmitter {
     this.port = clampPort(port)
     this.host = null
     this.lastError = null
-    this._acceptedClients = new Map()
+    this._loadLayout()
     const ident = this.identity()
 
-    // Start with only this Mac in the config. Clients are accepted on demand:
-    // when an unknown client tries to join we append it below and restart the
-    // core, so the user never has to type the peer's name.
-    this._writeServerConfig(this._serverConfigFor(new Map()))
+    // The config declares the host plus every known client (persisted from the
+    // previous session). Unknown clients are appended on demand and restart the
+    // core, so the user never has to type a peer's name.
+    this._writeServerConfig(this._serverConfigFor(this._layout))
 
     // Server settings. `checkPeerFingerprints=false` keeps the wire encrypted
     // (TLS) but does not reject unknown clients headlessly; the client side
@@ -222,17 +261,21 @@ class DeskflowCore extends EventEmitter {
     return this.status()
   }
 
-  // A client announced a name the server config does not know yet. Append it
-  // as a right-hand neighbour and restart the core so it picks up the new
-  // config. (Deskflow's SIGHUP reload is unreliable in headless mode: its
-  // signal thread blocks SIGHUP on the worker thread but not the main thread,
-  // so the process tends to die instead of reloading. A graceful restart is
-  // harmless here because the unknown client is already retrying its connect.)
+  // A client announced a name the server config does not know yet. Give it the
+  // nearest free cell (or keep its persisted position) and restart the core so
+  // it picks up the new config. (Deskflow's SIGHUP reload is unreliable in
+  // headless mode, so we restart gracefully; the unknown client is already
+  // retrying its connect.)
   _addClientToConfig(clientName) {
     const clean = cleanComputerName(clientName)
-    if (!clean || this._acceptedClients.has(clean)) return
-    this._acceptedClients.set(clean, 'right')
-    this._writeServerConfig(this._serverConfigFor(this._acceptedClients))
+    if (!clean) return
+    if (!this._layout.has(clean)) {
+      const cell = this._freeCell()
+      if (!cell) return
+      this._layout.set(clean, cell)
+      this._saveLayout()
+    }
+    this._writeServerConfig(this._serverConfigFor(this._layout))
     this.lastError = null
 
     this._restarting = true
@@ -245,14 +288,22 @@ class DeskflowCore extends EventEmitter {
     this._emitStatus()
   }
 
-  // Re-place an already-accepted client relative to the host and restart the
-  // core so the new layout takes effect.
-  setClientDirection(name, direction) {
+  // Move a screen (the host or a client) to a new grid cell, persist it, and
+  // restart the core so the new layout takes effect.
+  setLayout(name, col, row) {
     const clean = cleanComputerName(name)
-    if (!clean || !this._acceptedClients.has(clean)) return false
-    const dir = ['left', 'right', 'up', 'down'].includes(direction) ? direction : 'right'
-    this._acceptedClients.set(clean, dir)
-    this._writeServerConfig(this._serverConfigFor(this._acceptedClients))
+    if (!clean || !this._layout.has(clean)) return false
+    const c = Math.trunc(Number(col))
+    const r = Math.trunc(Number(row))
+    if (c < 0 || c >= GRID_COLS || r < 0 || r >= GRID_ROWS) return false
+    // Two screens cannot share a cell; reject an occupied target unless it is
+    // the screen's own current cell.
+    for (const [other, pos] of this._layout) {
+      if (other !== clean && pos.col === c && pos.row === r) return false
+    }
+    this._layout.set(clean, { col: c, row: r })
+    this._saveLayout()
+    this._writeServerConfig(this._serverConfigFor(this._layout))
     this.lastError = null
 
     this._restarting = true
@@ -415,7 +466,6 @@ class DeskflowCore extends EventEmitter {
     this.host = null
     this.peer = null
     this.lastError = null
-    this._acceptedClients = new Map()
     this._restarting = false
     if (child && !child.killed) {
       try { child.kill('SIGTERM') } catch {}

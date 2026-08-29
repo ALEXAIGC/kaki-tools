@@ -6,9 +6,10 @@ const deskState = document.getElementById('desklink-state')
 const hostInfo = document.getElementById('desklink-host-info')
 const hostAddr = document.getElementById('host-addr')
 const hostFp = document.getElementById('host-fp')
-const clientsBox = document.getElementById('desklink-clients')
-const clientsList = document.getElementById('desklink-clients-list')
-const DIR_LABELS = { left: '左', right: '右', up: '上', down: '下' }
+const gridBox = document.getElementById('desklink-grid-box')
+const gridEl = document.getElementById('desklink-grid')
+const GRID_COLS = 5
+const GRID_ROWS = 3
 
 // 标签页切换
 const tabs = Array.from(document.querySelectorAll('.tab'))
@@ -33,32 +34,59 @@ for (const btn of document.querySelectorAll('.mini[data-copy]')) {
   }
 }
 
-function renderClients(clients) {
-  const list = Array.isArray(clients) ? clients : []
-  clientsBox.hidden = list.length === 0
-  clientsList.innerHTML = ''
-  for (const client of list) {
-    const row = document.createElement('div')
-    row.className = 'client-row'
-    const name = document.createElement('span')
-    name.className = 'client-name'
-    name.textContent = client.name
-    row.appendChild(name)
-    const btns = document.createElement('div')
-    btns.className = 'dir-btns'
-    for (const dir of ['left', 'right', 'up', 'down']) {
-      const b = document.createElement('button')
-      b.className = 'dir-btn' + (client.direction === dir ? ' active' : '')
-      b.textContent = DIR_LABELS[dir]
-      b.onclick = async () => {
-        const result = await window.kaki.desklinkSetDirection(client.name, dir)
-        if (result.ok) renderDesklink(result.state)
-        else setStatus(result.message, 'error')
-      }
-      btns.appendChild(b)
+function displayName(name) {
+  const short = String(name || '').replace(/\.local$/i, '')
+  return short.length > 14 ? short.slice(0, 13) + '…' : short
+}
+
+function renderGrid(layout, deviceName) {
+  const entries = Object.entries(layout || {})
+  gridBox.hidden = entries.length === 0
+  gridEl.innerHTML = ''
+  gridEl.style.gridTemplateColumns = `repeat(${GRID_COLS}, 1fr)`
+
+  const cellName = {}
+  for (const [name, pos] of entries) {
+    if (pos && pos.col >= 0 && pos.col < GRID_COLS && pos.row >= 0 && pos.row < GRID_ROWS) {
+      cellName[pos.row * GRID_COLS + pos.col] = name
     }
-    row.appendChild(btns)
-    clientsList.appendChild(row)
+  }
+
+  for (let row = 0; row < GRID_ROWS; row++) {
+    for (let col = 0; col < GRID_COLS; col++) {
+      const cell = document.createElement('div')
+      cell.className = 'grid-cell'
+      cell.dataset.col = col
+      cell.dataset.row = row
+      const name = cellName[row * GRID_COLS + col]
+      if (name) {
+        cell.classList.add('occupied')
+        if (name === deviceName) cell.classList.add('host')
+        cell.textContent = name === deviceName ? '本机' : displayName(name)
+        cell.title = name
+        cell.draggable = true
+        cell.addEventListener('dragstart', e => {
+          e.dataTransfer.setData('text/plain', name)
+          e.dataTransfer.effectAllowed = 'move'
+        })
+      }
+      cell.addEventListener('dragover', e => {
+        e.preventDefault()
+        e.dataTransfer.dropEffect = 'move'
+        cell.classList.add('drag-over')
+      })
+      cell.addEventListener('dragleave', () => cell.classList.remove('drag-over'))
+      cell.addEventListener('drop', async e => {
+        e.preventDefault()
+        cell.classList.remove('drag-over')
+        const name = e.dataTransfer.getData('text/plain')
+        if (!name) return
+        const result = await window.kaki.desklinkSetLayout(name, col, row)
+        if (result.ok) renderDesklink(result.state)
+        else setStatus(result.message || '无法移动到该位置', 'error')
+      })
+      gridEl.appendChild(cell)
+    }
   }
 }
 
@@ -72,7 +100,7 @@ function renderDesklink(value) {
     hostAddr.textContent = preferred ? preferred.address : '未找到局域网地址'
     hostFp.textContent = value.fingerprint || '—'
   }
-  renderClients(value.clients)
+  renderGrid(value.layout, value.deviceName)
   if (value.error) setStatus(`跨屏协同：${value.error}`, 'error')
 }
 
