@@ -6,6 +6,9 @@ const deskState = document.getElementById('desklink-state')
 const hostInfo = document.getElementById('desklink-host-info')
 const hostAddr = document.getElementById('host-addr')
 const hostFp = document.getElementById('host-fp')
+const clientsBox = document.getElementById('desklink-clients')
+const clientsList = document.getElementById('desklink-clients-list')
+const DIR_LABELS = { left: '左', right: '右', up: '上', down: '下' }
 
 // 标签页切换
 const tabs = Array.from(document.querySelectorAll('.tab'))
@@ -30,6 +33,35 @@ for (const btn of document.querySelectorAll('.mini[data-copy]')) {
   }
 }
 
+function renderClients(clients) {
+  const list = Array.isArray(clients) ? clients : []
+  clientsBox.hidden = list.length === 0
+  clientsList.innerHTML = ''
+  for (const client of list) {
+    const row = document.createElement('div')
+    row.className = 'client-row'
+    const name = document.createElement('span')
+    name.className = 'client-name'
+    name.textContent = client.name
+    row.appendChild(name)
+    const btns = document.createElement('div')
+    btns.className = 'dir-btns'
+    for (const dir of ['left', 'right', 'up', 'down']) {
+      const b = document.createElement('button')
+      b.className = 'dir-btn' + (client.direction === dir ? ' active' : '')
+      b.textContent = DIR_LABELS[dir]
+      b.onclick = async () => {
+        const result = await window.kaki.desklinkSetDirection(client.name, dir)
+        if (result.ok) renderDesklink(result.state)
+        else setStatus(result.message, 'error')
+      }
+      btns.appendChild(b)
+    }
+    row.appendChild(btns)
+    clientsList.appendChild(row)
+  }
+}
+
 function renderDesklink(value) {
   if (!value) return
   deskState.textContent = value.peer ? `已连接：${value.peer.name}` : value.role === 'host' ? '主机运行中' : value.role === 'client' ? '正在连接' : '未连接'
@@ -40,6 +72,7 @@ function renderDesklink(value) {
     hostAddr.textContent = preferred ? preferred.address : '未找到局域网地址'
     hostFp.textContent = value.fingerprint || '—'
   }
+  renderClients(value.clients)
   if (value.error) setStatus(`跨屏协同：${value.error}`, 'error')
 }
 

@@ -37,11 +37,15 @@
 
         <div class="role-block">
           <h3>本机作为主机（控制另一台）</h3>
-          <p class="hint">点「开启主机」，把地址和指纹发给另一台即可，无需填写对方信息。</p>
+          <p class="hint">点「开启主机」，把地址和指纹发给其他 Mac 即可，无需填写对方信息。</p>
           <div class="desklink-actions"><button id="desklink-host" class="primary">开启主机</button><button id="desklink-stop" class="secondary">停止</button></div>
           <div id="desklink-host-info" class="desklink-info" hidden>
             <div class="info-row"><span>主机地址</span><code id="host-addr">—</code><button class="mini" data-copy="host-addr">复制</button></div>
             <div class="info-row"><span>主机指纹</span><code id="host-fp">—</code><button class="mini" data-copy="host-fp">复制</button></div>
+          </div>
+          <div id="desklink-clients" hidden>
+            <p class="hint">已连接的设备，点方向键排列它在本机（主机）的哪一边；同一边多台会上下/左右分段。</p>
+            <div id="desklink-clients-list"></div>
           </div>
         </div>
 

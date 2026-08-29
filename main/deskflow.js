@@ -74,7 +74,7 @@ class DeskflowCore extends EventEmitter {
     this.lastError = null
     this._stdoutBuffer = ''
     this._stderrBuffer = ''
-    this._acceptedClients = []
+    this._acceptedClients = new Map()
     this._restarting = false
   }
 
@@ -122,6 +122,7 @@ class DeskflowCore extends EventEmitter {
       fingerprint: this.identity().display,
       addresses: localAddresses(),
       peer: this.peer,
+      clients: [...this._acceptedClients].map(([name, direction]) => ({ name, direction })),
       running: !!this.child,
       error: this.lastError,
     }
@@ -139,20 +140,42 @@ class DeskflowCore extends EventEmitter {
     fs.writeFileSync(this._serverConfigFile(), text, 'utf8')
   }
 
-  // Build the text server config for the host plus any accepted clients, all
-  // placed to the right of this Mac. Regenerating the whole file (rather than
-  // editing in place) keeps the parser happy and makes layout changes trivial.
+  // Build the text server config for the host plus the accepted clients, each
+  // placed in one of four directions relative to this Mac. Multiple clients on
+  // the same side split that edge into equal segments, so e.g. three clients on
+  // the right stack vertically along the host's right edge. Regenerating the
+  // whole file keeps the parser happy and makes layout changes trivial.
   _serverConfigFor(clients) {
+    const OPPOSITE = { left: 'right', right: 'left', up: 'down', down: 'up' }
+    const DIRS = ['left', 'right', 'up', 'down']
+    const byDir = { left: [], right: [], up: [], down: [] }
+    for (const [name, dir] of clients) {
+      if (byDir[dir]) byDir[dir].push(name)
+    }
+
     const lines = [
       '# Kaki Tools generated Deskflow server config',
       'section: screens',
       `\t${this.deviceName}:`,
     ]
-    for (const client of clients) lines.push(`\t${client}:`)
+    for (const name of clients.keys()) lines.push(`\t${name}:`)
     lines.push('end', 'section: links', `\t${this.deviceName}:`)
-    for (const client of clients) lines.push(`\t\tright = ${client}`)
-    for (const client of clients) {
-      lines.push(`\t${client}:`, `\t\tleft = ${this.deviceName}`)
+    for (const dir of DIRS) {
+      const list = byDir[dir]
+      if (!list.length) continue
+      if (list.length === 1) {
+        lines.push(`\t\t${dir} = ${list[0]}`)
+      } else {
+        const n = list.length
+        for (let i = 0; i < n; i++) {
+          const start = Math.round((i * 100) / n)
+          const end = Math.round(((i + 1) * 100) / n)
+          lines.push(`\t\t${dir}(${start},${end}) = ${list[i]}`)
+        }
+      }
+    }
+    for (const [name, dir] of clients) {
+      lines.push(`\t${name}:`, `\t\t${OPPOSITE[dir] || 'left'} = ${this.deviceName}`)
     }
     lines.push('end', '')
     return lines.join('\n')
@@ -164,13 +187,13 @@ class DeskflowCore extends EventEmitter {
     this.port = clampPort(port)
     this.host = null
     this.lastError = null
-    this._acceptedClients = []
+    this._acceptedClients = new Map()
     const ident = this.identity()
 
     // Start with only this Mac in the config. Clients are accepted on demand:
-    // when an unknown client tries to join we append it below and SIGHUP the
-    // core to hot-reload, so the user never has to type the peer's name.
-    this._writeServerConfig(this._serverConfigFor([]))
+    // when an unknown client tries to join we append it below and restart the
+    // core, so the user never has to type the peer's name.
+    this._writeServerConfig(this._serverConfigFor(new Map()))
 
     // Server settings. `checkPeerFingerprints=false` keeps the wire encrypted
     // (TLS) but does not reject unknown clients headlessly; the client side
@@ -207,8 +230,8 @@ class DeskflowCore extends EventEmitter {
   // harmless here because the unknown client is already retrying its connect.)
   _addClientToConfig(clientName) {
     const clean = cleanComputerName(clientName)
-    if (!clean || this._acceptedClients.includes(clean)) return
-    this._acceptedClients.push(clean)
+    if (!clean || this._acceptedClients.has(clean)) return
+    this._acceptedClients.set(clean, 'right')
     this._writeServerConfig(this._serverConfigFor(this._acceptedClients))
     this.lastError = null
 
@@ -220,6 +243,27 @@ class DeskflowCore extends EventEmitter {
       this._spawn('server')
     }
     this._emitStatus()
+  }
+
+  // Re-place an already-accepted client relative to the host and restart the
+  // core so the new layout takes effect.
+  setClientDirection(name, direction) {
+    const clean = cleanComputerName(name)
+    if (!clean || !this._acceptedClients.has(clean)) return false
+    const dir = ['left', 'right', 'up', 'down'].includes(direction) ? direction : 'right'
+    this._acceptedClients.set(clean, dir)
+    this._writeServerConfig(this._serverConfigFor(this._acceptedClients))
+    this.lastError = null
+
+    this._restarting = true
+    if (this.child && !this.child.killed) {
+      try { this.child.kill('SIGTERM') } catch {}
+    } else {
+      this._restarting = false
+      this._spawn('server')
+    }
+    this._emitStatus()
+    return true
   }
 
   connect({ host, port = DEFAULT_PORT, fingerprint = '' } = {}) {
@@ -371,7 +415,7 @@ class DeskflowCore extends EventEmitter {
     this.host = null
     this.peer = null
     this.lastError = null
-    this._acceptedClients = []
+    this._acceptedClients = new Map()
     this._restarting = false
     if (child && !child.killed) {
       try { child.kill('SIGTERM') } catch {}

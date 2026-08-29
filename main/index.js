@@ -921,6 +921,12 @@ if (!gotLock) {
     deskflowCore?.stop()
     return { ok: true, state: deskflowCore?.status() }
   })
+  ipcMain.handle('desklink:set-direction', (_e, payload) => {
+    try {
+      deskflowCore.setClientDirection(payload?.name, payload?.direction)
+      return { ok: true, state: deskflowCore.status() }
+    } catch (error) { return { ok: false, message: error.message } }
+  })
   ipcMain.handle('clipboard:write', (_e, text) => {
     clipboard.writeText(String(text ?? ''))
     return { ok: true }
