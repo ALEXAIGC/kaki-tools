@@ -47,6 +47,7 @@ function migrateOldData(userDir) {
 }
 
 let panel = null
+let panelIdleTimer = null
 let settingsWindow = null
 let aboutWindow = null
 let tray = null
@@ -154,7 +155,7 @@ function broadcast({ force = false } = {}) {
   }
 }
 
-function createPanel() {
+function createPanel(showWhenReady = !TEST_MODE && settings.showOnLaunch !== false) {
   panel = new BrowserWindow({
     show: false,
     frame: false,
@@ -184,9 +185,14 @@ function createPanel() {
   panel.on('blur', () => {
     if (settings.hideOnBlur && !TEST_MODE) hidePanel()
   })
+  panel.on('closed', () => { panel = null })
   panel.webContents.on('did-finish-load', () => {
     logger.log('面板渲染器就绪')
     broadcast()
+    if (!showWhenReady && !TEST_MODE) {
+      clearTimeout(panelIdleTimer)
+      panelIdleTimer = setTimeout(releaseHiddenPanel, 30000)
+    }
   })
   panel.webContents.on('render-process-gone', (_event, details) => {
     logger.log('面板渲染器异常退出:', details)
@@ -194,7 +200,7 @@ function createPanel() {
   })
   // 正式启动时等页面真正加载完成再显示，避免菜单栏应用在后台启动后
   // 定时器被系统激活流程吞掉，只留下进程却看不到面板。
-  if (!TEST_MODE && settings.showOnLaunch !== false) {
+  if (showWhenReady) {
     panel.webContents.once('did-finish-load', () => {
       if (panel && !panel.isVisible()) showPanel()
     })
@@ -241,7 +247,12 @@ function positionPanel() {
 }
 
 function showPanel() {
-  if (!panel) return
+  clearTimeout(panelIdleTimer)
+  panelIdleTimer = null
+  if (!panel || panel.isDestroyed()) {
+    if (store && !exiting) createPanel(true)
+    return
+  }
   // hidePanel 用 app.hide() 藏过整个应用,必须先 app.show() 解除,
   // 否则 panel.show() 只是把窗口标记为可见,屏幕上什么都不会出现
   if (isMac && !TEST_MODE) app.show()
@@ -254,10 +265,26 @@ function showPanel() {
 }
 
 function hidePanel() {
-  if (panel && panel.isVisible()) panel.hide()
+  if (panel && panel.isVisible()) {
+    panel.webContents.send('panel-hidden')
+    panel.hide()
+  }
+  clearTimeout(panelIdleTimer)
+  // 保留短时间内再次呼出的速度；长时间不用则释放整个渲染进程。
+  panelIdleTimer = setTimeout(releaseHiddenPanel, 30000)
   // macOS 上把焦点还给之前的应用,用户呼出面板前在哪就回到哪
   if (isMac && !TEST_MODE) app.hide()
   logger.log('面板隐藏')
+}
+
+function releaseHiddenPanel() {
+  panelIdleTimer = null
+  if (!panel || panel.isDestroyed() || panel.isVisible()) return
+  clearTimeout(panelRecoveryTimer)
+  panelRecoveryTimer = null
+  panelRecoveryAttempts = 0
+  panel.destroy()
+  logger.log('闲置面板已释放；下次呼出时重建')
 }
 
 function nativePasteExecutable() {
@@ -628,6 +655,7 @@ function hotkeyLabel() {
 function cleanupBeforeExit(reason) {
   if (exiting) return false
   exiting = true
+  clearTimeout(panelIdleTimer)
   logger.log('退出请求:', reason)
   try {
     if (watcher) watcher.stop()
@@ -939,8 +967,7 @@ if (!gotLock) {
     logger.log('渲染进程诊断:', String(message).slice(0, 500))
   })
   ipcMain.handle('history:thumb', (_e, id) => {
-    const item = store.get(id)
-    return item && item.type === 'image' ? item.thumb || '' : ''
+    return store.getThumbnail(id)
   })
 
   // opts.plain = true 时只复制纯文本;默认带上抓取到的 HTML/RTF 富文本

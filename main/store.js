@@ -24,6 +24,8 @@ class Store {
     this._tempSequence = 0
     this._lastBackupAt = 0
     this._backupWriting = false
+    this._writeFailures = 0
+    this._retryAt = 0
     this.load()
   }
 
@@ -48,12 +50,32 @@ class Store {
     if (primary && !fs.existsSync(this.backupFile)) fs.copyFile(this.file, this.backupFile, () => {})
     // 图片路径按当前 images 目录重新解析,数据目录整体搬迁后依然有效
     for (const i of this.items) {
-      if (i.type === 'image' && i.file) i.file = path.join(this.imgDir, path.basename(i.file))
+      if (i.type === 'image' && i.file) {
+        i.file = path.join(this.imgDir, path.basename(i.file))
+        this.offloadThumbnail(i)
+      }
     }
   }
 
   list() { return this.items }
   get(id) { return this.items.find(i => i.id === id) }
+
+  // 写入成功后才移除旧内嵌缩略图；失败时继续使用原数据。
+  offloadThumbnail(item) {
+    if (!item.file || !item.thumb) return
+    try {
+      fs.writeFileSync(item.file + '.thumb', item.thumb, { mode: 0o600 })
+      delete item.thumb
+    } catch {}
+  }
+
+  async getThumbnail(id) {
+    const item = this.get(id)
+    if (!item || item.type !== 'image') return ''
+    if (item.thumb) return item.thumb
+    if (!item.file) return ''
+    try { return await fs.promises.readFile(item.file + '.thumb', 'utf8') } catch { return '' }
+  }
 
   // rich: { html, rtf } 剪贴板里的富文本形态(可选)
   addText(text, rich = {}) {
@@ -107,6 +129,7 @@ class Store {
         createdAt: Date.now(),
         pinned: false,
       })
+      this.offloadThumbnail(this.items[0])
     }
     this.trim()
     this.persist()
@@ -163,6 +186,9 @@ class Store {
     if (src.type === 'image' && src.file) {
       const newFile = path.join(this.imgDir, clone.id + '.png')
       try { fs.copyFileSync(src.file, newFile); clone.file = newFile } catch { return }
+      if (!clone.thumb) {
+        try { fs.copyFileSync(src.file + '.thumb', newFile + '.thumb') } catch {}
+      }
     }
     this.items.unshift(clone)
     this.persist()
@@ -185,6 +211,7 @@ class Store {
     const [it] = this.items.splice(idx, 1)
     if (it.type === 'image' && it.file) {
       try { fs.unlinkSync(it.file) } catch {}
+      try { fs.unlinkSync(it.file + '.thumb') } catch {}
     }
   }
 
@@ -231,7 +258,7 @@ class Store {
   persist() {
     this._revision++
     clearTimeout(this._flushTimer)
-    this._flushTimer = setTimeout(() => this.flush(), 300)
+    this._flushTimer = setTimeout(() => this.flush(), Math.max(300, this._retryAt - Date.now()))
   }
 
   flush() {
@@ -255,10 +282,24 @@ class Store {
       const stale = revision !== this._revision
       const finish = (renameError, wrotePrimary = false) => {
         this._writing = false
-        if (renameError) console.error('写入历史失败', renameError)
+        if (renameError) {
+          console.error('写入历史失败', renameError)
+          fs.unlink(tmp, () => {})
+          this._writeFailures++
+          this._retryAt = Date.now() + Math.min(30000, 1000 * 2 ** Math.min(this._writeFailures - 1, 5))
+          // 最多自动重试五次；之后保留未保存状态，新修改或退出时再尝试。
+          if (this._writeFailures <= 5) {
+            this._flushTimer = setTimeout(() => this.flush(), this._retryAt - Date.now())
+          }
+          return
+        }
         else {
-          this._savedRevision = revision
-          if (wrotePrimary) this.writeBackup(payload)
+          if (wrotePrimary) {
+            this._savedRevision = revision
+            this._writeFailures = 0
+            this._retryAt = 0
+            this.writeBackup(payload)
+          }
         }
         if (this._savedRevision !== this._revision) this.flush()
       }

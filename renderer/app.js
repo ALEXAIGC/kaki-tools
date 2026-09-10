@@ -12,6 +12,9 @@ const quitButton = document.getElementById('quit-app')
 const themeButtons = Array.from(document.querySelectorAll('[data-theme-value]'))
 const systemTheme = matchMedia('(prefers-color-scheme: light)')
 const thumbnailCache = new Map()
+const thumbnailCacheLimit = 120
+let panelSuspended = false
+let thumbnailGeneration = 0
 const initialCardLimit = 80
 const cardBatchSize = 60
 
@@ -187,6 +190,7 @@ function updateActionbar(list = filtered()) {
 }
 
 function render() {
+  if (panelSuspended) return
   // 标签页可能被删除,回退到剪贴板
   if (tab !== 'history' && !boards.includes(tab)) tab = 'history'
   renderTabs()
@@ -231,9 +235,13 @@ function render() {
       if (cached) {
         img.src = cached
       } else {
+        const generation = thumbnailGeneration
         window.kaki.getThumbnail(item.id).then(thumb => {
-          if (!thumb) return
+          if (!thumb || panelSuspended || generation !== thumbnailGeneration || !img.isConnected) return
           thumbnailCache.set(item.id, thumb)
+          while (thumbnailCache.size > thumbnailCacheLimit) {
+            thumbnailCache.delete(thumbnailCache.keys().next().value)
+          }
           if (img.isConnected) img.src = thumb
         }).catch(() => {})
       }
@@ -504,6 +512,7 @@ cardsEl.addEventListener('scroll', () => {
 }, { passive: true })
 
 function applyData(data) {
+  if (panelSuspended) return
   const nextItems = data.items || []
   const activeImageIds = new Set(nextItems.filter(item => item.type === 'image').map(item => item.id))
   for (const id of thumbnailCache.keys()) {
@@ -518,7 +527,17 @@ function applyData(data) {
 
 window.kaki.onUpdate(applyData)
 
+window.kaki.onHidden(() => {
+  panelSuspended = true
+  thumbnailGeneration++
+  cardsEl.replaceChildren()
+  thumbnailCache.clear()
+  items = []
+  visibleLimit = initialCardLimit
+})
+
 window.kaki.onShown(() => {
+  panelSuspended = false
   query = ''
   searchEl.value = ''
   sel = 0

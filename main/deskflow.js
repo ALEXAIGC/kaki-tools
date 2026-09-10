@@ -467,12 +467,18 @@ class DeskflowCore extends EventEmitter {
     this.peer = null
     this.lastError = null
     this._restarting = false
-    if (child && !child.killed) {
+    if (child && child.exitCode === null && child.signalCode === null) {
       try { child.kill('SIGTERM') } catch {}
       // Deskflow core installs a SIGINT/SIGTERM handler; give it a moment
       // before forcing, so it can release the event tap cleanly.
       const pending = child
-      setTimeout(() => { try { if (!pending.killed) pending.kill('SIGKILL') } catch {} }, 1500).unref()
+      const timer = setTimeout(() => {
+        try {
+          if (pending.exitCode === null && pending.signalCode === null) pending.kill('SIGKILL')
+        } catch {}
+      }, 1500)
+      timer.unref()
+      pending.once('exit', () => clearTimeout(timer))
     }
   }
 }

@@ -28,6 +28,7 @@ contextBridge.exposeInMainWorld('kaki', {
   renameBoard: payload => ipcRenderer.send('board:rename', payload),
   onUpdate: cb => ipcRenderer.on('history:updated', (_e, data) => cb(data)),
   onShown: cb => ipcRenderer.on('panel-shown', () => cb()),
+  onHidden: cb => ipcRenderer.on('panel-hidden', () => cb()),
   onBoardPrompt: cb => ipcRenderer.on('board:prompt', (_e, payload) => cb(payload)),
   onItemMetadata: cb => ipcRenderer.on('item:metadata:open', (_e, payload) => cb(payload)),
 })
