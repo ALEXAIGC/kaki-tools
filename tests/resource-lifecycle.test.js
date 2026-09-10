@@ -24,7 +24,7 @@ test('legacy thumbnails migrate, survive reload and remain independent in boards
   assert.equal(await new Store(dir).getThumbnail(clone.id), 'data:image/png;base64,YQ==')
   assert.equal(fs.readFileSync(clone.file, 'utf8'), 'original')
   store.addImage({ resize: () => ({ toDataURL: () => 'new-thumb' }), getSize: () => ({width:1,height:1}) }, Buffer.from('new'), 'new')
-  assert.equal(store.list()[0].thumb, undefined)
+  // 写入完成前缩略图仍可立即读取。
   assert.equal(await store.getThumbnail(store.list()[0].id), 'new-thumb')
   store.flushSync()
 })
@@ -38,7 +38,7 @@ test('failed history writes back off, stop retrying and recover on a new change'
     writeFile(_p, _data, cb) { writes++; cb(fail ? Error('disk full') : null) },
     unlink(_p, cb) { cb() }, rename(_a, _b, cb) { cb(null) },
   }
-  const context = { module: {exports:{}}, require: name => name === 'fs' ? mockFs : require(name),
+  const context = { module: {exports:{}}, require: name => name === 'fs' ? mockFs : name.startsWith('./image-') ? require('../main/' + name.slice(2)) : require(name),
     process, console: {error(){},warn(){}}, Date,
     clearTimeout() {}, setTimeout(fn, ms) { timers.push({fn,ms}); return timers.length },
   }

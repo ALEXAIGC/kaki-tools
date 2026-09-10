@@ -1,7 +1,7 @@
 {
   "name": "kaki-tools",
   "productName": "Kaki Tools",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "description": "Kaki Tools — 跨平台个人效率小工具:剪贴板历史、窗口排列、跨屏键鼠协同(Deskflow)",
   "author": "openclaw",
   "main": "main/index.js",
@@ -12,7 +12,10 @@
     "icon": "node scripts/gen-app-icon.js",
     "pack": "npm run native:build && npm run deskflow:build && electron-builder --mac dir",
     "release:local": "npm run pack && bash scripts/install-local-update.sh",
-    "dist": "npm run native:build && npm run deskflow:build && electron-builder"
+    "dist": "npm run native:build && npm run deskflow:build && electron-builder",
+    "test": "node --test tests/*.test.js",
+    "test:renderer": "electron tests/renderer-performance.cjs",
+    "test:image": "electron tests/image-performance.cjs"
   },
   "devDependencies": {
     "electron": "^38.2.0"
@@ -58,6 +61,7 @@
     }
   },
   "dependencies": {
-    "lucide": "^1.35.0"
+    "lucide": "^1.35.0",
+    "pngjs": "^7.0.0"
   }
 }

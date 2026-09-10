@@ -1,5 +1,6 @@
 const { clipboard } = require('electron')
 const crypto = require('crypto')
+const { fitImage } = require('./image-size')
 
 // 轮询系统剪贴板。文本直接比对；图片仅对缩小后的位图做指纹，确认变化后才 PNG 编码并存盘。
 class Watcher {
@@ -92,15 +93,13 @@ class Watcher {
       const img = clipboard.readImage()
       if (img.isEmpty()) return
       const { width, height } = img.getSize()
-      // 不再每 500ms 把整张 4K 图片复制到 JS 并哈希。64px 缩略图 + 尺寸足以可靠识别
-      // 新剪贴板内容，而完整 PNG 编码只在确认变化后执行一次。
-      const sampleHeight = Math.max(1, Math.round(height * Math.min(64, width) / Math.max(width, 1)))
-      const sample = img.resize({ width: Math.min(64, width), height: sampleHeight }).toBitmap()
+      // 指纹最多 64 × 64，长截图也不会生成无界位图。
+      const sample = img.resize(fitImage(width, height, 64, 64)).toBitmap()
       const hash = crypto.createHash('sha1').update(`${width}x${height}:`).update(sample).digest('hex')
       if (hash === this.lastImageFp) return
       this.lastImageFp = hash
-      const png = img.toPNG()
-      this.onImage(img, png, hash)
+      // 原图编码交给存储层的工作线程，主线程只生成有界指纹。
+      this.onImage(img, null, hash)
     } catch {
       // 剪贴板偶发读取失败(被其他应用占用等),下个周期重试
     }

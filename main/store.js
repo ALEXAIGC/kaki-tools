@@ -1,6 +1,8 @@
 const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
+const { fitImage } = require('./image-size')
+const { encodeImage } = require('./image-encoder')
 
 // 数据模型:
 // - 普通历史条目:board 为空,受 maxTextItems/maxImageItems 滚动清理(固定的除外)
@@ -26,6 +28,7 @@ class Store {
     this._backupWriting = false
     this._writeFailures = 0
     this._retryAt = 0
+    this._pendingImages = new Map()
     this.load()
   }
 
@@ -58,7 +61,12 @@ class Store {
   }
 
   list() { return this.items }
-  get(id) { return this.items.find(i => i.id === id) }
+  get(id) {
+    // 立即粘贴或收藏时，确保尚未完成的图片已落盘。
+    const pending = this._pendingImages.get(id)
+    if (pending) this.finishImageSync(pending)
+    return this.items.find(i => i.id === id)
+  }
 
   // 写入成功后才移除旧内嵌缩略图；失败时继续使用原数据。
   offloadThumbnail(item) {
@@ -70,7 +78,7 @@ class Store {
   }
 
   async getThumbnail(id) {
-    const item = this.get(id)
+    const item = this.items.find(i => i.id === id)
     if (!item || item.type !== 'image') return ''
     if (item.thumb) return item.thumb
     if (!item.file) return ''
@@ -118,22 +126,89 @@ class Store {
     } else {
       const id = crypto.randomUUID()
       const file = path.join(this.imgDir, id + '.png')
-      try { fs.writeFileSync(file, png) } catch (e) { console.error('保存图片失败', e); return }
       let thumb = ''
-      try { thumb = img.resize({ height: 140 }).toDataURL() } catch {}
       const { width, height } = img.getSize()
+      try { thumb = img.resize(fitImage(width, height, 280, 140)).toDataURL() } catch {}
       this.items.unshift({
         id, type: 'image', hash, file, thumb,
         size: { width, height },
-        bytes: png.length,
+        bytes: png ? png.length : 0,
         createdAt: Date.now(),
         pinned: false,
       })
-      this.offloadThumbnail(this.items[0])
+      this.saveImageAsync(this.items[0], png, img)
     }
     this.trim()
     this.persist()
     this.emit()
+  }
+
+  saveImageAsync(item, png, img) {
+    const pending = { item, png, img, tmp: item.file + '.pending', done: false }
+    this._pendingImages.set(item.id, pending)
+    // 临时文件避免与退出/立即粘贴时的同步兜底互相覆盖。
+    const write = encoded => {
+      if (pending.done) return
+      pending.png = encoded
+      item.bytes = encoded.length
+      fs.writeFile(pending.tmp, encoded, error => {
+        if (pending.done) { fs.unlink(pending.tmp, () => {}); return }
+        if (error) {
+          console.error('保存图片失败', error)
+          this._pendingImages.delete(item.id)
+          pending.done = true
+          this.remove(item.id)
+          fs.unlink(pending.tmp, () => {})
+          return
+        }
+        try { fs.renameSync(pending.tmp, item.file) } catch (error) {
+          console.error('保存图片失败', error)
+          this._pendingImages.delete(item.id)
+          pending.done = true
+          this.remove(item.id)
+          fs.unlink(pending.tmp, () => {})
+          return
+        }
+        pending.done = true
+        this._pendingImages.delete(item.id)
+        this.saveThumbnailAsync(item)
+        this.persist()
+      })
+    }
+    if (png) write(png)
+    else encodeImage(img, () => pending.done).then(encoded => {
+      if (!pending.done) write(encoded)
+    }).catch(error => {
+      if (pending.done) return
+      console.error('后台图片编码失败，使用原生编码兜底', error)
+      try { write(img.toPNG()) } catch (error) {
+        console.error('图片编码失败', error)
+        this.remove(item.id)
+      }
+    })
+  }
+
+  saveThumbnailAsync(item) {
+    if (!item.thumb) return
+    const thumb = item.thumb
+    fs.writeFile(item.file + '.thumb', thumb, { mode: 0o600 }, error => {
+      if (!this.items.includes(item)) { fs.unlink(item.file + '.thumb', () => {}); return }
+      if (!error && item.thumb === thumb) { delete item.thumb; this.persist() }
+    })
+  }
+
+  finishImageSync(pending) {
+    try {
+      if (!pending.png) pending.png = pending.img.toPNG()
+      pending.item.bytes = pending.png.length
+      fs.writeFileSync(pending.item.file, pending.png)
+      pending.done = true
+      this._pendingImages.delete(pending.item.id)
+      this.saveThumbnailAsync(pending.item)
+    } catch (error) {
+      console.error('保存待写入图片失败', error)
+      throw error
+    }
   }
 
   // 复制历史条目后,把它挪到最前(标签页条目保持原位)
@@ -209,6 +284,8 @@ class Store {
     const idx = this.items.findIndex(i => i.id === id)
     if (idx < 0) return
     const [it] = this.items.splice(idx, 1)
+    const pending = this._pendingImages.get(id)
+    if (pending) { pending.done = true; this._pendingImages.delete(id) }
     if (it.type === 'image' && it.file) {
       try { fs.unlinkSync(it.file) } catch {}
       try { fs.unlinkSync(it.file + '.thumb') } catch {}
@@ -264,7 +341,7 @@ class Store {
   flush() {
     clearTimeout(this._flushTimer)
     this._flushTimer = null
-    if (this._writing || this._savedRevision === this._revision) return
+    if (this._pendingImages.size || this._writing || this._savedRevision === this._revision) return
 
     const revision = this._revision
     const tmp = `${this.file}.${process.pid}.${++this._tempSequence}.tmp`
@@ -327,6 +404,7 @@ class Store {
 
   // 只在应用退出时调用，保证异步写尚未完成也不会丢失最后一次修改。
   flushSync() {
+    for (const pending of this._pendingImages.values()) this.finishImageSync(pending)
     clearTimeout(this._flushTimer)
     this._flushTimer = null
     if (this._savedRevision === this._revision) return

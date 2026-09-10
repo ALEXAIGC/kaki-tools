@@ -11,6 +11,8 @@ const actionDelete = document.getElementById('action-delete')
 const quitButton = document.getElementById('quit-app')
 const themeButtons = Array.from(document.querySelectorAll('[data-theme-value]'))
 const systemTheme = matchMedia('(prefers-color-scheme: light)')
+const cardCache = new Map()
+let renderedTabsKey = ''
 const thumbnailCache = new Map()
 const thumbnailCacheLimit = 120
 let panelSuspended = false
@@ -89,6 +91,9 @@ function filtered() {
 }
 
 function renderTabs() {
+  const key = JSON.stringify([tab, boards])
+  if (key === renderedTabsKey) return
+  renderedTabsKey = key
   tabsEl.textContent = ''
   const mk = (label, id, isBoard) => {
     const b = document.createElement('button')
@@ -199,13 +204,24 @@ function render() {
   syncFilters()
   updateCounts()
   if (sel >= fullList.length) sel = Math.max(0, fullList.length - 1)
-  cardsEl.textContent = ''
+  const visibleIds = new Set(list.map(item => item.id))
+  for (const [id, entry] of cardCache) {
+    if (!visibleIds.has(id)) { entry.card.remove(); cardCache.delete(id) }
+  }
   emptyEl.hidden = list.length > 0
   emptyEl.textContent = tab === 'history'
     ? '还没有剪贴板记录 — 去复制点什么吧'
     : '这个标签页还是空的 — 在剪贴板卡片上右键「添加到标签页」'
 
   list.forEach((item, idx) => {
+    const signature = JSON.stringify([item.type, item.text, item.chars, item.hasRich, item.size, item.board, item.pinned, item.tags, item.note])
+    const existing = cardCache.get(item.id)
+    if (existing && existing.signature === signature) {
+      updateCardPosition(existing.card, item, idx)
+      if (cardsEl.children[idx] !== existing.card) cardsEl.insertBefore(existing.card, cardsEl.children[idx] || null)
+      return
+    }
+    if (existing) existing.card.remove()
     const card = document.createElement('div')
     card.className = 'card' + (idx === sel ? ' selected' : '') + (item.pinned ? ' pinned' : '') + (item.type === 'image' ? ' image-card' : '')
     card.setAttribute('role', 'option')
@@ -329,12 +345,37 @@ function render() {
     card.append(head, body, ...(annotation ? [annotation] : []), foot, actions)
     card.onclick = e => activate(item, e.shiftKey)
     card.oncontextmenu = e => { e.preventDefault(); window.kaki.itemContext(item.id, item.board) }
-    card.onmouseenter = () => { sel = idx; updateSel() }
-    card.onfocus = () => { sel = idx; updateSel() }
-    cardsEl.append(card)
+    card.onmouseenter = () => { sel = card._index; updateSel() }
+    card.onfocus = () => { sel = card._index; updateSel() }
+    card._meta = meta
+    updateCardPosition(card, item, idx)
+    cardCache.set(item.id, { card, signature })
+    cardsEl.insertBefore(card, cardsEl.children[idx] || null)
   })
   updateActionbar(fullList)
   lucide.createIcons()
+}
+
+function updateCardPosition(card, item, idx) {
+  card._index = idx
+  card._createdAt = item.createdAt
+  card.classList.toggle('selected', idx === sel)
+  card.setAttribute('aria-selected', String(idx === sel))
+  card.tabIndex = idx === sel ? 0 : -1
+  card.setAttribute('aria-label', item.type === 'text' ? `剪贴板条目 ${idx + 1}: ${item.text.slice(0, 120)}` : `剪贴板图片 ${idx + 1}, ${item.size.width} × ${item.size.height}`)
+  card.querySelector('.card-index').textContent = String(idx + 1).padStart(2, '0')
+  card.querySelector('.time').textContent = fmtTime(item.createdAt)
+  if (card._shortcutIndex !== idx) {
+    card._shortcutIndex = idx
+    const foot = card.querySelector('.card-foot')
+    foot.textContent = ''
+    if (idx < 9) {
+      const key = document.createElement('span')
+      key.className = 'key-badge'
+      key.textContent = modLabel + (idx + 1)
+      foot.append(key, document.createTextNode(' ' + card._meta))
+    } else foot.textContent = card._meta
+  }
 }
 
 // ---- 新建 / 重命名标签页弹层 ----
@@ -531,6 +572,7 @@ window.kaki.onHidden(() => {
   panelSuspended = true
   thumbnailGeneration++
   cardsEl.replaceChildren()
+  cardCache.clear()
   thumbnailCache.clear()
   items = []
   visibleLimit = initialCardLimit
@@ -549,4 +591,11 @@ window.kaki.onShown(() => {
 window.kaki.getHistory().then(applyData)
 
 // 每 30 秒刷新一次相对时间
-setInterval(() => { if (document.visibilityState === 'visible' && promptEl.hidden) render() }, 30000)
+setInterval(() => {
+  if (panelSuspended || document.visibilityState !== 'visible' || !promptEl.hidden) return
+  for (const { card } of cardCache.values()) {
+    const time = card.querySelector('.time')
+    const label = fmtTime(card._createdAt)
+    if (time.textContent !== label) time.textContent = label
+  }
+}, 30000)
