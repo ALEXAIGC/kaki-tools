@@ -8,10 +8,12 @@ history.json
 images/
 settings.json
 
-# Compiled / packaged native artifacts (sources like native/kaki-fast-paste.m stay).
-native/bin/
-native/deskflow/
+# Compiled optional runtime and archived generated artifacts.
+components/bin/
+components/deskflow/
+legacy/electron/native/bin/
+legacy/electron/native/deskflow/
 
-# Legacy top-level entry files — the real entry is main/index.js.
+# Legacy top-level entry files.
 /index.js
 /app.js

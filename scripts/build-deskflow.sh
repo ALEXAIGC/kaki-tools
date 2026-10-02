@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # 构建 Deskflow 的 deskflow-core，并准备打包所需的两个产物：
-#   1. native/bin/deskflow-core         —— 开发用二进制(链接 Homebrew Qt，本机可直接跑)
-#   2. native/deskflow/                 —— 自包含 Qt 框架+插件包(供 electron-builder 打进 app)
+#   1. components/bin/deskflow-core         —— 开发用二进制(链接 Homebrew Qt，本机可直接跑)
+#   2. components/deskflow/                 —— 自包含 Qt 框架+插件包(供独立组件打包)
 #
 # 源码目录默认是 ~/Downloads/deskflow_repo，可用 DESKFLOW_REPO 覆盖。
 # 仅当二进制缺失或传了 --rebuild 时才重新编译(编译约数分钟)。
@@ -12,9 +12,8 @@ project_root=$(cd "$(dirname "$0")/.." && pwd)
 repo="${DESKFLOW_REPO:-$HOME/Downloads/deskflow_repo}"
 build_dir="$repo/build"
 built="$build_dir/bin/deskflow-core"
-dev_bin="$project_root/native/bin/deskflow-core"
-bundle_dir="$project_root/native/deskflow"
-identity="${KAKI_IDENTITY:-Kaki Tools Dev}"
+dev_bin="$project_root/components/bin/deskflow-core"
+bundle_dir="$project_root/components/deskflow"
 arch=$(uname -m)                       # arm64 / x86_64
 prefix=$(brew --prefix)                # /opt/homebrew (Apple Silicon) or /usr/local (Intel)
 
