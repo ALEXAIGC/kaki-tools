@@ -113,6 +113,32 @@ struct HotkeyChord: Hashable {
         Self.keyNames.first(where: { $0.value == keyCode })?.key ?? ""
     }
 
+    var menuKeyEquivalent: String {
+        let name = keyName
+        if name.count == 1 { return name.lowercased() }
+        if name.hasPrefix("F"), let number = Int(name.dropFirst()), (1...20).contains(number) {
+            return String(UnicodeScalar(NSF1FunctionKey + number - 1)!)
+        }
+        let characters = ["LEFT": NSLeftArrowFunctionKey, "RIGHT": NSRightArrowFunctionKey,
+                          "UP": NSUpArrowFunctionKey, "DOWN": NSDownArrowFunctionKey,
+                          "DELETE": NSDeleteFunctionKey, "HOME": NSHomeFunctionKey,
+                          "END": NSEndFunctionKey, "PAGEUP": NSPageUpFunctionKey, "PAGEDOWN": NSPageDownFunctionKey]
+        if let character = characters[name] { return String(UnicodeScalar(character)!) }
+        let keys = ["RETURN": "\r", "SPACE": " ", "TAB": "\t", "ESCAPE": "\u{1b}", "BACKSPACE": "\u{8}",
+                    "MINUS": "-", "EQUAL": "=", "COMMA": ",", "PERIOD": ".", "SLASH": "/",
+                    "BACKSLASH": "\\", "SEMICOLON": ";", "QUOTE": "'", "LEFTBRACKET": "[", "RIGHTBRACKET": "]"]
+        return keys[name] ?? ""
+    }
+
+    var menuModifierFlags: NSEvent.ModifierFlags {
+        var flags: NSEvent.ModifierFlags = []
+        if modifiers & UInt32(controlKey) != 0 { flags.insert(.control) }
+        if modifiers & UInt32(optionKey) != 0 { flags.insert(.option) }
+        if modifiers & UInt32(shiftKey) != 0 { flags.insert(.shift) }
+        if modifiers & UInt32(cmdKey) != 0 { flags.insert(.command) }
+        return flags
+    }
+
     var accelerator: String {
         var parts: [String] = []
         if modifiers & UInt32(controlKey) != 0 { parts.append("Control") }

@@ -23,18 +23,18 @@ private struct ClipboardPalette {
 
     init(_ scheme: ColorScheme) {
         let light = scheme == .light
-        background = Color(rgb: light ? 0xf2f2f0 : 0x0b0d0f)
-        surface = Color(rgb: light ? 0xffffff : 0x111315)
-        raised = Color(rgb: light ? 0xfafaf9 : 0x171a1d)
-        hover = Color(rgb: light ? 0xf3f3f1 : 0x1d2125)
+        background = Color(rgb: light ? 0xf3f4f5 : 0x0e1013)
+        surface = Color(rgb: light ? 0xffffff : 0x15181c)
+        raised = Color(rgb: light ? 0xf8f9fa : 0x1b1f24)
+        hover = Color(rgb: light ? 0xf0f2f4 : 0x22272d)
         pressed = Color(rgb: light ? 0xeaeae7 : 0x0d0f11)
-        sidebar = Color(rgb: light ? 0xf7f7f5 : 0x0f1113)
+        sidebar = Color(rgb: light ? 0xf8f9fa : 0x121519)
         foreground = Color(rgb: light ? 0x181816 : 0xf4f4f2)
         soft = Color(rgb: light ? 0x343431 : 0xd6d7d4)
-        muted = Color(rgb: light ? 0x686963 : 0xa1a39f)
-        subtle = Color(rgb: light ? 0x888983 : 0x747772)
-        faint = Color(rgb: light ? 0xaaaba5 : 0x515450)
-        border = Color(rgb: light ? 0xdeded9 : 0x292d31)
+        muted = Color(rgb: light ? 0x626a73 : 0xaab2bc)
+        subtle = Color(rgb: light ? 0x747e89 : 0x88929f)
+        faint = Color(rgb: light ? 0x919aa4 : 0x68727e)
+        border = Color(rgb: light ? 0xe0e4e8 : 0x2a3038)
         strongBorder = Color(rgb: light ? 0xc9cac3 : 0x3a3f44)
         control = Color(rgb: light ? 0xffffff : 0x16191c)
         key = Color(rgb: light ? 0xf0f0ed : 0x1b1e22)
@@ -56,14 +56,16 @@ private enum ClipboardAssets {
 private struct ClipboardMetrics {
     let width: CGFloat
     var sidebar: CGFloat { width <= 1120 ? 132 : width <= 1480 ? 150 : 164 }
-    var card: CGFloat { width <= 1480 ? 178 : 188 }
+    var card: CGFloat { width <= 1120 ? 178 : width <= 1480 ? 188 : 200 }
     var showCounts: Bool { width > 1120 }
     var showHints: Bool { width > 1480 }
     var compactActions: Bool { width <= 1120 }
     var actionWidth: CGFloat { width <= 1480 ? 94 : 110 }
     var searchWidth: CGFloat { min(300, max(160, width * 0.22)) }
+    var compactStudio: Bool { width <= 900 }
+    var studioWidth: CGFloat { compactStudio ? 38 : 100 }
     var tabsWidth: CGFloat {
-        min(480, max(80, width - 42 - searchWidth - (showHints ? 255 : 0) - 94 - 34 - 32 - 72))
+        min(480, max(80, width - 42 - searchWidth - (showHints ? 255 : 0) - studioWidth - 1 - 94 - 34 - 32 - 96))
     }
 }
 
@@ -157,35 +159,48 @@ private struct ClipboardMetrics {
                     }
                     Button { controller.createBoard() } label: {
                         Image(systemName: "plus").font(.system(size: 16, weight: .regular)).frame(width: 36, height: 38)
-                    }.buttonStyle(ClipboardControlStyle(palette: palette)).help("新建收藏分组").accessibilityLabel("新建收藏分组")
+                    }.buttonStyle(ClipboardControlStyle(palette: palette, quiet: true)).help("新建收藏分组").accessibilityLabel("新建收藏分组")
                 }.padding(.vertical, 3)
             }.frame(maxWidth: metrics.tabsWidth).frame(height: 44)
             Spacer(minLength: 0)
             if metrics.showHints {
-                Text("⌘1–9 选择 · ↵ 粘贴 · Esc 关闭")
-                    .font(.system(size: 10, design: .monospaced)).foregroundColor(palette.subtle).fixedSize()
+                Text("⌘1–9 使用 · Esc 关闭")
+                    .font(.system(size: 11, design: .monospaced)).foregroundColor(palette.subtle).fixedSize()
             }
+            palette.border.frame(width: 1, height: 24)
+            Button { controller.showStudio() } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "photo.on.rectangle.angled").font(.system(size: 15))
+                    if !metrics.compactStudio {
+                        Text("素材库").font(.system(size: 13, weight: .medium))
+                    }
+                }.frame(width: metrics.studioWidth, height: 38)
+            }.buttonStyle(ClipboardControlStyle(palette: palette))
+                .help("打开 Studio 素材库 · \(HotkeyChord.parse(settings.studioHotkey)?.label ?? settings.studioHotkey)")
+                .accessibilityLabel("打开 Studio 素材库")
             themeSwitcher
-            Button { NSApp.terminate(nil) } label: {
-                Image(systemName: "power").font(.system(size: 16)).frame(width: 34, height: 34)
-            }.buttonStyle(ClipboardControlStyle(palette: palette, danger: true)).help("退出 Kaki Tools · ⌘Q").accessibilityLabel("退出 Kaki Tools")
-        }.padding(.horizontal, 16).offset(y: -4).frame(height: 61).background(palette.surface)
+            Button { controller.showSettings() } label: {
+                Image(systemName: "gearshape").font(.system(size: 16)).frame(width: 34, height: 34)
+            }.buttonStyle(ClipboardControlStyle(palette: palette, quiet: true)).help("设置 · ⌘,").accessibilityLabel("Kaki Tools 设置")
+        }.padding(.horizontal, 16).frame(height: 64).background(palette.surface)
     }
 
     private func search(_ metrics: ClipboardMetrics) -> some View {
         HStack(spacing: 9) {
             Image(systemName: "magnifyingglass").font(.system(size: 18, weight: .regular))
                 .foregroundColor(searchFocused ? palette.accent : palette.subtle)
-            TextField("", text: $controller.query, prompt: Text("搜索剪贴板").foregroundColor(palette.subtle))
+            TextField("", text: $controller.query, prompt: Text("搜索内容、标签或备注").foregroundColor(palette.subtle))
                 .textFieldStyle(.plain).font(.system(size: 13)).foregroundColor(palette.foreground)
                 .focused($searchFocused).accessibilityLabel("搜索剪贴板内容、标签或备注")
-            KeyBadge(text: "⌘ F", palette: palette)
+            if !controller.query.isEmpty {
+                Button { controller.query = ""; searchFocused = true } label: {
+                    Image(systemName: "xmark.circle.fill").font(.system(size: 12)).foregroundColor(palette.subtle)
+                }.buttonStyle(.plain).help("清空搜索").accessibilityLabel("清空搜索")
+            } else { KeyBadge(text: "⌘F", palette: palette) }
         }
         .padding(.leading, 12).padding(.trailing, 10).frame(width: metrics.searchWidth, height: 40)
         .background(searchFocused ? palette.surface : palette.control, in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(searchFocused ? palette.accent : palette.border, lineWidth: 1))
-        .shadow(color: searchFocused ? palette.accentSoft : .clear, radius: 0, x: 0, y: 0)
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(searchFocused ? palette.accentSoft : .clear, lineWidth: 3).padding(-2))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(searchFocused ? palette.accent.opacity(0.65) : palette.border, lineWidth: 1))
     }
 
     private func boardButton(_ title: String, board: String?) -> some View {
@@ -196,7 +211,7 @@ private struct ClipboardMetrics {
                 if board == nil { Image(systemName: "clipboard").font(.system(size: 14)) }
                 Text(title).font(.system(size: 13, weight: board == nil ? .semibold : .medium)).lineLimit(1)
             }.padding(.horizontal, board == nil ? 12 : 14).frame(height: 38).fixedSize(horizontal: true, vertical: false)
-        }.buttonStyle(ClipboardControlStyle(palette: palette, active: controller.board == board))
+        }.buttonStyle(ClipboardControlStyle(palette: palette, active: controller.board == board, tinted: true, quiet: true))
     }
 
     private var themeSwitcher: some View {
@@ -221,8 +236,8 @@ private struct ClipboardMetrics {
 
     private func sidebar(_ metrics: ClipboardMetrics) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("LIBRARY").font(.system(size: 10, design: .monospaced)).tracking(1.4)
-                .foregroundColor(palette.faint).padding(.leading, 10).padding(.bottom, 8)
+            Text(controller.board == nil ? "历史记录" : "收藏内容").font(.system(size: 11, weight: .medium))
+                .foregroundColor(palette.subtle).padding(.leading, 10).padding(.bottom, 10)
             ForEach(AppController.Filter.allCases, id: \.self) { filter in
                 Button { controller.filter = filter; searchFocused = true } label: {
                     HStack(spacing: 8) {
@@ -234,8 +249,7 @@ private struct ClipboardMetrics {
                         if metrics.showCounts {
                             Text("\(controller.currentBoardCounts[filter] ?? 0)").font(.system(size: 11, weight: .medium, design: .monospaced))
                                 .foregroundColor(controller.filter == filter ? palette.accent : palette.subtle)
-                                .padding(.horizontal, 5).padding(.vertical, 3).frame(minWidth: 30)
-                                .background(controller.filter == filter ? palette.surface : palette.background, in: Capsule())
+                                .frame(minWidth: 30, alignment: .trailing)
                         }
                     }.padding(.horizontal, 10).frame(height: 36)
                 }
@@ -246,7 +260,7 @@ private struct ClipboardMetrics {
             HStack(spacing: 7) {
                 Circle().fill(palette.accent).frame(width: 5, height: 5)
                     .overlay(Circle().stroke(palette.accentSoft, lineWidth: 3).padding(-1))
-                Text("LOCAL ONLY").font(.system(size: 10, design: .monospaced)).tracking(1.2).foregroundColor(palette.faint)
+                Text("仅存本机").font(.system(size: 11)).foregroundColor(palette.subtle)
             }.padding(.horizontal, 9).padding(.top, 8).padding(.bottom, 3)
         }.padding(.top, 14).padding(.horizontal, 10).padding(.bottom, 10)
             .frame(width: metrics.sidebar).background(palette.sidebar)
@@ -274,14 +288,14 @@ private struct ClipboardMetrics {
             } else {
                 ScrollViewReader { reader in
                     ScrollView(.horizontal, showsIndicators: false) {
-                        LazyHStack(spacing: 10) {
+                        LazyHStack(spacing: 12) {
                             ForEach(Array(controller.visibleItems.enumerated()), id: \.element.id) { index, item in
                                 ClipboardCard(item: item, index: index, selected: controller.selectedID == item.id,
                                               store: store, controller: controller, palette: palette, now: now,
-                                              width: metrics.card + (item.type == "image" ? 6 : 0), height: max(90, area.size.height - 22))
+                                              width: metrics.card, height: max(90, area.size.height - 28))
                                     .id(item.id)
                             }
-                        }.padding(.leading, 14).padding(.trailing, 14).padding(.top, 12).padding(.bottom, 10)
+                        }.padding(.horizontal, 16).padding(.vertical, 14)
                     }
                     .onChange(of: controller.selectedID) { id in
                         if let id { withAnimation(.easeOut(duration: 0.12)) { reader.scrollTo(id) } }
@@ -297,7 +311,7 @@ private struct ClipboardMetrics {
     private func actionbar(_ metrics: ClipboardMetrics) -> some View {
         HStack(spacing: 14) {
             HStack(spacing: 10) {
-                Text(selectionIndex).font(.system(size: 11, weight: .semibold, design: .monospaced)).tracking(0.6).foregroundColor(palette.accent).fixedSize()
+                Text(selectionIndex).font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundColor(palette.muted).fixedSize()
                 Text(controller.message.isEmpty ? selectionSummary : controller.message)
                     .font(.system(size: 12)).foregroundColor(controller.message.isEmpty ? palette.muted : palette.accent).lineLimit(1)
             }.frame(maxWidth: .infinity, alignment: .leading)
@@ -315,7 +329,7 @@ private struct ClipboardMetrics {
                     controller.deleteSelected()
                 }
             }
-        }.padding(.horizontal, 14).frame(height: 57).background(palette.surface)
+        }.padding(.horizontal, 16).frame(height: 56).background(palette.surface)
     }
 
     private func actionButton(_ title: String, icon: String, key: String, metrics: ClipboardMetrics,
@@ -325,15 +339,15 @@ private struct ClipboardMetrics {
                 if icon == "textformat" {
                     Text("T").font(.system(size: 18, weight: .regular, design: .serif))
                 } else {
-                    Image(systemName: icon).font(.system(size: 16)).symbolVariant(.none)
+                    Image(systemName: icon).font(.system(size: 14)).symbolVariant(.none)
                 }
                 if !metrics.compactActions {
                     Text(title).font(.system(size: 13, weight: .medium)).lineLimit(1)
                     KeyBadge(text: key, palette: palette, primary: primary)
                 }
             }.padding(.horizontal, metrics.compactActions ? 0 : 10)
-                .frame(minWidth: metrics.compactActions ? 40 : metrics.actionWidth, minHeight: 40)
-        }.buttonStyle(ClipboardControlStyle(palette: palette, active: primary, danger: danger))
+                .frame(minWidth: metrics.compactActions ? 38 : metrics.actionWidth, minHeight: 36)
+        }.buttonStyle(ClipboardControlStyle(palette: palette, active: primary, danger: danger, quiet: !primary))
             .disabled(!enabled).help("\(title) · \(key)").accessibilityLabel(title)
     }
 
@@ -365,28 +379,25 @@ private struct ClipboardMetrics {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 7) {
-                Text(String(format: "%02d", index + 1)).font(.system(size: 11, weight: .semibold, design: .monospaced)).foregroundColor(palette.accent)
+                Text(String(format: "%02d", index + 1)).font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundColor(selected ? palette.accent : palette.subtle)
+                if item.pinned { Image(systemName: "pin.fill").font(.system(size: 10)).foregroundColor(palette.accent) }
                 Spacer(minLength: 0)
-                Text(age).font(.system(size: 11)).foregroundColor(palette.subtle).lineLimit(1)
-            }.padding(.horizontal, 10).frame(height: 36).background(palette.raised)
-            rule()
+                if hovered { cardActions }
+                else { Text(age).font(.system(size: 11)).foregroundColor(palette.subtle).lineLimit(1) }
+            }.padding(.horizontal, 12).frame(height: 30)
             content
             if !(item.tags ?? []).isEmpty || !(item.note ?? "").isEmpty { annotations }
             rule()
             HStack(spacing: 5) {
                 if index < 9 { KeyBadge(text: "⌘\(index + 1)", palette: palette, compact: true) }
-                Text(metadata).font(.system(size: 10, design: .monospaced)).foregroundColor(palette.subtle).lineLimit(1)
+                Text(metadata).font(.system(size: 11)).foregroundColor(palette.muted).lineLimit(1)
                 Spacer(minLength: 0)
-            }.padding(.horizontal, 9).frame(height: 30).background(palette.raised)
+            }.padding(.horizontal, 12).frame(height: 28)
         }
         .frame(width: width, height: height)
         .background(selected || hovered ? palette.raised : palette.surface)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(selected ? palette.accent : hovered ? palette.strongBorder : palette.border, lineWidth: 1))
-        .shadow(color: selected ? palette.accentSoft : .clear, radius: 0)
-        .overlay(RoundedRectangle(cornerRadius: 13).stroke(selected ? palette.accentSoft : .clear, lineWidth: 2).padding(-1))
-        .overlay(alignment: .topTrailing) { if hovered || item.pinned { cardActions.padding(.top, 43).padding(.trailing, 7) } }
-        .offset(y: hovered ? -3 : 0)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(selected ? palette.accent.opacity(0.8) : hovered ? palette.strongBorder : palette.border, lineWidth: 1))
         .contentShape(RoundedRectangle(cornerRadius: 12))
         .onHover { inside in hovered = inside; if inside { controller.selectItem(item.id) } }
         .onTapGesture { controller.activate(item.id, plainText: NSEvent.modifierFlags.contains(.shift)) }
@@ -419,15 +430,18 @@ private struct ClipboardMetrics {
                 ZStack {
                     palette.pressed
                     if let image {
-                        Image(nsImage: image).resizable().scaledToFill().frame(width: geometry.size.width, height: geometry.size.height).clipped()
+                        Image(nsImage: image).resizable().interpolation(.high).scaledToFit()
+                            .frame(width: max(0, geometry.size.width - 20), height: max(0, geometry.size.height - 16))
+                            .frame(width: geometry.size.width, height: geometry.size.height)
                     } else {
                         Image(systemName: store.isPending(id: item.id) ? "hourglass" : "photo").font(.system(size: 26, weight: .light)).foregroundColor(palette.faint)
                     }
                 }
             } else {
-                Text(String((item.text ?? "").prefix(600))).font(.system(size: 13, weight: .regular)).lineSpacing(4).foregroundColor(palette.soft)
-                    .frame(width: max(0, geometry.size.width - 22), height: max(0, geometry.size.height - 24), alignment: .topLeading)
-                    .padding(.horizontal, 11).padding(.vertical, 12).clipped()
+                Text(String((item.text ?? "").prefix(600))).font(.system(size: 14, weight: .regular)).lineSpacing(4).foregroundColor(palette.soft)
+                    .lineLimit(max(1, Int((geometry.size.height - 20) / 21))).truncationMode(.tail)
+                    .frame(width: max(0, geometry.size.width - 28), height: max(0, geometry.size.height - 20), alignment: .topLeading)
+                    .padding(.horizontal, 14).padding(.vertical, 10).clipped()
             }
         }.frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -455,12 +469,12 @@ private struct ClipboardMetrics {
         }
     }
     private func smallAction(_ icon: String, label: String, danger: Bool = false, action: @escaping () -> Void) -> some View {
-        Button(action: action) { Image(systemName: icon).font(.system(size: 14)).frame(width: 27, height: 27) }
-            .buttonStyle(ClipboardControlStyle(palette: palette, danger: danger, radius: 5)).help(label).accessibilityLabel(label)
+        Button(action: action) { Image(systemName: icon).font(.system(size: 11)).frame(width: 21, height: 21) }
+            .buttonStyle(ClipboardControlStyle(palette: palette, danger: danger, radius: 5, quiet: true)).help(label).accessibilityLabel(label)
     }
     private var metadata: String {
         if item.type == "image", let size = item.size { return "\(size.width) × \(size.height)" }
-        let base = "\((item.text ?? "").utf16.count) 个字符"
+        let base = "\((item.text ?? "").utf16.count) 字"
         return item.hasRichText ? base + " · 富文本" : base
     }
     private var age: String {
@@ -541,8 +555,7 @@ private struct KeyBadge: View {
         Text(text).font(.system(size: 10, design: .monospaced))
             .foregroundColor(primary ? .white : compact ? palette.muted : palette.subtle)
             .padding(.horizontal, compact ? 5 : 6).padding(.vertical, 2)
-            .background(primary ? Color.black.opacity(0.12) : palette.key, in: RoundedRectangle(cornerRadius: 5))
-            .overlay(RoundedRectangle(cornerRadius: 5).stroke(primary ? Color.white.opacity(0.28) : palette.border, lineWidth: 1))
+            .background(primary ? Color.white.opacity(0.12) : palette.key.opacity(0.55), in: RoundedRectangle(cornerRadius: 4))
     }
 }
 
@@ -551,15 +564,16 @@ private struct ClipboardControlStyle: ButtonStyle {
     var active = false
     var danger = false
     var radius: CGFloat = 8
+    var tinted = false
+    var quiet = false
     @Environment(\.isEnabled) private var enabled
     @State private var hovered = false
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .foregroundColor(active ? .white : hovered ? danger ? palette.danger : palette.foreground : palette.muted)
-            .background(active ? palette.accent : hovered ? danger ? palette.danger.opacity(0.1) : palette.hover : palette.control,
+            .foregroundColor(active ? tinted ? palette.accent : .white : hovered ? danger ? palette.danger : palette.foreground : palette.muted)
+            .background(active ? tinted ? palette.accentSoft : palette.accent : hovered ? danger ? palette.danger.opacity(0.1) : palette.hover : quiet ? .clear : palette.control,
                         in: RoundedRectangle(cornerRadius: radius))
-            .overlay(RoundedRectangle(cornerRadius: radius).stroke(active ? palette.accent : hovered ? danger ? palette.danger.opacity(0.4) : palette.strongBorder : palette.border, lineWidth: 1))
-            .overlay(alignment: .top) { if active { Color.white.opacity(0.22).frame(height: 1).padding(.horizontal, radius) } }
+            .overlay(RoundedRectangle(cornerRadius: radius).stroke(active ? tinted ? palette.accent.opacity(0.16) : palette.accent : hovered ? danger ? palette.danger.opacity(0.4) : palette.strongBorder : quiet ? .clear : palette.border, lineWidth: 1))
             .opacity(enabled ? 1 : 0.38)
             .offset(y: configuration.isPressed ? 1 : 0)
             .onHover { hovered = $0 }

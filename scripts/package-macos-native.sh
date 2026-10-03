@@ -21,7 +21,17 @@ verify_native() {
   forbidden=$(/usr/bin/find "$app/Contents" \( -name '*.asar' -o -name 'Electron Framework.framework' -o -name 'Qt*.framework' -o -name 'DeskflowRuntime.bundle' -o -name 'deskflow-core' \) -print)
   [ -z "$forbidden" ] || fail "原生主包包含不应内置的运行时：$forbidden"
   /usr/bin/otool -L "$app/Contents/MacOS/$executable" | /usr/bin/grep -Eiq 'Electron|Qt(Core|Gui|Widgets|Network)' && fail '主程序链接到 Electron 或 Qt。'
+  # SwiftUI's VideoPlayer overlay does not itself load AVPlayerView's framework.
+  # Refuse the missing AVKit dependency that caused the 1.2.2 preview crash.
+  local dependencies
+  dependencies=$(/usr/bin/otool -L "$app/Contents/MacOS/$executable")
+  if printf '%s\n' "$dependencies" | /usr/bin/grep -q '_AVKit_SwiftUI.framework/'; then
+    printf '%s\n' "$dependencies" | /usr/bin/grep -q '/AVKit.framework/' || fail '视频预览缺少 AVKit 链接；安装包已停止生成。'
+  fi
   /usr/bin/codesign --verify --deep --strict "$app"
+  if /usr/bin/codesign -d --verbose=4 "$app" 2>&1 | /usr/bin/grep -q 'Signature=adhoc'; then
+    fail '安装包要求固定证书签名。临时签名应用只可用于隔离开发测试。'
+  fi
 }
 verify_native "$app_input"
 version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_input/Contents/Info.plist")
@@ -79,6 +89,19 @@ mkdir "$stage/payload"
 /usr/bin/ditto "$app_input" "$stage/payload/Kaki Tools.app"
 ln -s /Applications "$stage/payload/Applications"
 [ ! -f "$project_root/macos/README.md" ] || cp "$project_root/macos/README.md" "$stage/payload/README.md"
+[ ! -f "$project_root/macos/INSTALL.txt" ] || cp "$project_root/macos/INSTALL.txt" "$stage/payload/安装说明.txt"
+if [ -f "$project_root/macos/REAUTHORIZE.command.in" ]; then
+  python3 - "$project_root/macos/REAUTHORIZE.command.in" "$app_input" "$stage/payload/重新授权.command" <<'PYTHON'
+import pathlib,re,shlex,subprocess,sys
+template,app,output=map(pathlib.Path,sys.argv[1:])
+result=subprocess.run(['/usr/bin/codesign','-d','-r-',str(app)],check=True,capture_output=True,text=True)
+match=re.search(r'designated => (.+)',result.stdout+result.stderr)
+if match is None or 'cdhash' in match.group(1): raise SystemExit('Signing identity must be certificate-based')
+output.write_text(template.read_text().replace('__KAKI_SIGNING_REQUIREMENT__',shlex.quote(match.group(1))))
+output.chmod(0o755)
+PYTHON
+  bash -n "$stage/payload/重新授权.command"
+fi
 [ ! -f "$project_root/LICENSE" ] || cp "$project_root/LICENSE" "$stage/payload/LICENSE"
 verify_native "$stage/payload/Kaki Tools.app"
 python3 "$stage/app-manifest.py" "$stage/payload/Kaki Tools.app" > "$stage/staged-manifest.json"
@@ -102,6 +125,15 @@ verify_native "$mount_point/Kaki Tools.app"
 python3 "$stage/app-manifest.py" "$mount_point/Kaki Tools.app" > "$stage/mounted-manifest.json"
 cmp "$stage/source-manifest.json" "$stage/mounted-manifest.json"
 [ "$(readlink "$mount_point/Applications")" = /Applications ] || fail 'DMG 的 Applications 链接无效。'
+if [ -f "$stage/payload/安装说明.txt" ]; then
+  cmp "$stage/payload/安装说明.txt" "$mount_point/安装说明.txt"
+fi
+if [ -f "$stage/payload/重新授权.command" ]; then
+  cmp "$stage/payload/重新授权.command" "$mount_point/重新授权.command"
+  [ -x "$mount_point/重新授权.command" ] || fail '重新授权工具缺少执行权限。'
+  bash -n "$mount_point/重新授权.command"
+  /usr/bin/grep -q '__KAKI_SIGNING_REQUIREMENT__' "$mount_point/重新授权.command" && fail '重新授权工具尚未填入签名身份。'
+fi
 /usr/bin/hdiutil detach "$mount_device"
 mount_device=''
 final="$output/$(basename "$image")"

@@ -73,6 +73,31 @@ final class ClipboardService {
         lastChangeCount = count
         return count
     }
+    @discardableResult
+    func writeMaterialFile(_ file: URL) -> Int? {
+        guard file.isFileURL, FileManager.default.fileExists(atPath: file.path) else { return nil }
+        let entry = NSPasteboardItem()
+        entry.setString(file.absoluteString, forType: .fileURL)
+        entry.setString(sourceMarker, forType: sourceType)
+        pasteboard.clearContents()
+        guard pasteboard.writeObjects([entry]) else { return nil }
+        lastChangeCount = pasteboard.changeCount
+        return lastChangeCount
+    }
+    @discardableResult
+    func writeStudioReferences(_ text: String) -> Int? {
+        guard text.hasPrefix(StudioReferenceEnvelope.prefix), text.utf8.count <= 65536 else { return nil }
+        let entry = NSPasteboardItem()
+        // Browsers reliably receive text/plain during user-initiated paste; the custom
+        // native type is supplementary and is never the only representation.
+        entry.setString(text, forType: .string)
+        entry.setString(text, forType: NSPasteboard.PasteboardType("com.kaki.studio.material-references"))
+        entry.setString(sourceMarker, forType: sourceType)
+        pasteboard.clearContents()
+        guard pasteboard.writeObjects([entry]) else { return nil }
+        lastChangeCount = pasteboard.changeCount
+        return lastChangeCount
+    }
     func matchesWrite(_ count: Int) -> Bool {
         pasteboard.changeCount == count && pasteboard.string(forType: sourceType) == sourceMarker
     }

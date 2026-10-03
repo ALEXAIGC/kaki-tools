@@ -4,7 +4,7 @@
 
 `SOURCE-SNAPSHOT.json` 保存归档前源码文件的 SHA-256；`package.before-archive.json` 保留原 package.json。归档后的 package.json 只增加 private 标记并说明用途。原 `README.md` 属于旧版本资料，其命令应在本归档目录执行。
 
-`native/deskflow` 链接至共享的可选运行库 `../../components/deskflow`（相对于归档根目录）；归档的 Deskflow 构建脚本转到根目录的组件构建工具。它不进入默认原生主包。
+`native/deskflow` 链接至共享的可选运行库 `../deskflow/components/deskflow`（相对于归档根目录）；归档的 Deskflow 构建脚本转到`legacy/deskflow/scripts/` 中的历史组件构建工具。它不进入默认原生主包。
 
 ## 需要回看旧版时
 

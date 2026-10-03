@@ -1,7 +1,7 @@
 {
   "name": "kaki-tools",
   "productName": "Kaki Tools",
-  "version": "1.0.3",
+  "version": "1.4.3",
   "private": true,
   "description": "原生 macOS 剪贴板、窗口调整和区域截图工具",
   "scripts": {
@@ -13,10 +13,10 @@
     "macos:build": "bash scripts/build-macos-native.sh",
     "macos:test": "bash scripts/test-macos-native.sh",
     "macos:dist": "bash scripts/build-macos-native.sh && bash scripts/package-macos-native.sh",
-    "macos:deskflow": "bash scripts/package-deskflow-component.sh",
-    "deskflow:build": "bash scripts/build-deskflow.sh",
     "legacy:start": "npm --prefix legacy/electron start",
     "legacy:test": "npm --prefix legacy/electron test",
-    "legacy:dist": "npm --prefix legacy/electron run dist"
+    "legacy:dist": "npm --prefix legacy/electron run dist",
+    "macos:signing": "python3 scripts/setup-macos-local-signing.py",
+    "macos:icons": "bash scripts/build-macos-icons.sh"
   }
 }

@@ -54,7 +54,7 @@ private enum HistoryFailure: LocalizedError {
         }
     }
 }
-private enum ImageCodec {
+enum ImageCodec {
     static let maximumPixels = 40_000_000
     static let maximumBytes = 160 * 1024 * 1024
     static func dimensions(_ data: Data) throws -> ImageDimensions {

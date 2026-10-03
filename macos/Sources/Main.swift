@@ -97,7 +97,7 @@ import CryptoKit
                 }
             }
         } else if ["settings", "settings-wait", "settings-shortcuts", "settings-shortcuts-wait"].contains(action) {
-            app.showSettings(section: action.hasPrefix("settings-shortcuts") ? "shortcuts" : nil)
+            app.showSettings(section: action.hasPrefix("settings-shortcuts") ? "shortcuts" : environment["KAKI_NATIVE_TEST_SETTINGS_SECTION"])
             if action.hasSuffix("-wait") { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
                 guard let window = NSApp.windows.first(where: { $0.title == "Kaki Tools 设置" }), let view = window.contentView,

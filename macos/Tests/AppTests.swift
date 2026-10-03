@@ -1,6 +1,42 @@
 import AppKit
 import Combine
 
+@MainActor func runPermissionRefreshTests() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("kaki-permission-refresh-" + UUID().uuidString)
+    var trusted = false
+    var checks: [Bool] = []
+    let controller = AppController(directory: directory, testMode: true, accessibilityPermissionCheck: { prompt in
+        checks.append(prompt); return trusted
+    })
+    defer { controller.shutdown(); try? FileManager.default.removeItem(at: directory) }
+    try check(!controller.accessibilityTrusted, "permission badge initially reflects denied system state")
+    trusted = true
+    controller.showSettings(section: "about")
+    let window = NSApp.windows.first { $0.title == "Kaki Tools 设置" && $0.isVisible }!
+    defer { window.close() }
+    try check(controller.accessibilityTrusted, "opening settings replaces a stale denied permission with current authorization")
+    trusted = false
+    NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: window)
+    try check(!controller.accessibilityTrusted, "returning to settings reads revocation even when the app is already active")
+    trusted = true
+    NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: NSApp)
+    try check(controller.accessibilityTrusted, "returning from System Settings refreshes granted permission")
+    trusted = false
+    controller.refreshAccessibilityPermission()
+    try check(!controller.accessibilityTrusted, "manual refresh reads the current system permission instead of a cached badge")
+    let before = checks.count
+    let unrelated = NSWindow(contentRect: .zero, styleMask: [], backing: .buffered, defer: false)
+    unrelated.isReleasedWhenClosed = false
+    NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: unrelated)
+    try check(checks.count == before, "unrelated windows do not trigger settings permission checks")
+    unrelated.close()
+    try check(checks.allSatisfy { !$0 }, "passive permission refresh never requests authorization")
+    trusted = true
+    controller.requestAccessibility()
+    try check(controller.accessibilityTrusted && Array(checks.suffix(2)) == [true, false], "explicit authorization is followed by a fresh non-prompting state check")
+    print("Permission refresh tests passed (injected system state, no real authorization changes)")
+}
+
 @MainActor func runAppTests() async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("kaki-native-app-test-" + UUID().uuidString)
     let controller = AppController(directory: directory, testMode: true, messageLifetime: 0.12)
@@ -8,9 +44,14 @@ import Combine
     controller.start()
     _ = controller.registerShortcuts(allowFallback: true)
     let initialMenu = controller.makeStatusMenu()
-    try check(initialMenu.items.contains { $0.title.hasPrefix("区域截图") && $0.title.contains("⇧⌘2") }, "screenshot menu exposes configured global shortcut")
+    try check(initialMenu.items.filter { !$0.isSeparatorItem }.map(\.title) == ["打开剪贴板", "打开素材库", "调整窗口", "区域截图", "设置…", "退出 Kaki Tools"], "status menu keeps only common actions and one settings entry")
+    try check(initialMenu.item(withTitle: "打开剪贴板")?.keyEquivalent == "v" && initialMenu.item(withTitle: "打开剪贴板")?.keyEquivalentModifierMask == [.command, .shift], "clipboard shortcut is displayed in the native shortcut column")
+    try check(initialMenu.item(withTitle: "区域截图")?.keyEquivalent == "2" && initialMenu.item(withTitle: "区域截图")?.keyEquivalentModifierMask == [.command, .shift], "screenshot menu exposes configured global shortcut")
+    try check(initialMenu.item(withTitle: "打开素材库")?.keyEquivalent == "b" && initialMenu.item(withTitle: "打开素材库")?.keyEquivalentModifierMask == [.command, .shift], "material library menu exposes Command Shift B")
     let initialLayouts = initialMenu.item(withTitle: "调整窗口")?.submenu
-    try check(initialLayouts?.items.contains { $0.title.hasPrefix("左半屏") && $0.title.contains("⌃⌥←") } == true, "window submenu exposes layout shortcuts")
+    try check(initialLayouts?.item(withTitle: "左半屏")?.keyEquivalent == String(UnicodeScalar(NSLeftArrowFunctionKey)!) && initialLayouts?.item(withTitle: "左半屏")?.keyEquivalentModifierMask == [.control, .option], "window submenu exposes layout shortcuts")
+    try check(Set(initialLayouts?.items.compactMap { $0.representedObject as? String } ?? []) == Set(WindowManager.layouts.map(\.id)), "grouped window menu retains every layout")
+    try check(initialLayouts?.items.first?.representedObject as? String == "maximize" && initialLayouts?.items.first?.keyEquivalent == "\r", "fill-window action remains prominent with its return shortcut")
     let negativeScreen = NSRect(x: -1920, y: -180, width: 1920, height: 1057)
     try check(AppController.panelFrame(workArea: negativeScreen) == NSRect(x: -1920, y: -180, width: 1920, height: 332), "panel fills target screen width and rests at work area bottom")
     try check(AppController.panelFrame(workArea: NSRect(x: 400, y: 200, width: 480, height: 240)) == NSRect(x: 400, y: 200, width: 480, height: 240), "small work area bounds panel without minimum width overflow")
@@ -133,8 +174,13 @@ import Combine
     controller.settings.windowShortcuts["left-half"] = "Control+Alt+X"
     controller.settings.autoPaste = false; controller.saveSettings()
     let editedMenu = controller.makeStatusMenu()
-    try check(editedMenu.items.contains { $0.title.hasPrefix("区域截图") && $0.title.contains("⌥⌘2") }, "saved screenshot shortcut updates the menu")
-    try check(editedMenu.item(withTitle: "调整窗口")?.submenu?.items.contains { $0.title.hasPrefix("左半屏") && $0.title.contains("⌃⌥X") } == true, "saved window shortcut updates submenu")
+    try check(editedMenu.item(withTitle: "区域截图")?.keyEquivalent == "2" && editedMenu.item(withTitle: "区域截图")?.keyEquivalentModifierMask == [.command, .option], "saved screenshot shortcut updates the menu")
+    try check(editedMenu.item(withTitle: "调整窗口")?.submenu?.item(withTitle: "左半屏")?.keyEquivalent == "x" && editedMenu.item(withTitle: "调整窗口")?.submenu?.item(withTitle: "左半屏")?.keyEquivalentModifierMask == [.control, .option], "saved window shortcut updates submenu")
+    controller.settings.screenshotHotkey = ""; controller.settings.windowManagerEnabled = false; controller.saveSettings()
+    let disabledMenu = controller.makeStatusMenu()
+    try check(disabledMenu.item(withTitle: "区域截图")?.keyEquivalent == "" && disabledMenu.item(withTitle: "区域截图")?.isEnabled == true, "disabled screenshot shortcut retains a clean clickable menu action")
+    try check(disabledMenu.item(withTitle: "调整窗口")?.submenu?.items.allSatisfy { $0.keyEquivalent.isEmpty } == true, "disabled window shortcuts are omitted while manual layouts remain available")
+    controller.settings.screenshotHotkey = "Command+Alt+2"; controller.settings.windowManagerEnabled = true; controller.saveSettings()
     try check(AppSettings(directory: directory).screenshotHotkey == "Command+Alt+2" && AppSettings(directory: directory).windowShortcuts["left-half"] == "Control+Alt+X", "screenshot and layout shortcut edits survive settings reload")
     try check(!AppSettings(directory: directory).autoPaste, "controller saves native settings")
     let savedHotkey = AppSettings(directory: directory).hotkey
@@ -143,6 +189,13 @@ import Combine
     let themedSettings = AppSettings(directory: directory)
     try check(themedSettings.appearance == "dark" && themedSettings.hotkey == savedHotkey, "toolbar appearance saves only persisted state without saving unregistered hotkey draft")
     try check(controller.settings.hotkey == "Command+Option+X", "theme change preserves active Settings draft")
+    controller.setDownloadPreferences(askEachTime: false, folder: directory.path)
+    let downloadSettings = AppSettings(directory: directory)
+    try check(!downloadSettings.downloadAskEachTime && downloadSettings.downloadFolder == directory.path && downloadSettings.hotkey == savedHotkey, "download preferences persist without saving unrelated shortcut drafts")
+    try check(controller.settings.hotkey == "Command+Option+X", "download preferences preserve active Settings draft")
+    controller.setCachePreferences(limitMB: 512, days: 30)
+    let cachedSettings = AppSettings(directory: directory)
+    try check(cachedSettings.studioCacheLimitMB == 512 && cachedSettings.studioCacheDays == 30 && cachedSettings.hotkey == savedHotkey, "cache preferences persist without saving unrelated shortcut drafts")
     controller.setAppearance("system")
     let recorderWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 220, height: 50), styleMask: [.titled, .closable], backing: .buffered, defer: false)
     recorderWindow.isReleasedWhenClosed = false
@@ -166,8 +219,18 @@ import Combine
     controller.shutdown()
     try await Task.sleep(nanoseconds: 160_000_000)
     try check(controller.message == "shutdown status", "shutdown cancels queued message cleanup")
-    let shortcutEntry = controller.makeStatusMenu().item(withTitle: "快捷键设置…")!
-    try check(NSApp.sendAction(shortcutEntry.action!, to: shortcutEntry.target, from: shortcutEntry) && controller.settingsSection == "shortcuts", "menu shortcut settings action opens the unified recorder page")
+    controller.showSettings(section: "shortcuts")
+    try check(controller.settingsSection == "shortcuts", "shortcut recorder remains accessible through unified settings")
+    let settingsEntry = controller.makeStatusMenu().item(withTitle: "设置…")!
+    try check(NSApp.sendAction(settingsEntry.action!, to: settingsEntry.target, from: settingsEntry) && controller.settingsSection == "shortcuts", "single settings entry preserves the last selected tab")
+    controller.showSettings(section: "studio")
+    try check(controller.settingsSection == "studio", "account connections remain accessible in settings")
+    controller.showSettings(section: "downloads")
+    try check(controller.settingsSection == "downloads", "download location preferences are accessible through settings")
+    controller.showSettings(section: "universal-control")
+    try check(controller.settingsSection == "downloads", "removed guide cannot become the selected settings section")
+    controller.showSettings(section: "not-a-settings-section")
+    try check(controller.settingsSection == "downloads", "unknown section cannot replace the selected settings tab")
     for window in NSApp.windows where window.title == "Kaki Tools 设置" { window.close() }
     print("Native controller interaction tests passed (private pasteboard, no external window actions)")
 }

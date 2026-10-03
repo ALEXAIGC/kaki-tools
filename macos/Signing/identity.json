@@ -1,0 +1,8 @@
+{
+  "name": "Kaki Tools Native Local",
+  "certificate_sha1": "C15FC08EC38C57388ECBA64B90D65EA9065E9DE5",
+  "type": "local-self-signed",
+  "trust_policy": "codeSign only, current user",
+  "private_key": "login keychain; never bundled",
+  "notarized": false
+}

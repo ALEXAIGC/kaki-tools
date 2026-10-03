@@ -4,15 +4,16 @@ import Combine
 import ApplicationServices
 import ServiceManagement
 
-@MainActor final class AppController: NSObject, ObservableObject {
+@MainActor final class AppController: NSObject, ObservableObject, NSWindowDelegate {
     enum Filter: String, CaseIterable { case all = "全部", text = "文本", image = "图片", pinned = "固定" }
     let store: HistoryStore
     let settings: AppSettings
     let clipboard: ClipboardService
-    let deskflow: DeskflowService
     let windows = WindowManager()
     let hotkeys = HotkeyManager()
     let log: NativeLog
+    let studio: StudioStore
+    let dreamina: DreaminaConnector
     let testMode: Bool
     @Published var query = "" { didSet { if query != oldValue { selectedID = nil; refreshItems() } } }
     @Published var filter: Filter = .all { didSet { if filter != oldValue { selectedID = nil; refreshItems() } } }
@@ -23,8 +24,11 @@ import ServiceManagement
     @Published var effectiveHotkey = ""
     @Published var settingsSection = "clipboard"
     @Published var screenshotBusy = false
+    @Published private(set) var accessibilityTrusted = false
+    private let accessibilityPermissionCheck: (Bool) -> Bool
     private var panel: ClipboardPanel?
     private var settingsWindow: NSWindow?
+    private var studioWindow: NSWindow?
     private var statusItem: NSStatusItem?
     private var previousApp: NSRunningApplication?
     private var subscriptions = Set<AnyCancellable>()
@@ -42,30 +46,42 @@ import ServiceManagement
     private var shuttingDown = false
     private var shortcutRecording = false
 
-    init(directory: URL, testMode: Bool, messageLifetime: TimeInterval = 5) {
+    init(directory: URL, testMode: Bool, messageLifetime: TimeInterval = 5, studioTransport: StudioTransport = StudioURLTransport(), dreaminaRunner: DreaminaRunning? = nil, accessibilityPermissionCheck: @escaping (Bool) -> Bool = { WindowManager.accessibilityTrusted(prompt: $0) }) {
         self.testMode = testMode
+        self.accessibilityPermissionCheck = accessibilityPermissionCheck
         self.messageLifetime = messageLifetime.isFinite && messageLifetime > 0 ? messageLifetime : 5
         settings = AppSettings(directory: directory)
         store = HistoryStore(directory: directory, limit: 100)
         clipboard = ClipboardService(store: store, pasteboard: testMode ? NSPasteboard(name: NSPasteboard.Name("kaki-native-test-" + UUID().uuidString)) : .general)
-        deskflow = DeskflowService(userData: directory)
         log = NativeLog(directory: directory)
+        studio = StudioStore(directory: directory, credentials: testMode ? StudioMemoryCredentials() : StudioKeychain(), transport: studioTransport, cacheLimitMB: settings.studioCacheLimitMB, cacheDays: settings.studioCacheDays, cacheFolder: settings.studioCacheFolder, cacheVolumeUUID: settings.studioCacheVolumeUUID)
+        dreamina = DreaminaConnector(directory: directory, runner: dreaminaRunner ?? (testMode ? DreaminaUnavailableRunner() : nil))
         super.init()
         store.onError = { [weak self] text in self?.report(text) }
         windows.onError = { [weak self] text in self?.report(text) }
         store.$items.combineLatest(store.$boards).receive(on: RunLoop.main).sink { [weak self] _, _ in
             self?.refreshItems()
         }.store(in: &subscriptions)
+        studio.$user.combineLatest(studio.$environment).sink { [weak self] user, environment in
+            self?.dreamina.setOwner(user.map { KakiConnectionOwner(environment: environment.rawValue, userID: $0.id) })
+        }.store(in: &subscriptions)
         settings.objectWillChange.sink { [weak self] in
             DispatchQueue.main.async { self?.applyAppearance() }
         }.store(in: &subscriptions)
         NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification).sink { [weak self] _ in
+            self?.refreshAccessibilityPermission()
             self?.objectWillChange.send()
         }.store(in: &subscriptions)
+        NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification).sink { [weak self] notification in
+            guard let self, let window = notification.object as? NSWindow, window === self.settingsWindow else { return }
+            self.refreshAccessibilityPermission()
+        }.store(in: &subscriptions)
+        refreshAccessibilityPermission()
         refreshItems()
         applyAppearance()
     }
     func start() {
+        studio.startCacheMaintenance()
         log.write("原生应用启动 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development")")
         buildStatusItem()
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -270,7 +286,7 @@ import ServiceManagement
         return false
     }
     private func shortcutBindings(panelShortcut: String) -> [String: String] {
-        var result = ["panel": panelShortcut, "screenshot": settings.screenshotHotkey]
+        var result = ["panel": panelShortcut, "studio": settings.studioHotkey, "screenshot": settings.screenshotHotkey]
         if settings.windowManagerEnabled {
             for (key, value) in WindowManager.defaultShortcuts.merging(settings.windowShortcuts, uniquingKeysWith: { _, new in new }) {
                 if !value.isEmpty { result["window:" + key] = value }
@@ -288,6 +304,7 @@ import ServiceManagement
         var failures = hotkeys.register(bindings: bindings) { [weak self] action in self?.performHotkey(action) }
         if allowFallback && failures.contains("panel") {
             for fallback in settings.fallbackHotkeys {
+                if HotkeyChord.parse(fallback) == HotkeyChord.parse(settings.studioHotkey) { continue }
                 candidate = fallback; bindings = shortcutBindings(panelShortcut: candidate)
                 failures = hotkeys.register(bindings: bindings) { [weak self] action in self?.performHotkey(action) }
                 if !failures.contains("panel") { break }
@@ -305,6 +322,7 @@ import ServiceManagement
     private func performHotkey(_ action: String) {
         guard !shortcutRecording && !shuttingDown else { return }
         if action == "panel" { panel?.isVisible == true ? hidePanel(restoreFocus: true) : showPanel() }
+        else if action == "studio" { studioWindow?.isKeyWindow == true ? hideStudio(restoreFocus: true) : showStudio() }
         else if action == "screenshot" { takeScreenshot() }
         else if action.hasPrefix("window:") { arrangeWindow(String(action.dropFirst(7))) }
     }
@@ -362,16 +380,164 @@ import ServiceManagement
         NSApp.appearance = settings.appearance == "dark" ? NSAppearance(named: .darkAqua) : settings.appearance == "light" ? NSAppearance(named: .aqua) : nil
     }
     func showSettings(section: String? = nil) {
-        if let section, ["clipboard", "shortcuts", "deskflow", "about"].contains(section) { settingsSection = section }
+        refreshAccessibilityPermission()
+        if let section, ["clipboard", "shortcuts", "studio", "downloads", "about"].contains(section) { settingsSection = section }
         hidePanel()
         if settingsWindow == nil {
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 660), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 880, height: 700), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
             window.title = "Kaki Tools 设置"; window.isReleasedWhenClosed = false
-            window.minSize = NSSize(width: 600, height: 540)
-            window.contentView = NSHostingView(rootView: NativeSettingsView(controller: self, settings: settings, deskflow: deskflow))
+            window.minSize = NSSize(width: 760, height: 608)
+            window.contentView = NSHostingView(rootView: NativeSettingsView(controller: self, settings: settings))
             settingsWindow = window
         }
         settingsWindow?.center(); settingsWindow?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+    }
+    func showStudio() {
+        let front = NSWorkspace.shared.frontmostApplication
+        if front?.processIdentifier != ProcessInfo.processInfo.processIdentifier { previousApp = front }
+        hidePanel()
+        if studioWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 680), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            window.title = "Kaki Tools · Studio 素材库"; window.isReleasedWhenClosed = false; window.delegate = self
+            window.minSize = NSSize(width: 700, height: 520)
+            window.contentView = NSHostingView(rootView: StudioLibraryView(studio: studio,
+                copyMaterial: { [weak self] asset in self?.copyStudioMaterial(asset) },
+                copyReferences: { [weak self] ids in self?.copyStudioReferences(ids) },
+                downloadMaterials: { [weak self] ids in self?.downloadStudioMaterials(ids) },
+                openDownloadSettings: { [weak self] in self?.showSettings(section: "downloads") },
+                close: { [weak self] in self?.hideStudio(restoreFocus: true) }))
+            studioWindow = window
+        }
+        studioWindow?.center(); studioWindow?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+        studio.setLibraryActive(true)
+    }
+    func copyStudioMaterial(_ asset: StudioAsset) {
+        studio.copyMaterial(asset, consumeImage: { [weak self] data in
+            guard let self, self.clipboard.writeImage(data) != nil else { return false }
+            _ = self.store.captureImage(data: data)
+            self.hideStudio(restoreFocus: true)
+            return true
+        }, consumeFile: { [weak self] file in
+            guard let self, self.clipboard.writeMaterialFile(file) != nil else { return false }
+            self.hideStudio(restoreFocus: true)
+            return true
+        })
+    }
+    func setDownloadPreferences(askEachTime: Bool, folder: String) {
+        // Download preferences must not persist unregistered shortcut drafts.
+        let saved = AppSettings(directory: store.directory)
+        if let error = saved.loadError { report(error); return }
+        saved.downloadAskEachTime = askEachTime; saved.downloadFolder = folder
+        do {
+            try saved.save()
+            settings.downloadAskEachTime = askEachTime; settings.downloadFolder = folder
+            message = "下载设置已保存。"
+        } catch { report("下载设置保存失败：" + error.localizedDescription) }
+    }
+    func setCachePreferences(limitMB: Int, days: Int) {
+        let saved = AppSettings(directory: store.directory)
+        if let error = saved.loadError { report(error); return }
+        saved.studioCacheLimitMB = AppSettings.cacheLimit(limitMB); saved.studioCacheDays = AppSettings.cacheDays(days)
+        do {
+            try saved.save()
+            settings.studioCacheLimitMB = saved.studioCacheLimitMB; settings.studioCacheDays = saved.studioCacheDays
+            Task { await studio.configureCache(limitMB: saved.studioCacheLimitMB, days: saved.studioCacheDays) }
+            message = "缓存设置已保存。"
+        } catch { report("缓存设置保存失败：" + error.localizedDescription) }
+    }
+    func chooseCacheFolder() {
+        guard !studio.mediaBusy, !studio.cacheChanging else { return }
+        let panel = NSOpenPanel(); panel.title = "选择缓存磁盘或文件夹"
+        panel.canChooseDirectories = true; panel.canChooseFiles = false; panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true; panel.prompt = "用作缓存位置"
+        panel.message = "将在所选位置创建 Kaki Tools Cache 文件夹。切换位置时清理原缓存。"
+        if !settings.studioCacheFolder.isEmpty { panel.directoryURL = URL(fileURLWithPath: settings.studioCacheFolder) }
+        panel.begin { [weak self] response in
+            guard response == .OK, let self, let folder = panel.url else { return }
+            let selected = folder.resolvingSymlinksInPath()
+            let volume = (try? selected.resourceValues(forKeys: [.volumeUUIDStringKey]).volumeUUIDString) ?? ""
+            self.setCacheLocation(folder: selected.path, volumeUUID: volume)
+        }
+    }
+    func setCacheLocation(folder: String, volumeUUID: String) {
+        Task { [weak self] in
+            guard let self else { return }
+            let saved = AppSettings(directory: self.store.directory)
+            if let error = saved.loadError { self.report(error); return }
+            let oldFolder = saved.studioCacheFolder, oldVolume = saved.studioCacheVolumeUUID
+            do {
+                try await self.studio.changeCacheLocation(folder: folder, volumeUUID: volumeUUID)
+                saved.studioCacheFolder = folder; saved.studioCacheVolumeUUID = volumeUUID
+                do { try saved.save() }
+                catch {
+                    try? await self.studio.changeCacheLocation(folder: oldFolder, volumeUUID: oldVolume)
+                    throw error
+                }
+                self.settings.studioCacheFolder = folder; self.settings.studioCacheVolumeUUID = volumeUUID
+                self.message = "缓存位置已保存。"
+            } catch { self.report("缓存位置切换失败：" + error.localizedDescription) }
+        }
+    }
+    func chooseDownloadFolder() {
+        let panel = NSOpenPanel(); panel.title = "选择默认下载文件夹"
+        panel.canChooseDirectories = true; panel.canChooseFiles = false; panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true; panel.prompt = "选择"
+        if !settings.downloadFolder.isEmpty { panel.directoryURL = URL(fileURLWithPath: settings.downloadFolder) }
+        panel.begin { [weak self] response in
+            guard response == .OK, let self, let folder = panel.url else { return }
+            self.setDownloadPreferences(askEachTime: false, folder: folder.path)
+        }
+    }
+    func downloadStudioMaterials(_ ids: [String]) {
+        guard !studio.mediaBusy, !ids.isEmpty else { return }
+        let revision = studio.sessionRevision
+        if !settings.downloadAskEachTime && !settings.downloadFolder.isEmpty {
+            let directory = URL(fileURLWithPath: settings.downloadFolder, isDirectory: true)
+            if StudioMediaFiles.isWritableDirectory(directory) { studio.download(ids: ids, to: directory); return }
+            studio.setMessage("默认文件夹不可用，请重新选择下载位置。")
+        }
+        if ids.count == 1, let asset = studio.assets.first(where: { $0.id == ids[0] }) {
+            Task { [weak self] in
+                guard let self, let filename = await self.studio.suggestedFilename(asset), self.studio.sessionRevision == revision else { return }
+                let panel = NSSavePanel(); panel.title = "下载素材"; panel.nameFieldStringValue = filename
+                panel.begin { [weak self] response in
+                    guard response == .OK, let self, self.studio.sessionRevision == revision, let file = panel.url else { return }
+                    self.studio.download(asset, destination: file)
+                }
+            }
+        } else {
+            let panel = NSOpenPanel(); panel.title = "下载 \(ids.count) 项素材"
+            panel.canChooseDirectories = true; panel.canChooseFiles = false; panel.allowsMultipleSelection = false
+            panel.canCreateDirectories = true; panel.prompt = "下载到此处"
+            panel.begin { [weak self] response in
+                guard response == .OK, let self, self.studio.sessionRevision == revision, let directory = panel.url else { return }
+                self.studio.download(ids: ids, to: directory)
+            }
+        }
+    }
+    func hideStudio(restoreFocus: Bool = false) {
+        studio.setLibraryActive(false); studioWindow?.orderOut(nil)
+        if !testMode, restoreFocus, NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier {
+            previousApp?.activate(options: [])
+        }
+    }
+    func copyStudioReferences(_ ids: [String]) {
+        guard !studio.mediaBusy else { studio.setMessage("正在读取素材，请稍候再操作。"); return }
+        do {
+            let text = try studio.referenceText(ids: ids)
+            guard clipboard.writeStudioReferences(text) != nil else { throw StudioError.invalidResponse }
+            studio.dismissMessage()
+            hideStudio(restoreFocus: true)
+        } catch { studio.setMessage("素材引用未能复制，请重新选择后重试。") }
+    }
+    func windowDidBecomeKey(_ notification: Notification) {
+        if notification.object as? NSWindow === studioWindow { studio.setLibraryActive(true) }
+    }
+    func windowDidResignKey(_ notification: Notification) {
+        if notification.object as? NSWindow === studioWindow { studio.setLibraryActive(false) }
+    }
+    func windowWillClose(_ notification: Notification) {
+        if notification.object as? NSWindow === studioWindow { studio.setLibraryActive(false) }
     }
     func takeScreenshot() {
         guard !screenshotBusy && !testMode else { return }
@@ -419,7 +585,14 @@ import ServiceManagement
     func clearHistory() {
         if confirm("清空普通历史？", detail: "包括固定项；收藏中的独立副本会保留。") { store.clearHistory() }
     }
-    func requestAccessibility() { _ = WindowManager.accessibilityTrusted(prompt: true) }
+    func refreshAccessibilityPermission() {
+        let trusted = accessibilityPermissionCheck(false)
+        if accessibilityTrusted != trusted { accessibilityTrusted = trusted }
+    }
+    func requestAccessibility() {
+        _ = accessibilityPermissionCheck(true)
+        refreshAccessibilityPermission()
+    }
     func openAccessibilitySettings() { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!) }
     func setLaunchAtLogin(_ enabled: Bool) {
         do { if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }; message = "开机启动设置已更新。" }
@@ -441,8 +614,10 @@ import ServiceManagement
     private func buildStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem?.button {
-            button.title = "K"
-            button.font = NSFont.systemFont(ofSize: 16, weight: .heavy)
+            button.title = ""
+            button.image = NativeBrand.menuImage
+            button.imagePosition = .imageOnly
+            button.imageScaling = .scaleNone
             button.toolTip = "Kaki Tools · 剪贴板与窗口调整"
             button.setAccessibilityLabel("Kaki Tools")
         }
@@ -452,40 +627,48 @@ import ServiceManagement
         guard let statusItem else { return }
         statusItem.menu = makeStatusMenu()
     }
-    private func shortcutMenuTitle(_ title: String, action: String) -> String {
-        if failedShortcutActions.contains(action) { return title + "（快捷键未注册）" }
-        guard let accelerator = lastBindings[action], let chord = HotkeyChord.parse(accelerator) else { return title + "（未设置快捷键）" }
-        return title + "    " + chord.label
+    private func menuItem(_ title: String, selector: Selector, shortcutAction: String? = nil) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+        item.target = self
+        if let action = shortcutAction {
+            if failedShortcutActions.contains(action) {
+                item.toolTip = "快捷键未注册，请在设置 → 快捷键中调整。"
+            } else if let accelerator = lastBindings[action], let chord = HotkeyChord.parse(accelerator) {
+                item.keyEquivalent = chord.menuKeyEquivalent
+                item.keyEquivalentModifierMask = chord.menuModifierFlags
+            }
+        }
+        return item
     }
     func makeStatusMenu() -> NSMenu {
         let menu = NSMenu()
-        menu.addItem(withTitle: "打开剪贴板", action: #selector(menuShowPanel), keyEquivalent: "")
-        let shortcut = NSMenuItem(title: shortcutMenuTitle("快捷键：", action: "panel"), action: nil, keyEquivalent: ""); shortcut.isEnabled = false; menu.addItem(shortcut)
-        menu.addItem(.separator())
+        menu.addItem(menuItem("打开剪贴板", selector: #selector(menuShowPanel), shortcutAction: "panel"))
+        menu.addItem(menuItem("打开素材库", selector: #selector(menuShowStudio), shortcutAction: "studio"))
         let arrange = NSMenuItem(title: "调整窗口", action: nil, keyEquivalent: ""), layouts = NSMenu()
-        for layout in WindowManager.layouts {
-            let item = NSMenuItem(title: shortcutMenuTitle(layout.label, action: "window:" + layout.id), action: #selector(menuArrange(_:)), keyEquivalent: ""); item.representedObject = layout.id; item.target = self; layouts.addItem(item)
+        let groups = [["maximize", "center"], ["left-half", "right-half", "top-half", "bottom-half"],
+                      ["top-left", "top-right", "bottom-left", "bottom-right"],
+                      ["left-third", "center-third", "right-third", "left-two-thirds", "right-two-thirds"]]
+        for (index, group) in groups.enumerated() {
+            if index > 0 { layouts.addItem(.separator()) }
+            for key in group {
+                guard let layout = WindowManager.layouts.first(where: { $0.id == key }) else { continue }
+                let item = menuItem(layout.label, selector: #selector(menuArrange(_:)), shortcutAction: "window:" + layout.id)
+                item.representedObject = layout.id; layouts.addItem(item)
+            }
         }
-        layouts.addItem(.separator())
-        let edit = NSMenuItem(title: "调整快捷键…", action: #selector(menuShortcutSettings), keyEquivalent: ""); edit.target = self
-        layouts.addItem(edit)
         arrange.submenu = layouts; menu.addItem(arrange)
-        menu.addItem(withTitle: shortcutMenuTitle("区域截图", action: "screenshot"), action: #selector(menuScreenshot), keyEquivalent: "")
-        menu.addItem(withTitle: "快捷键设置…", action: #selector(menuShortcutSettings), keyEquivalent: "")
-        menu.addItem(withTitle: "设置…", action: #selector(menuSettings), keyEquivalent: ",")
-        menu.addItem(withTitle: "辅助功能权限…", action: #selector(menuPermissions), keyEquivalent: "")
+        menu.addItem(menuItem("区域截图", selector: #selector(menuScreenshot), shortcutAction: "screenshot"))
         menu.addItem(.separator())
-        menu.addItem(withTitle: "关于 Kaki Tools", action: #selector(menuAbout), keyEquivalent: "")
+        menu.addItem(withTitle: "设置…", action: #selector(menuSettings), keyEquivalent: ",")
         menu.addItem(withTitle: "退出 Kaki Tools", action: #selector(menuQuit), keyEquivalent: "q")
         for item in menu.items where item.action != nil { item.target = self }
         return menu
     }
     @objc private func menuShowPanel() { showPanel() }
+    @objc private func menuShowStudio() { showStudio() }
     @objc private func menuArrange(_ sender: NSMenuItem) { if let key = sender.representedObject as? String { arrangeWindow(key) } }
     @objc private func menuScreenshot() { takeScreenshot() }
     @objc private func menuSettings() { showSettings() }
-    @objc private func menuShortcutSettings() { showSettings(section: "shortcuts") }
-    @objc private func menuPermissions() { requestAccessibility(); openAccessibilitySettings() }
     func showAbout() {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "开发版本"
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
@@ -494,13 +677,14 @@ import ServiceManagement
             .credits: NSAttributedString(string: "剪贴板 · 窗口调整 · 原生截图\nSwift / AppKit / SwiftUI")])
         NSApp.activate(ignoringOtherApps: true)
     }
-    @objc private func menuAbout() { showAbout() }
     @objc private func menuQuit() { NSApp.terminate(nil) }
     func shutdown() {
         guard !shuttingDown else { return }; shuttingDown = true
         pasteGeneration += 1; arrangementGeneration += 1; searchGeneration += 1; searchTask?.cancel()
         messageClearGeneration += 1; messageClearTask?.cancel(); messageClearTask = nil
-        clipboard.stop(); hotkeys.unregisterAll(); windows.cancel(); deskflow.shutdown()
+        studio.shutdown()
+        dreamina.shutdown()
+        clipboard.stop(); hotkeys.unregisterAll(); windows.cancel()
         if let process = screenshotProcess, process.isRunning { process.terminate() }; screenshotProcess = nil
         if let monitor = eventMonitor { NSEvent.removeMonitor(monitor) }
         store.flush(); log.write("原生应用正常退出"); log.flush()

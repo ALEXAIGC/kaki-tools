@@ -9,11 +9,19 @@ images/
 settings.json
 
 # Compiled optional runtime and archived generated artifacts.
-components/bin/
-components/deskflow/
+legacy/deskflow/components/bin/
+legacy/deskflow/components/deskflow/
 legacy/electron/native/bin/
 legacy/electron/native/deskflow/
 
 # Legacy top-level entry files.
 /index.js
 /app.js
+
+# Signing secrets belong in Keychain, never in the repository.
+*.p12
+*.pfx
+*.key
+**/private-key.pem
+**/passphrase
+__pycache__/
