@@ -15,10 +15,18 @@ import ServiceManagement
     let studio: StudioStore
     let dreamina: DreaminaConnector
     let testMode: Bool
-    @Published var query = "" { didSet { if query != oldValue { selectedID = nil; refreshItems() } } }
+    @Published var query = "" {
+        didSet {
+            guard query != oldValue else { return }
+            if Self.normalizedQuery(query) != Self.normalizedQuery(oldValue) { selectedID = nil }
+            refreshItems()
+        }
+    }
     @Published var filter: Filter = .all { didSet { if filter != oldValue { selectedID = nil; refreshItems() } } }
     @Published var board: String? { didSet { if board != oldValue { selectedID = nil; refreshItems() } } }
     @Published private(set) var visibleItems: [HistoryItem] = []
+    @Published private(set) var searching = false
+    @Published private var textPresentations: [String: ClipboardTextPresentation] = [:]
     @Published var selectedID: String?
     @Published var message = "" { didSet { scheduleMessageClear() } }
     @Published var effectiveHotkey = ""
@@ -31,9 +39,28 @@ import ServiceManagement
     private var studioWindow: NSWindow?
     private var statusItem: NSStatusItem?
     private var previousApp: NSRunningApplication?
+    private var panelTarget: NSRunningApplication?
+    private var focusContext = ClipboardFocusContext()
     private var subscriptions = Set<AnyCancellable>()
     private var eventMonitor: Any?
     private var searchTask: DispatchWorkItem?
+    private var searchCancellation: ClipboardSearchCancellation?
+    private let searchQueue = DispatchQueue(label: "com.kakitools.search", qos: .userInitiated)
+    private let presentationQueue = DispatchQueue(label: "com.kakitools.text-preview", qos: .utility)
+    private var presentationTickets: [String: UUID] = [:]
+    private struct SearchKey: Equatable {
+        let revision: Int
+        let query: String
+        let board: String?
+        let filter: Filter
+    }
+    private var resolvedSearch: SearchKey?
+    private var requestedSearch: SearchKey?
+    private var resultItems: [String: HistoryItem] = [:]
+    private var pendingSelectionActions: [(key: SearchKey, focus: Int, action: () -> Void)] = []
+    private var countsRevision = -1
+    private var countsBoard: String?
+    private var cachedCounts: [Filter: Int] = [:]
     private var messageClearTask: DispatchWorkItem?
     private var messageClearGeneration = 0
     private let messageLifetime: TimeInterval
@@ -61,6 +88,7 @@ import ServiceManagement
         windows.onError = { [weak self] text in self?.report(text) }
         store.$items.combineLatest(store.$boards).receive(on: RunLoop.main).sink { [weak self] _, _ in
             self?.refreshItems()
+            self?.pruneTextPresentations()
         }.store(in: &subscriptions)
         studio.$user.combineLatest(studio.$environment).sink { [weak self] user, environment in
             self?.dreamina.setOwner(user.map { KakiConnectionOwner(environment: environment.rawValue, userID: $0.id) })
@@ -110,20 +138,97 @@ import ServiceManagement
     func report(_ text: String) {
         message = text; log.write(text)
     }
+    private var currentSearch: SearchKey {
+        SearchKey(revision: store.revision, query: Self.normalizedQuery(query), board: board, filter: filter)
+    }
+    private nonisolated static func normalizedQuery(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
     func refreshItems() {
+        guard !shuttingDown else { return }
+        let key = currentSearch
+        pendingSelectionActions.removeAll { $0.key != key }
+        if resolvedSearch == key {
+            if requestedSearch != nil {
+                searchTask?.cancel(); searchCancellation?.cancel(); searchGeneration += 1
+                requestedSearch = nil
+            }
+            searching = false
+            if selectedID.flatMap({ resultItems[$0] }) == nil { selectedID = visibleItems.first?.id }
+            return
+        }
+        guard requestedSearch != key else { return }
         searchTask?.cancel(); searchGeneration += 1
-        let generation = searchGeneration, items = store.items, query = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let board = board, filter = filter
+        searchCancellation?.cancel()
+        let generation = searchGeneration, items = store.items
+        let cancellation = ClipboardSearchCancellation(); searchCancellation = cancellation
+        requestedSearch = key
+        // Empty search only compares small metadata; it never walks the text bodies.
+        if key.query.isEmpty {
+            commitSearch(Self.matchingItems(items, query: "", board: key.board, filter: key.filter), key: key)
+            return
+        }
+        searching = true
         let work = DispatchWorkItem { [weak self] in
-            let result = Self.matchingItems(items, query: query, board: board, filter: filter)
+            var result: [HistoryItem] = []
+            for item in items {
+                guard !cancellation.isCancelled else { return }
+                if Self.matches(item, normalizedQuery: key.query, board: key.board, filter: key.filter) { result.append(item) }
+            }
+            guard !cancellation.isCancelled else { return }
             DispatchQueue.main.async {
-                guard let self, self.searchGeneration == generation else { return }
-                self.visibleItems = result
-                if !result.contains(where: { $0.id == self.selectedID }) { self.selectedID = result.first?.id }
+                guard let self, !self.shuttingDown, self.searchGeneration == generation, self.currentSearch == key else { return }
+                self.commitSearch(result, key: key)
             }
         }
         searchTask = work
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + (query.isEmpty ? 0 : 0.06), execute: work)
+        searchQueue.asyncAfter(deadline: .now() + 0.06, execute: work)
+    }
+    private func commitSearch(_ result: [HistoryItem], key: SearchKey) {
+        resolvedSearch = key; requestedSearch = nil
+        resultItems = Dictionary(result.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        visibleItems = result; searching = false
+        if selectedID.flatMap({ resultItems[$0] }) == nil { selectedID = result.first?.id }
+        let pending = pendingSelectionActions; pendingSelectionActions.removeAll()
+        for intent in pending where intent.key == key && intent.focus == pasteGeneration {
+            // A preceding action can change history and start another search.
+            // Preserve keyboard order, including the selection repair after deletion.
+            withCurrentItems(intent.action)
+        }
+    }
+    private func withCurrentItems(_ action: @escaping () -> Void) {
+        guard !shuttingDown else { return }
+        if resolveCurrentItems() { action() }
+        else { pendingSelectionActions.append((currentSearch, pasteGeneration, action)) }
+    }
+    private func pruneTextPresentations() {
+        let ids = Set(store.items.map(\.id))
+        textPresentations = textPresentations.filter { ids.contains($0.key) }
+        presentationTickets = presentationTickets.filter { ids.contains($0.key) }
+    }
+    func requestTextPresentation(_ item: HistoryItem) {
+        guard !shuttingDown, item.type == "text", textPresentations[item.id] == nil, presentationTickets[item.id] == nil else { return }
+        let id = item.id, text = item.text ?? "", ticket = UUID()
+        presentationTickets[id] = ticket
+        presentationQueue.async { [weak self] in
+            let value = ClipboardTextPresentation(text)
+            DispatchQueue.main.async {
+                guard let self, !self.shuttingDown, self.presentationTickets[id] == ticket else { return }
+                self.presentationTickets[id] = nil
+                guard self.store.items.contains(where: { $0.id == id && $0.text == text }) else { return }
+                self.textPresentations[id] = value
+            }
+        }
+    }
+    func summary(for item: HistoryItem) -> String {
+        textPresentations[item.id]?.summary ?? ClipboardTextPresentation.summary(item.text ?? "", scanLimit: 4096)
+    }
+    func textCount(for item: HistoryItem) -> Int? { textPresentations[item.id]?.utf16Count }
+    private func recordExternalFocus() {
+        let front = NSWorkspace.shared.frontmostApplication, own = ProcessInfo.processInfo.processIdentifier
+        let revision = focusContext.revision
+        focusContext.enter(frontPID: front?.processIdentifier, ownPID: own)
+        if focusContext.revision != revision { previousApp = front }
     }
     nonisolated static func matchingItems(_ items: [HistoryItem], query: String, board: String?, filter: Filter) -> [HistoryItem] {
         let query = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -148,11 +253,16 @@ import ServiceManagement
         }
         return result
     }
-    var currentBoardCounts: [Filter: Int] { Self.boardCounts(store.items, board: board) }
+    var currentBoardCounts: [Filter: Int] {
+        if countsRevision != store.revision || countsBoard != board {
+            cachedCounts = Self.boardCounts(store.items, board: board)
+            countsRevision = store.revision; countsBoard = board
+        }
+        return cachedCounts
+    }
     var selectedItem: HistoryItem? {
-        guard let selectedID, let item = store.items.first(where: { $0.id == selectedID }) else { return nil }
-        let query = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return Self.matches(item, normalizedQuery: query, board: board, filter: filter) ? item : nil
+        guard resolvedSearch == currentSearch, let selectedID else { return nil }
+        return resultItems[selectedID]
     }
     var canPasteSelected: Bool {
         guard let item = selectedItem else { return false }
@@ -162,45 +272,49 @@ import ServiceManagement
     var canPinSelected: Bool { selectedItem != nil && !store.isReadOnly }
     var canDeleteSelected: Bool { selectedItem != nil && !store.isReadOnly }
     func selectItem(_ id: String) {
-        resolveCurrentItems()
-        if visibleItems.contains(where: { $0.id == id }) { selectedID = id }
+        guard resolveCurrentItems(), resultItems[id] != nil, selectedID != id else { return }
+        selectedID = id
     }
     func activateSelected(plainText: Bool = false, copyOnly: Bool = false) {
-        resolveCurrentItems()
-        guard let item = selectedItem, !plainText || item.type == "text" else { return }
-        activate(item.id, plainText: plainText, copyOnly: copyOnly)
+        withCurrentItems { [weak self] in
+            guard let self, let item = self.selectedItem, !plainText || item.type == "text" else { return }
+            self.activate(item.id, plainText: plainText, copyOnly: copyOnly)
+        }
     }
     func toggleSelectedPin() {
-        resolveCurrentItems()
-        guard canPinSelected, let item = selectedItem else { return }
-        store.togglePin(id: item.id)
-        resolveCurrentItems()
+        withCurrentItems { [weak self] in
+            guard let self, self.canPinSelected, let item = self.selectedItem else { return }
+            self.store.togglePin(id: item.id); self.refreshItems()
+        }
     }
     func deleteSelected() {
-        resolveCurrentItems()
-        guard canDeleteSelected, let item = selectedItem,
-              let index = visibleItems.firstIndex(where: { $0.id == item.id }) else { return }
-        store.remove(id: item.id)
-        resolveCurrentItems()
-        if !visibleItems.isEmpty { selectedID = visibleItems[min(index, visibleItems.count - 1)].id }
+        withCurrentItems { [weak self] in
+            guard let self, self.canDeleteSelected, let item = self.selectedItem,
+                  let index = self.visibleItems.firstIndex(where: { $0.id == item.id }) else { return }
+            self.store.remove(id: item.id)
+            self.withCurrentItems { [weak self] in
+                guard let self, !self.visibleItems.isEmpty else { return }
+                self.selectedID = self.visibleItems[min(index, self.visibleItems.count - 1)].id
+            }
+        }
     }
     func focusSearch() { NotificationCenter.default.post(name: .kakiFocusSearch, object: self) }
-    func resolveCurrentItems() {
-        // Rendering is debounced; actions always resolve the latest canonical state.
-        searchTask?.cancel(); searchGeneration += 1
-        visibleItems = Self.matchingItems(store.items, query: query, board: board, filter: filter)
-        if !visibleItems.contains(where: { $0.id == selectedID }) { selectedID = visibleItems.first?.id }
+    @discardableResult func resolveCurrentItems() -> Bool {
+        guard !shuttingDown else { return false }
+        refreshItems()
+        return resolvedSearch == currentSearch
     }
     func selectRelative(_ step: Int) {
-        resolveCurrentItems()
-        guard !visibleItems.isEmpty else { return }
-        let index = visibleItems.firstIndex { $0.id == selectedID } ?? 0
-        selectedID = visibleItems[max(0, min(visibleItems.count - 1, index + step))].id
+        withCurrentItems { [weak self] in
+            guard let self, !self.visibleItems.isEmpty else { return }
+            let index = self.visibleItems.firstIndex { $0.id == self.selectedID } ?? 0
+            self.selectedID = self.visibleItems[max(0, min(self.visibleItems.count - 1, index + step))].id
+        }
     }
     func showPanel() {
-        pasteGeneration += 1
-        let front = NSWorkspace.shared.frontmostApplication
-        if front?.processIdentifier != ProcessInfo.processInfo.processIdentifier { previousApp = front }
+        cancelPendingClipboardActions()
+        recordExternalFocus()
+        panelTarget = previousApp?.processIdentifier == focusContext.externalPID ? previousApp : nil
         if panel == nil {
             let p = ClipboardPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
             p.isFloatingPanel = true; p.level = .floating
@@ -222,7 +336,8 @@ import ServiceManagement
         NSRect(x: workArea.minX, y: workArea.minY, width: workArea.width, height: min(332, workArea.height))
     }
     func hidePanel(restoreFocus: Bool = false) {
-        pasteGeneration += 1; panel?.orderOut(nil)
+        cancelPendingClipboardActions(); panel?.orderOut(nil)
+        panelTarget = nil
         NotificationCenter.default.post(name: .kakiPanelHidden, object: self)
         if restoreFocus, NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier {
             previousApp?.activate(options: [])
@@ -231,11 +346,18 @@ import ServiceManagement
     func panelLostFocus() {
         if settings.hideOnBlur && settingsWindow?.isKeyWindow != true { hidePanel() }
     }
+    func cancelPendingClipboardActions() {
+        pasteGeneration += 1
+        pendingSelectionActions.removeAll()
+    }
     func activate(_ id: String, plainText: Bool = false, copyOnly: Bool = false) {
-        resolveCurrentItems()
+        guard resolveCurrentItems() else {
+            withCurrentItems { [weak self] in self?.activate(id, plainText: plainText, copyOnly: copyOnly) }
+            return
+        }
         if store.isPending(id: id) { report("图片正在后台处理，完成后即可使用。"); return }
         guard visibleItems.contains(where: { $0.id == id }), let item = store.item(id: id) else { return }
-        let target = previousApp, frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let target = panelTarget, frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
         let eligible = frontPID == target?.processIdentifier || frontPID == ProcessInfo.processInfo.processIdentifier
         guard let count = clipboard.write(item: item, plainText: plainText) else { report("复制失败，原历史已保留。"); return }
         store.touch(id: id)
@@ -262,17 +384,18 @@ import ServiceManagement
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if let editor = panel?.firstResponder as? NSTextView, editor.hasMarkedText() { return false }
         if event.keyCode == 53 { hidePanel(restoreFocus: true); return true }
-        let selectionKeys: Set<UInt16> = [36, 76, 123, 124, 125, 126, 51, 117]
-        if selectionKeys.contains(event.keyCode) || flags.contains(.command) { resolveCurrentItems() }
         if flags.contains(.command), let char = event.charactersIgnoringModifiers, let digit = Int(char), digit >= 1, digit <= 9 {
-            if visibleItems.count >= digit { activate(visibleItems[digit - 1].id, plainText: flags.contains(.shift)) }
+            withCurrentItems { [weak self] in
+                guard let self, self.visibleItems.count >= digit else { return }
+                self.activate(self.visibleItems[digit - 1].id, plainText: flags.contains(.shift))
+            }
             return true
         }
         if flags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "f" { focusSearch(); return true }
         if flags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "p" { toggleSelectedPin(); return true }
         if flags.contains(.command), event.charactersIgnoringModifiers == "," { showSettings(); return true }
         if event.keyCode == 36 || event.keyCode == 76 {
-            if let selectedID { activate(selectedID, plainText: flags.contains(.shift)) }; return true
+            activateSelected(plainText: flags.contains(.shift)); return true
         }
         let editor = panel?.firstResponder as? NSTextView
         let editing = editor != nil
@@ -293,6 +416,14 @@ import ServiceManagement
         }
         return result.filter { !$0.value.isEmpty }
     }
+    nonisolated static func availableFallbacks(_ candidates: [String], bindings: [String: String]) -> [String] {
+        let occupied = Set(bindings.filter { $0.key != "panel" }.values.compactMap(HotkeyChord.parse))
+        var used = Set<HotkeyChord>()
+        return candidates.filter {
+            guard let chord = HotkeyChord.parse($0), !occupied.contains(chord) else { return false }
+            return used.insert(chord).inserted
+        }
+    }
     @discardableResult func registerShortcuts(allowFallback: Bool) -> [String] {
         guard !testMode else {
             effectiveHotkey = settings.hotkey
@@ -302,8 +433,7 @@ import ServiceManagement
         var candidate = settings.hotkey, bindings = shortcutBindings(panelShortcut: candidate)
         var failures = hotkeys.register(bindings: bindings) { [weak self] action in self?.performHotkey(action) }
         if allowFallback && failures.contains("panel") {
-            for fallback in settings.fallbackHotkeys {
-                if HotkeyChord.parse(fallback) == HotkeyChord.parse(settings.studioHotkey) { continue }
+            for fallback in Self.availableFallbacks(settings.fallbackHotkeys, bindings: bindings) {
                 candidate = fallback; bindings = shortcutBindings(panelShortcut: candidate)
                 failures = hotkeys.register(bindings: bindings) { [weak self] action in self?.performHotkey(action) }
                 if !failures.contains("panel") { break }
@@ -330,6 +460,13 @@ import ServiceManagement
         windows.cancel()
         let front = NSWorkspace.shared.frontmostApplication
         let frontPID = front?.processIdentifier
+        if panel?.isVisible != true, frontPID == ProcessInfo.processInfo.processIdentifier {
+            guard let window = NSApp.keyWindow, window === settingsWindow || window === studioWindow else {
+                report("请先选择要调整的窗口。"); return
+            }
+            _ = arrangeLocalWindow(window, key: key)
+            return
+        }
         let target = frontPID == ProcessInfo.processInfo.processIdentifier ? previousApp : front
         if panel?.isVisible == true {
             hidePanel(restoreFocus: true)
@@ -340,6 +477,16 @@ import ServiceManagement
                 self.windows.arrange(key, targetPID: target.processIdentifier)
             }
         } else if let frontPID { windows.arrange(key, targetPID: frontPID) }
+    }
+    @discardableResult func arrangeLocalWindow(_ window: NSWindow, key: String) -> Bool {
+        guard let layout = WindowManager.layouts.first(where: { $0.id == key }), let primary = NSScreen.screens.first,
+              let screen = window.screen ?? NSScreen.main else { return false }
+        let axWork = WindowManager.accessibilityRect(screen.visibleFrame, primaryScreenFrame: primary.frame)
+        let axFrame = WindowManager.targetRect(layout, workArea: axWork)
+        guard !axFrame.isNull else { return false }
+        let frame = WindowManager.accessibilityRect(axFrame, primaryScreenFrame: primary.frame)
+        window.setFrame(frame, display: true)
+        return true
     }
     func setShortcutRecording(_ recording: Bool) {
         guard recording != shortcutRecording else { return }
@@ -379,6 +526,7 @@ import ServiceManagement
         NSApp.appearance = value == "dark" ? NSAppearance(named: .darkAqua) : value == "light" ? NSAppearance(named: .aqua) : nil
     }
     func showSettings(section: String? = nil) {
+        recordExternalFocus()
         refreshAccessibilityPermission()
         if let section, ["clipboard", "shortcuts", "studio", "downloads", "about"].contains(section) { settingsSection = section }
         hidePanel()
@@ -392,8 +540,7 @@ import ServiceManagement
         settingsWindow?.center(); settingsWindow?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
     }
     func showStudio() {
-        let front = NSWorkspace.shared.frontmostApplication
-        if front?.processIdentifier != ProcessInfo.processInfo.processIdentifier { previousApp = front }
+        recordExternalFocus()
         hidePanel()
         if studioWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 680), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
@@ -562,6 +709,7 @@ import ServiceManagement
     }
     func editMetadata(_ id: String) {
         guard let item = store.item(id: id) else { return }
+        cancelPendingClipboardActions()
         let alert = NSAlert(); alert.messageText = "标签与备注"; alert.addButton(withTitle: "保存"); alert.addButton(withTitle: "取消")
         let box = NSStackView(); box.orientation = .vertical; box.spacing = 10
         let tags = NSTextField(string: (item.tags ?? []).joined(separator: "、")); tags.placeholderString = "标签，用逗号分隔"
@@ -591,6 +739,7 @@ import ServiceManagement
     }
     var launchesAtLogin: Bool { SMAppService.mainApp.status == .enabled }
     private func prompt(title: String, value: String, action: (String) -> Void) {
+        cancelPendingClipboardActions()
         let alert = NSAlert(); alert.messageText = title
         alert.addButton(withTitle: "确定"); alert.addButton(withTitle: "取消")
         let field = NSTextField(string: value); field.frame = NSRect(x: 0, y: 0, width: 280, height: 26); alert.accessoryView = field
@@ -598,6 +747,7 @@ import ServiceManagement
         if alert.runModal() == .alertFirstButtonReturn { action(field.stringValue) }
     }
     private func confirm(_ title: String, detail: String) -> Bool {
+        cancelPendingClipboardActions()
         let alert = NSAlert(); alert.messageText = title; alert.informativeText = detail
         alert.addButton(withTitle: "确定"); alert.addButton(withTitle: "取消")
         return alert.runModal() == .alertFirstButtonReturn
@@ -657,6 +807,8 @@ import ServiceManagement
     @objc private func menuScreenshot() { takeScreenshot() }
     @objc private func menuSettings() { showSettings() }
     func showAbout() {
+        recordExternalFocus()
+        hidePanel()
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "开发版本"
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
         let description = version + (build.map { $0 == version ? "" : " (" + $0 + ")" } ?? "") + " · 原生 macOS"
@@ -667,7 +819,12 @@ import ServiceManagement
     @objc private func menuQuit() { NSApp.terminate(nil) }
     func shutdown() {
         guard !shuttingDown else { return }; shuttingDown = true
+        hidePanel()
+        settingsWindow?.orderOut(nil); studioWindow?.orderOut(nil)
         pasteGeneration += 1; arrangementGeneration += 1; searchGeneration += 1; searchTask?.cancel()
+        searchCancellation?.cancel(); pendingSelectionActions.removeAll()
+        subscriptions.removeAll()
+        presentationTickets.removeAll(); textPresentations.removeAll()
         messageClearGeneration += 1; messageClearTask?.cancel(); messageClearTask = nil
         studio.shutdown()
         dreamina.shutdown()

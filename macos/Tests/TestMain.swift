@@ -12,6 +12,7 @@ func check(_ condition: @autoclosure () -> Bool, _ message: String, file: Static
 
 @main struct NativeTests {
     @MainActor static func main() async {
+        setbuf(stdout, nil)
         do {
             _ = NSApplication.shared
             try runSystemTests()

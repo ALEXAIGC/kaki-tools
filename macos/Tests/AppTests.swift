@@ -38,6 +38,7 @@ import Combine
 }
 
 @MainActor func runAppTests() async throws {
+    try await runClipboardOptimizationTests()
     try await runAppearanceUpdateTests()
     try await runConcurrentSettingsTests()
     try await runCacheLocationRollbackTest()
@@ -137,26 +138,32 @@ import Combine
     controller.activate(staleID, copyOnly: true)
     try check(controller.store.item(id: staleID)?.createdAt == staleTime, "stale excluded card cannot be activated during debounce")
     try check(controller.handleKey(key(36)), "enter during new pending query handled")
+    try await waitForClipboardSearch(controller)
     try check(controller.panelIsVisible, "empty latest query cannot paste stale selection")
     try check(controller.visibleItems.isEmpty && controller.selectedID == nil, "activation resolves newest search without debounce delay")
     controller.query = "first full-text"
     try check(controller.handleKey(key(36)), "enter resolves latest nonempty search")
+    try await waitForClipboardSearch(controller)
     try check(!controller.panelIsVisible, "latest matching item is used immediately")
     try check(controller.store.items.first?.text == "first full-text record", "latest match, rather than old selection, is activated")
     controller.query = "third content"; controller.showPanel()
     try check(controller.handleKey(key(18, flags: .command, chars: "1")), "command digit resolves latest query")
+    try await waitForClipboardSearch(controller)
     try check(controller.store.items.first?.text == "third content", "command digit uses latest filtered ordering")
     controller.query = "second content"
     try check(controller.handleKey(key(124)), "navigation resolves latest query")
+    try await waitForClipboardSearch(controller)
     try check(controller.visibleItems.count == 1 && controller.visibleItems[0].text == "second content", "navigation cannot retain stale search list")
     controller.query = "missing new query"
     try check(controller.selectedItem == nil && !controller.canPasteSelected, "footer cannot publish a stale excluded record during pending query")
     let pinnedBefore = controller.store.item(id: second)!.pinned
     controller.toggleSelectedPin(); controller.deleteSelected(); controller.activateSelected(copyOnly: true)
+    try await waitForClipboardSearch(controller)
     try check(controller.store.item(id: second)?.pinned == pinnedBefore, "stale footer pin does not mutate excluded item")
     try check(controller.store.item(id: second) != nil, "stale footer delete does not remove excluded item")
     controller.query = "first full-text"
     controller.toggleSelectedPin()
+    try await waitForClipboardSearch(controller)
     try check(controller.selectedItem?.text == "first full-text record" && controller.selectedItem?.pinned == true, "footer pin resolves latest matching selection immediately")
     controller.query = ""
     controller.resolveCurrentItems()
@@ -220,6 +227,7 @@ import Combine
     try check(controller.message.isEmpty, "temporary message clears after latest assignment lifetime")
     controller.message = "shutdown status"
     controller.shutdown()
+    try check(!controller.panelIsVisible, "shutdown hides the controller panel while the process remains alive")
     try await Task.sleep(nanoseconds: 160_000_000)
     try check(controller.message == "shutdown status", "shutdown cancels queued message cleanup")
     controller.showSettings(section: "shortcuts")

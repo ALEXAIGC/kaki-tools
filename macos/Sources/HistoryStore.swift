@@ -27,18 +27,43 @@ private final class ImageJob: @unchecked Sendable {
     private let lock = NSLock()
     private var data: Data?
     private var cancelled = false
+    private var started = false
+    private var workerEnded = false
+    private var reservationReleased = false
     private var result: Result<ImageResult, Error>?
     init(id: String, data: Data, temporary: URL, reservation: Int) {
         self.id = id; self.data = data; self.temporary = temporary; self.reservation = reservation
     }
-    func input() -> Data? { lock.lock(); defer { lock.unlock() }; return cancelled ? nil : data }
-    func cancel() { lock.lock(); cancelled = true; data = nil; result = nil; lock.unlock() }
-    func finish(_ outcome: Result<ImageResult, Error>) {
-        lock.lock(); data = nil
-        if !cancelled { result = outcome }
+    func input() -> Data? {
+        lock.lock(); defer { lock.unlock() }
+        guard !cancelled else { return nil }
+        started = true
+        return data
+    }
+    // A running worker owns a local Data copy and decoder allocations even after
+    // cancellation clears this job's copy. Release only after its pool has drained.
+    func endProcessing() {
+        lock.lock(); workerEnded = true
         let discard = cancelled
         lock.unlock()
         if discard { try? FileManager.default.removeItem(at: temporary) }
+    }
+    func takeReleasedReservation() -> Int? {
+        lock.lock(); defer { lock.unlock() }
+        guard !reservationReleased, !started || workerEnded else { return nil }
+        reservationReleased = true
+        return reservation
+    }
+    func cancel() {
+        lock.lock(); cancelled = true; data = nil; result = nil
+        let discard = !started || workerEnded
+        lock.unlock()
+        if discard { try? FileManager.default.removeItem(at: temporary) }
+    }
+    func finish(_ outcome: Result<ImageResult, Error>) {
+        lock.lock(); data = nil
+        if !cancelled { result = outcome }
+        lock.unlock()
     }
     func outcome() -> Result<ImageResult, Error>? { lock.lock(); defer { lock.unlock() }; return result }
 }
@@ -99,8 +124,9 @@ enum ImageCodec {
 
 @MainActor
 final class HistoryStore: ObservableObject {
-    @Published private(set) var items: [HistoryItem] = []
-    @Published private(set) var boards: [String] = []
+    private(set) var revision = 0
+    @Published private(set) var items: [HistoryItem] = [] { didSet { revision &+= 1 } }
+    @Published private(set) var boards: [String] = [] { didSet { revision &+= 1 } }
     @Published private(set) var lastError: String?
     private(set) var isReadOnly = false
     private(set) var pendingImageBytes = 0
@@ -111,8 +137,11 @@ final class HistoryStore: ObservableObject {
     private let history: URL
     private let limit: Int
     private let imageBudget: Int
+    private let imageProcessor: @Sendable (Data) throws -> Data
     private let queue = DispatchQueue(label: "com.kakitools.history", qos: .utility)
     private var pending: [String: ImageJob] = [:]
+    private var imageReservations: [String: ImageJob] = [:]
+    private var deferredImageFiles: Set<String> = []
     private var persistWork: DispatchWorkItem?
     private var thumbnails: [String: NSImage] = [:]
     private var thumbnailOrder: [String] = []
@@ -123,12 +152,14 @@ final class HistoryStore: ObservableObject {
     private var thumbnailSources: [String: ThumbnailSource] = [:]
     private var loadingThumbnails: [String: UUID] = [:]
 
-    init(directory: URL, limit: Int = 100, imageBudget: Int = 384 * 1024 * 1024) {
+    init(directory: URL, limit: Int = 100, imageBudget: Int = 384 * 1024 * 1024,
+         imageProcessor: @escaping @Sendable (Data) throws -> Data = { try ImageCodec.png($0) }) {
         self.directory = directory
         self.images = directory.appendingPathComponent("images", isDirectory: true)
         self.history = directory.appendingPathComponent("history.json")
         self.limit = min(100, max(1, limit))
         self.imageBudget = imageBudget
+        self.imageProcessor = imageProcessor
         do {
             try FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
             try load()
@@ -179,6 +210,14 @@ final class HistoryStore: ObservableObject {
     private func cleanupTemporaryImages() {
         guard let files = try? FileManager.default.contentsOfDirectory(at: images,
             includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]) else { return }
+        let liveFiles = Set(items.compactMap { $0.file.map { URL(fileURLWithPath: $0).lastPathComponent } })
+        for file in files where file.pathExtension == "png" && !liveFiles.contains(file.lastPathComponent) {
+            // Recover payloads left by a crash after an index commit, without
+            // touching unrelated legacy files or the independent import backup.
+            if UUID(uuidString: file.deletingPathExtension().lastPathComponent) != nil {
+                deferredImageFiles.insert(file.path)
+            }
+        }
         for file in files where file.lastPathComponent.hasSuffix(".png.pending") {
             let base = String(file.lastPathComponent.dropLast(".png.pending".count))
             guard UUID(uuidString: base) != nil,
@@ -201,16 +240,50 @@ final class HistoryStore: ObservableObject {
     private func snapshot() -> HistorySnapshot {
         HistorySnapshot(items: items.filter { pending[$0.id] == nil }, boards: boards)
     }
-    private nonisolated static func write(_ snapshot: HistorySnapshot, to file: URL) throws {
+    private nonisolated static func write(_ snapshot: HistorySnapshot, to file: URL,
+                                         images: URL, deleting candidates: Set<String>) throws -> Set<String> {
         let data = try JSONEncoder().encode(snapshot)
         try data.write(to: file, options: .atomic)
+        // The atomic primary commit is the deletion barrier. A failed commit must
+        // leave every payload available to the previous primary and backup index.
+        guard !candidates.isEmpty else { return [] }
+        var referenced = Set(snapshot.items.filter { $0.type == "image" }.compactMap { item in
+            item.file.map { URL(fileURLWithPath: $0).lastPathComponent }
+        })
+        let backup = file.deletingLastPathComponent().appendingPathComponent("history.backup.json")
+        if FileManager.default.fileExists(atPath: backup.path) {
+            // If an existing backup cannot be inspected, retain payloads rather
+            // than guess. The one-time import backup owns its own image copies.
+            guard let data = try? Data(contentsOf: backup),
+                  let saved = try? JSONDecoder().decode(HistorySnapshot.self, from: data) else { return [] }
+            referenced.formUnion(saved.items.filter { $0.type == "image" }.compactMap { item in
+                item.file.map { URL(fileURLWithPath: $0).lastPathComponent }
+            })
+        }
+        var removed: Set<String> = []
+        let imageDirectory = images.standardizedFileURL
+        for path in candidates {
+            let payload = URL(fileURLWithPath: path).standardizedFileURL
+            guard payload.deletingLastPathComponent() == imageDirectory,
+                  !referenced.contains(payload.lastPathComponent) else { continue }
+            var complete = true
+            for suffix in ["", ".thumb", ".thumbnail.png"] {
+                let target = URL(fileURLWithPath: payload.path + suffix)
+                do { if FileManager.default.fileExists(atPath: target.path) { try FileManager.default.removeItem(at: target) } }
+                catch { complete = false }
+            }
+            if complete { removed.insert(path) }
+        }
+        return removed
     }
     private func persistAsync() {
         guard !isReadOnly else { return }
-        let snapshot = snapshot(), file = history
+        let snapshot = snapshot(), file = history, images = images, deleting = deferredImageFiles
         queue.async { [weak self] in
-            do { try Self.write(snapshot, to: file) }
-            catch { DispatchQueue.main.async { self?.report(error) } }
+            do {
+                let removed = try Self.write(snapshot, to: file, images: images, deleting: deleting)
+                DispatchQueue.main.async { self?.deferredImageFiles.subtract(removed) }
+            } catch { DispatchQueue.main.async { self?.report(error) } }
         }
     }
     func flush() {
@@ -218,11 +291,14 @@ final class HistoryStore: ObservableObject {
         guard !isReadOnly else { return }
         // Drain older snapshots and image workers before collecting final values.
         queue.sync {}
+        for job in Array(imageReservations.values) { settleReservation(job) }
         for job in Array(pending.values) { complete(job) }
         persistWork?.cancel(); persistWork = nil
-        let final = snapshot(), file = history
-        do { try queue.sync { try Self.write(final, to: file) } }
-        catch { report(error) }
+        let final = snapshot(), file = history, images = images, deleting = deferredImageFiles
+        do {
+            let removed = try queue.sync { try Self.write(final, to: file, images: images, deleting: deleting) }
+            deferredImageFiles.subtract(removed)
+        } catch { report(error) }
     }
     func isPending(id: String) -> Bool { pending[id] != nil }
     func item(id: String) -> HistoryItem? {
@@ -257,29 +333,35 @@ final class HistoryStore: ObservableObject {
             let temporary = images.appendingPathComponent(item.id + ".png.pending")
             var record = item; record.file = file.path
             let job = ImageJob(id: item.id, data: data, temporary: temporary, reservation: reservation)
-            pending[item.id] = job; pendingImageBytes += reservation
+            pending[item.id] = job; imageReservations[item.id] = job; pendingImageBytes += reservation
             items.insert(record, at: 0); changed()
+            let processor = imageProcessor
             queue.async { [weak self] in
                 autoreleasepool {
                     guard let input = job.input() else { return }
                     do {
-                        let png = try ImageCodec.png(input)
+                        let png = try processor(input)
                         guard png.count <= ImageCodec.maximumBytes else { throw HistoryFailure.imageTooLarge }
                         let hash = SHA256.hash(data: png).map { String(format: "%02x", $0) }.joined()
                         try png.write(to: job.temporary, options: .atomic)
                         job.finish(.success(ImageResult(hash: hash, bytes: png.count)))
                     } catch { job.finish(.failure(error)) }
                 }
-                DispatchQueue.main.async { self?.complete(job) }
+                job.endProcessing()
+                DispatchQueue.main.async { self?.settleReservation(job); self?.complete(job) }
             }
             return true
         } catch { report(error); return false }
     }
     private func release(_ job: ImageJob) {
         guard pending.removeValue(forKey: job.id) != nil else { return }
-        pendingImageBytes -= job.reservation
         job.cancel()
-        try? FileManager.default.removeItem(at: job.temporary)
+        settleReservation(job)
+    }
+    private func settleReservation(_ job: ImageJob) {
+        guard let bytes = job.takeReleasedReservation() else { return }
+        imageReservations.removeValue(forKey: job.id)
+        pendingImageBytes -= bytes
     }
     private func complete(_ job: ImageJob) {
         guard pending[job.id] === job, let result = job.outcome(), let index = items.firstIndex(where: { $0.id == job.id }) else { return }
@@ -304,9 +386,7 @@ final class HistoryStore: ObservableObject {
         let item = items.remove(at: index)
         if let job = pending[id] { release(job) }
         thumbnails[id] = nil; thumbnailSources[id] = nil; loadingThumbnails[id] = nil; thumbnailOrder.removeAll { $0 == id }
-        if item.type == "image", let path = item.file {
-            for suffix in ["", ".thumb", ".thumbnail.png"] { try? FileManager.default.removeItem(atPath: path + suffix) }
-        }
+        if item.type == "image", let path = item.file { deferredImageFiles.insert(path) }
     }
     func remove(id: String) { guard mayWrite() else { return }; removeInternal(id: id); changed() }
     func touch(id: String) {

@@ -26,6 +26,7 @@ private func historyTestDirectory() throws -> URL {
 @MainActor
 func runHistoryTests() async throws {
     try await runHistoryPersistenceOrderingTests()
+    try await runHistoryImageSafetyTests()
     try await runThumbnailNotificationTests()
     let manager = FileManager.default
     let directory = try historyTestDirectory()
@@ -155,12 +156,16 @@ func runHistoryTests() async throws {
 
     let budgetDirectory = try historyTestDirectory()
     defer { try? manager.removeItem(at: budgetDirectory) }
-    let budget = HistoryStore(directory: budgetDirectory, imageBudget: png.count * 2)
+    let budgetGate = HistoryImageTestGate()
+    defer { budgetGate.resume.signal() }
+    let budget = HistoryStore(directory: budgetDirectory, imageBudget: png.count * 2,
+                              imageProcessor: { try budgetGate.process($0) })
     try check(budget.captureImage(data: png) && budget.captureImage(data: png), "two reserved PNG captures")
     try check(!budget.captureImage(data: png), "pending lifecycle budget rejects overflow")
     let pendingID = budget.items[0].id
     budget.remove(id: pendingID)
     try check(budget.captureImage(data: png), "cancel returns queue reservation")
+    budgetGate.resume.signal()
     budget.flush(); try check(budget.pendingImageBytes == 0, "flush returns every reservation")
     try check(!budget.captureImage(data: Data("not an image".utf8)), "invalid image rejected")
     budget.flush()

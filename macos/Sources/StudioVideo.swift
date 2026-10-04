@@ -29,10 +29,11 @@ struct StudioVideoChunk {
     private var info: StudioVideoChunk?
     private let onRemoteError: ((Error) async -> Void)?
     private let localLoader: (() async throws -> StudioHTTPFile?)?
-    private var localTask: Task<StudioHTTPFile?, Error>?
+    private let localWork = StudioMediaWork<String, StudioHTTPFile?>(limit: 1)
+    private var localResolved = false
     private var localFile: StudioHTTPFile?
     private let cache = NSCache<NSString, NSData>()
-    private var pending: [String: Task<StudioVideoChunk, Error>] = [:]
+    private let pending = StudioMediaWork<String, StudioVideoChunk>(limit: 4)
     init(api: StudioClient, session: StudioSession, workspace: String, url: String, byteBudget: Int64, localLoader: (() async throws -> StudioHTTPFile?)? = nil, onRemoteError: ((Error) async -> Void)? = nil) {
         self.localLoader = localLoader; self.onRemoteError = onRemoteError
         self.api = api; self.session = session; self.workspace = workspace; self.url = url; self.byteBudget = byteBudget
@@ -69,10 +70,20 @@ struct StudioVideoChunk {
     private func fetch(_ range: Range<Int64>) async throws -> StudioVideoChunk {
         guard !closed else { throw CancellationError() }
         if let localLoader {
-            if localTask == nil { localTask = Task { try await localLoader() } }
-            if let local = try await localTask?.value {
-                guard !closed, !Task.isCancelled else { try? FileManager.default.removeItem(at: local.file); throw CancellationError() }
-                localFile = local
+            if !localResolved {
+                _ = try await localWork.value(for: "original") { [weak self] in
+                    let local = try await localLoader()
+                    guard let self, !self.closed, !Task.isCancelled else {
+                        if let local { try? FileManager.default.removeItem(at: local.file) }
+                        throw CancellationError()
+                    }
+                    self.localFile = local; self.localResolved = true
+                    return local
+                }
+            }
+            try Task.checkCancellation()
+            guard !closed else { throw CancellationError() }
+            if let local = localFile {
                 let result = try await Task.detached(priority: .userInitiated) {
                     let total = Int64(try local.file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0)
                     guard range.lowerBound >= 0, range.upperBound <= total else { throw StudioError.invalidResponse }
@@ -89,27 +100,24 @@ struct StudioVideoChunk {
             }
         }
         let key = "\(range.lowerBound)-\(range.upperBound)"
-        if let task = pending[key] { return try await task.value }
-        let count = Int64(range.count)
-        guard count <= byteBudget - usedBytes else { throw StudioError.tooLarge }
-        usedBytes += count
-        let task = Task { try await api.videoRange(url, session: session, workspace: workspace, range: range) }
-        pending[key] = task
-        defer { pending.removeValue(forKey: key) }
-        let result: StudioVideoChunk
-        do { result = try await task.value }
-        catch { await onRemoteError?(error); throw error }
+        let result = try await pending.value(for: key) { [weak self] in
+            guard let self, !self.closed else { throw CancellationError() }
+            let count = Int64(range.count)
+            guard count <= self.byteBudget - self.usedBytes else { throw StudioError.tooLarge }
+            self.usedBytes += count
+            do { return try await self.api.videoRange(self.url, session: self.session, workspace: self.workspace, range: range) }
+            catch { await self.onRemoteError?(error); throw error }
+        }
         try Task.checkCancellation()
         guard !closed else { throw CancellationError() }
         return result
     }
     func cancel() {
         closed = true
-        localTask?.cancel()
+        localWork.cancelAll()
         if let localFile { try? FileManager.default.removeItem(at: localFile.file) }
         localFile = nil
-        for task in pending.values { task.cancel() }
-        pending.removeAll(); cache.removeAllObjects(); info = nil
+        pending.cancelAll(); cache.removeAllObjects(); info = nil
     }
 }
 

@@ -27,6 +27,7 @@ actor StudioDiskCache {
     // Loaded v1 indexes receive fresh identities without changing their schema.
     struct Version: Equatable { let epoch: Int; let write: UUID? }
     struct Lookup { let entry: Entry?; let epoch: Int; let version: Version }
+    struct Lease { let media: StudioHTTPFile; let version: Version }
     struct Stats { let bytes: Int64; let files: Int; let available: Bool }
     private struct Index: Codable { var version = 1; var entries: [Entry] }
     private var directory: URL
@@ -149,6 +150,9 @@ actor StudioDiskCache {
         return Lookup(entry: entry, epoch: epoch, version: Version(epoch: epoch, write: writes[key.value]))
     }
     func lease(_ key: Key, responseURL: URL, maximumBytes: Int64) throws -> StudioHTTPFile? {
+        try leaseVersioned(key, responseURL: responseURL, maximumBytes: maximumBytes)?.media
+    }
+    func leaseVersioned(_ key: Key, responseURL: URL, maximumBytes: Int64) throws -> Lease? {
         guard available() else { return nil }
         load(); trim(); save()
         guard limit > 0, var entry = entries[key.value] else { return nil }
@@ -164,11 +168,11 @@ actor StudioDiskCache {
             // Keep exact LRU in memory. Persist each entry's access at least once
             // per minute; an abrupt exit can lose at most 60s of access recency.
             if entry.lastUsed.timeIntervalSince(persistedUses[key.value] ?? .distantPast) >= 60 { save(includeAccess: true) }
-            return StudioHTTPFile(file: leased, response: response)
+            return Lease(media: StudioHTTPFile(file: leased, response: response), version: Version(epoch: epoch, write: writes[key.value]))
         } catch { try? FileManager.default.removeItem(at: leased); remove(key.value); save(); return nil }
     }
     func store(_ result: StudioHTTPFile, key: Key, epoch expected: Int, now: Date = Date()) {
-        guard available() else { return }
+        guard !Task.isCancelled, available() else { return }
         load()
         guard expected == epoch, limit > 0,
               let bytes = try? result.file.resourceValues(forKeys: [.fileSizeKey]).fileSize, bytes > 0, Int64(bytes) <= limit else { return }

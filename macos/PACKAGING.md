@@ -16,8 +16,8 @@ Apple Silicon 默认产物：
 
 ```text
 dist/native-arm64/Kaki Tools.app
-dist/native-arm64/Kaki-Tools-1.4.4-arm64.dmg
-dist/native-arm64/Kaki-Tools-1.4.4-arm64.dmg.sha256
+dist/native-arm64/Kaki-Tools-1.4.5-arm64.dmg
+dist/native-arm64/Kaki-Tools-1.4.5-arm64.dmg.sha256
 ```
 
 文件名中的版本取自应用 `Info.plist`。生成新版本不会删除已有版本的 DMG 或校验文件，旧 Electron 版本元数据独立保留在 `legacy/electron/package.json`。脚本也接受显式应用路径与输出目录：
@@ -30,8 +30,8 @@ DMG 包含应用、指向 `/Applications` 的链接、安装说明、签名身�
 
 ```bash
 cd dist/native-arm64
-shasum -a 256 -c Kaki-Tools-1.4.4-arm64.dmg.sha256
-hdiutil verify Kaki-Tools-1.4.4-arm64.dmg
+shasum -a 256 -c Kaki-Tools-1.4.5-arm64.dmg.sha256
+hdiutil verify Kaki-Tools-1.4.5-arm64.dmg
 ```
 
 原生构建默认使用 `macos/Signing/local-certificate.sha1` 指定的固定本地证书。私钥保存在登录钥匙串；仓库只有公开证书和指纹。缺少证书/私钥或信任失效时构建停止，禁止自动退回临时签名。仅隔离开发编译可显式指定 `KAKI_NATIVE_IDENTITY=-`；DMG打包拒绝临时签名。

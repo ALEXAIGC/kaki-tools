@@ -34,6 +34,7 @@ import ImageIO
     @Published var query = "" {
         didSet {
             if query != oldValue {
+                thumbnailRevision += 1; thumbnailWork.cancelAll()
                 searchGeneration += 1; loadingAssets = false
                 assets = []; total = 0; nextCursor = nil; loadedQuery = nil; lastSyncedAt = nil; syncNote = ""
             }
@@ -54,14 +55,18 @@ import ImageIO
     private var loadedQuery: String?
     @Published private var mediaTasks: [UUID: Task<Void, Never>] = [:]
     private let thumbnails = NSCache<NSString, NSImage>()
+    private let thumbnailWork = StudioMediaWork<String, NSImage?>(limit: 4)
+    private var thumbnailRevision = 0
+    private let decodeThumbnail: (URL) async -> Data?
     private var videoStreams: [UUID: StudioVideoStream] = [:]
     private var posterSlots = Set<UUID>()
     private var failedPosters: [NSString: Date] = [:]
-    init(directory: URL, credentials: StudioCredentialStore? = nil, transport: StudioTransport = StudioURLTransport(), cacheLimitMB: Int = 1024, cacheDays: Int = 7, cacheFolder: String = "", cacheVolumeUUID: String = "") {
+    init(directory: URL, credentials: StudioCredentialStore? = nil, transport: StudioTransport = StudioURLTransport(), cacheLimitMB: Int = 1024, cacheDays: Int = 7, cacheFolder: String = "", cacheVolumeUUID: String = "", cache: StudioDiskCache? = nil, thumbnailDecoder: ((URL) async -> Data?)? = nil) {
+        decodeThumbnail = thumbnailDecoder ?? Self.thumbnailPNG
         defaultCacheDirectory = directory.appendingPathComponent("studio-cache", isDirectory: true)
         let cacheDirectory = cacheFolder.isEmpty ? defaultCacheDirectory : URL(fileURLWithPath: cacheFolder, isDirectory: true).appendingPathComponent("Kaki Tools Cache", isDirectory: true)
         cacheLocation = cacheDirectory.path
-        diskCache = StudioDiskCache(directory: cacheDirectory, limitMB: cacheLimitMB, days: cacheDays, volumeUUID: cacheVolumeUUID)
+        diskCache = cache ?? StudioDiskCache(directory: cacheDirectory, limitMB: cacheLimitMB, days: cacheDays, volumeUUID: cacheVolumeUUID)
         self.credentials = credentials ?? StudioKeychain(); self.transport = transport
         clipboardDirectory = directory.appendingPathComponent("studio-clipboard", isDirectory: true)
         preference = directory.appendingPathComponent("studio-environment.json")
@@ -100,7 +105,7 @@ import ImageIO
         for task in mediaTasks.values { task.cancel() }; mediaTasks.removeAll()
         session = nil; user = nil; workspaces = []; workspaceID = ""; source = .library
         assets = []; total = 0; nextCursor = nil; query = ""; kind = "all"
-        clearVideoStreams(); thumbnails.removeAllObjects(); busy = false; loadingAssets = false; twoFactorRequired = false
+        thumbnailWork.cancelAll(); clearVideoStreams(); thumbnails.removeAllObjects(); busy = false; loadingAssets = false; twoFactorRequired = false
         loadedQuery = nil; lastSyncedAt = nil; syncNote = ""
     }
     func changeEnvironment(_ value: StudioEnvironment) async {
@@ -167,6 +172,7 @@ import ImageIO
     func selectWorkspace(_ id: String) async {
         guard id != workspaceID, workspaces.contains(where: { $0.id == id }) else { return }
         generation += 1; sessionRevision += 1; thumbnails.removeAllObjects()
+        thumbnailWork.cancelAll()
         clearVideoStreams()
         for task in mediaTasks.values { task.cancel() }; mediaTasks.removeAll()
         workspaceID = id; assets = []; total = 0; nextCursor = nil; busy = false
@@ -178,6 +184,7 @@ import ImageIO
         generation += 1; sessionRevision += 1; searchGeneration += 1
         for task in mediaTasks.values { task.cancel() }; mediaTasks.removeAll()
         thumbnails.removeAllObjects(); source = value
+        thumbnailWork.cancelAll()
         clearVideoStreams()
         if value == .recent && kind == "audio" { kind = "all" }
         assets = []; total = 0; nextCursor = nil; query = ""; loadingAssets = false
@@ -294,6 +301,7 @@ import ImageIO
     func changeCacheLocation(folder: String, volumeUUID: String) async throws {
         guard !mediaBusy, !cacheClearing, !cacheChanging else { throw CocoaError(.userCancelled) }
         cacheChanging = true; cacheRevision += 1
+        thumbnailWork.cancelAll()
         defer { cacheChanging = false }
         let target = folder.isEmpty ? defaultCacheDirectory : URL(fileURLWithPath: folder, isDirectory: true).appendingPathComponent("Kaki Tools Cache", isDirectory: true)
         let oldCleared = try await diskCache.relocate(to: target, volumeUUID: volumeUUID)
@@ -303,12 +311,14 @@ import ImageIO
     }
     func configureCache(limitMB: Int, days: Int) async {
         cacheRevision += 1
+        thumbnailWork.cancelAll()
         await diskCache.configure(limitMB: limitMB, days: days)
         await refreshCacheStats()
     }
     func clearMaterialCache() async {
         guard !mediaBusy, !cacheClearing, !cacheChanging else { return }
         cacheClearing = true; cacheRevision += 1
+        thumbnailWork.cancelAll()
         thumbnails.removeAllObjects(); failedPosters.removeAll()
         await diskCache.clear(); await refreshCacheStats()
         cacheClearing = false
@@ -346,14 +356,23 @@ import ImageIO
                 let modified = head.response.value(forHTTPHeaderField: "Last-Modified")
                 let size = head.response.value(forHTTPHeaderField: "Content-Length").flatMap { Int64($0) }
                 let headMime = StudioMediaFiles.mime(head)
-                let sameVersion = (headMime.isEmpty || headMime == entry.mime) && (etag == nil || entry.headers["ETag"] == etag) && (modified == nil || entry.headers["Last-Modified"] == modified)
+                // Length/MIME do not establish identity for a mutable URL. A
+                // validator must be present and agree before reusing old bytes.
+                let hasValidator = etag?.isEmpty == false || modified?.isEmpty == false
+                let sameVersion = hasValidator && (headMime.isEmpty || headMime == entry.mime) && (etag == nil || entry.headers["ETag"] == etag) && (modified == nil || entry.headers["Last-Modified"] == modified)
                 if sameVersion && (size == nil || size == entry.bytes),
-                   let leased = try await diskCache.lease(key, responseURL: responseURL, maximumBytes: maximumBytes) {
+                   let lease = try await diskCache.leaseVersioned(key, responseURL: responseURL, maximumBytes: maximumBytes) {
+                    let leased = lease.media
                     if generation != revision || cacheRevision != cacheVersion || Task.isCancelled { try? FileManager.default.removeItem(at: leased.file); throw CancellationError() }
-                    await refreshCacheStats()
-                    return leased
+                    if lease.version == lookup.version {
+                        await refreshCacheStats()
+                        return leased
+                    }
+                    try? FileManager.default.removeItem(at: leased.file)
                 }
-                await diskCache.remove(key, ifUnchanged: lookup.version)
+                // Without validators retry GET, retaining old bytes if the
+                // network fails. They are never served without revalidation.
+                if hasValidator { await diskCache.remove(key, ifUnchanged: lookup.version) }
             } catch {
                 guard generation == revision, cacheRevision == cacheVersion, !Task.isCancelled else { throw CancellationError() }
                 let status = mediaStatus(error)
@@ -387,18 +406,35 @@ import ImageIO
               let diskKey = cacheKey(asset, url: asset.thumbUrl ?? asset.url, role: "preview:" + asset.url) else { return nil }
         let key = diskKey.value as NSString
         if let image = thumbnails.object(forKey: key) { return image }
-        let revision = generation, cacheVersion = cacheRevision, api = client, workspace = workspaceID
+        let revision = generation, cacheVersion = cacheRevision, thumbnailVersion = thumbnailRevision
+        let workKey = "\(revision):\(cacheVersion):\(thumbnailVersion):\(diskKey.value)"
+        return try? await thumbnailWork.value(for: workKey) { [weak self] in
+            guard let self, self.generation == revision, self.cacheRevision == cacheVersion,
+                  self.thumbnailRevision == thumbnailVersion,
+                  self.assets.contains(where: { $0.id == asset.id && $0.url == asset.url && $0.thumbUrl == asset.thumbUrl }) else { throw CancellationError() }
+            return await self.loadThumbnail(asset, saved: saved, diskKey: diskKey, revision: revision, cacheVersion: cacheVersion)
+        }
+    }
+    private func loadThumbnail(_ asset: StudioAsset, saved: StudioSession, diskKey: StudioDiskCache.Key, revision: Int, cacheVersion: Int, retryReplacement: Bool = true) async -> NSImage? {
+        let key = diskKey.value as NSString, api = client, workspace = workspaceID
         let lookup = await diskCache.lookup(diskKey)
         guard generation == revision, cacheRevision == cacheVersion, !Task.isCancelled else { return nil }
         do {
-            if let cached = try await diskCache.lease(diskKey, responseURL: environment.baseURL, maximumBytes: 1024 * 1024) {
+            if let lease = try await diskCache.leaseVersioned(diskKey, responseURL: environment.baseURL, maximumBytes: 1024 * 1024) {
+                let cached = lease.media
                 defer { try? FileManager.default.removeItem(at: cached.file) }
-                if let png = await Self.thumbnailPNG(cached.file), let image = NSImage(data: png) {
+                if let png = await decodeThumbnail(cached.file), let image = NSImage(data: png) {
                     guard generation == revision, cacheRevision == cacheVersion, !Task.isCancelled else { return nil }
                     thumbnails.setObject(image, forKey: key, cost: Int(image.size.width * image.size.height * 4))
                     await refreshCacheStats(); return image
                 }
-                await diskCache.remove(diskKey)
+                guard generation == revision, cacheRevision == cacheVersion, !Task.isCancelled else { return nil }
+                if !(await diskCache.remove(diskKey, ifUnchanged: lease.version)) {
+                    // A replacement arrived during decoding. Do not delete or
+                    // overwrite it with work based on the stale bad lease.
+                    if retryReplacement { return await loadThumbnail(asset, saved: saved, diskKey: diskKey, revision: revision, cacheVersion: cacheVersion, retryReplacement: false) }
+                    return nil
+                }
             }
             let image: NSImage?
             var png: Data?
@@ -413,7 +449,7 @@ import ImageIO
                     result = original
                 } else { result = try await api.media(asset.thumbUrl!, session: saved, workspace: workspace, maximumBytes: 8 * 1024 * 1024) }
                 defer { try? FileManager.default.removeItem(at: result.file) }
-                png = await Self.thumbnailPNG(result.file)
+                png = await decodeThumbnail(result.file)
                 image = png.flatMap { NSImage(data: $0) }
             }
             guard generation == revision, cacheRevision == cacheVersion, !Task.isCancelled else { return nil }
@@ -640,5 +676,5 @@ import ImageIO
             } catch { if self.generation == revision { self.handle(error) } }
         }
     }
-    func shutdown() { cacheTimer?.invalidate(); cacheTimer = nil; libraryActive = false; generation += 1; for task in mediaTasks.values { task.cancel() }; mediaTasks.removeAll(); clearVideoStreams(); thumbnails.removeAllObjects() }
+    func shutdown() { cacheTimer?.invalidate(); cacheTimer = nil; libraryActive = false; generation += 1; for task in mediaTasks.values { task.cancel() }; mediaTasks.removeAll(); thumbnailWork.cancelAll(); clearVideoStreams(); thumbnails.removeAllObjects() }
 }

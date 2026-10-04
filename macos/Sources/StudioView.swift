@@ -327,7 +327,7 @@ private struct StudioPrimaryButtonStyle: ButtonStyle {
             })
             .task(id: "\(studio.sessionRevision):\(asset.id):\(asset.url):\(asset.thumbUrl ?? ""):\(nearby):\(studio.libraryActive)") {
                 guard nearby else { image = nil; return }
-                guard studio.libraryActive else { return }
+                guard studio.libraryActive else { image = nil; return }
                 image = await studio.thumbnail(asset)
             }
             .onDisappear { image = nil }

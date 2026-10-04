@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 
 @MainActor func runStudioCacheTests() async throws {
+    try await runStudioConcurrencyTests()
     let fm = FileManager.default
     let directory = fm.temporaryDirectory.appendingPathComponent("kaki-disk-cache-tests-" + UUID().uuidString)
     try fm.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -93,6 +94,7 @@ import AppKit
     try await runStudioAccessPersistenceTests(directory: directory)
     try await runStudioCacheVersionTests(directory: directory)
     try await runStudioCachedMediaTests(directory: directory)
+    try await runStudioNoValidatorTests(directory: directory)
 }
 
 private struct CacheStep {
@@ -191,6 +193,9 @@ private actor CacheTransport: StudioTransport {
     try check(touched.version == first.version, "cache lease updates usage without changing write identity")
     await cache.store(media, key: key, epoch: first.epoch)
     let second = await cache.lookup(key)
+    guard let actualLease = try await cache.leaseVersioned(key, responseURL: url, maximumBytes: 1024) else { throw NativeTestFailure(description: "Versioned lease missing") }
+    defer { try? FileManager.default.removeItem(at: actualLease.media.file) }
+    try check(actualLease.version == second.version && actualLease.version != first.version, "atomic lease reports the actually leased write rather than an earlier lookup")
     let removedOld = await cache.remove(key, ifUnchanged: first.version)
     try check(second.version != first.version && !removedOld, "same ETag and same bytes still receive a new write identity")
     let missing = StudioHTTPFile(file: directory.appendingPathComponent("missing-source"), response: media.response)
@@ -214,6 +219,38 @@ private actor CacheTransport: StudioTransport {
     let removedReloaded = await restarted.remove(key, ifUnchanged: reloaded.version)
     let reloadedEmpty = await restarted.lookup(key)
     try check(removedReloaded && reloadedEmpty.entry == nil, "post-restart validation can still remove its observed cache entry")
+}
+
+@MainActor private func runStudioNoValidatorTests(directory: URL) async throws {
+    let dir = directory.appendingPathComponent("no-validator")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false)
+    let v1 = Data("version-one-media".utf8), v2 = Data("version-two-media".utf8)
+    let path = "/api/private-files/no-validator"
+    let transport = CacheTransport([
+        CacheStep(path: "/api/auth/login", method: "POST", headers: ["Content-Type":"application/json", "Set-Cookie":"kaki_session=cache-fixture; Max-Age=604800; Path=/; HttpOnly; Secure"], body: Data(#"{"user":{"id":"cache-user","email":"cache@example.invalid"}}"#.utf8)),
+        CacheStep(path: "/api/workspaces", method: "GET", body: Data(#"[{"id":"cache-ws","name":"Fixture","kind":"personal","role":"owner","disabled":false}]"#.utf8)),
+        CacheStep(path: "/api/assets", method: "GET", body: Data(#"{"items":[{"id":"no-validator","url":"/api/private-files/no-validator","kind":"video","name":"素材.mp4"}],"total":1}"#.utf8)),
+        CacheStep(path: path, method: "GET", headers: ["Content-Type":"video/mp4"], body: v1),
+        CacheStep(path: path, method: "HEAD", headers: ["Content-Type":"video/mp4", "Content-Length":String(v1.count)]),
+        CacheStep(path: path, method: "GET", status: 503),
+        CacheStep(path: path, method: "HEAD", headers: ["Content-Type":"video/mp4", "Content-Length":String(v2.count)]),
+        CacheStep(path: path, method: "GET", headers: ["Content-Type":"video/mp4"], body: v2)
+    ])
+    let store = StudioStore(directory: dir, credentials: StudioMemoryCredentials(), transport: transport)
+    let downloads = dir.appendingPathComponent("downloads")
+    try FileManager.default.createDirectory(at: downloads, withIntermediateDirectories: false)
+    await store.login(email: "cache@example.invalid", password: "fixture", code: "")
+    store.download(ids: ["no-validator"], to: downloads)
+    for _ in 0..<200 { if !store.mediaBusy { break }; try await Task.sleep(nanoseconds: 5_000_000) }
+    store.download(ids: ["no-validator"], to: downloads)
+    for _ in 0..<200 { if !store.mediaBusy { break }; try await Task.sleep(nanoseconds: 5_000_000) }
+    try check(store.cacheFiles == 1 && !FileManager.default.fileExists(atPath: downloads.appendingPathComponent("素材 (2).mp4").path), "validator-free transient GET failure retains cache without serving unverifiable old media")
+    store.download(ids: ["no-validator"], to: downloads)
+    for _ in 0..<200 { if !store.mediaBusy { break }; try await Task.sleep(nanoseconds: 5_000_000) }
+    let requests = await transport.requests
+    let remaining = await transport.steps.count
+    try check((try? Data(contentsOf: downloads.appendingPathComponent("素材 (2).mp4"))) == v2 && requests.filter { $0.url?.path == path && $0.httpMethod == "GET" }.count == 3 && remaining == 0, "same-size changed content without ETag/Last-Modified is fetched rather than mistaken for cached identity")
+    store.shutdown()
 }
 
 @MainActor private func runStudioAccessPersistenceTests(directory: URL) async throws {

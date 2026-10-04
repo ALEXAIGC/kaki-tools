@@ -254,7 +254,7 @@ private func studioLoginStep(delay: UInt64 = 0) -> StudioStubStep {
 @MainActor private func runStudioMediaTests(directory: URL) async throws {
     let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 12, pixelsHigh: 8, bitsPerSample: 8, samplesPerPixel: 3, hasAlpha: false, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
     let jpeg = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.8])!
-    var imageStep = StudioStubStep(path: "/api/private-files/private-a", headers: ["Content-Type": "image/jpeg"], json: "")
+    var imageStep = StudioStubStep(path: "/api/private-files/private-a", headers: ["Content-Type": "image/jpeg", "ETag":"image-v1"], json: "")
     imageStep.bytes = jpeg
     let changedThumbnail = StudioStubStep(path: "/api/private-files/new-thumb", headers: ["Content-Type": "image/jpeg"], json: "", bytes: jpeg)
     let transport = StudioStubTransport([studioLoginStep(), StudioStubStep(path: "/api/workspaces", json: studioWorkspaceJSON), StudioStubStep(path: "/api/assets", json: studioPageJSON), imageStep, imageStep, imageStep,
@@ -338,16 +338,16 @@ private func studioLoginStep(delay: UInt64 = 0) -> StudioStubStep {
     try fm.createDirectory(at: output, withIntermediateDirectories: false)
     let page = #"{"items":[{"id":"video-a","url":"/api/private-files/video-a","kind":"video","name":"片段.mp4"},{"id":"video-b","url":"/api/private-files/video-b","kind":"video","name":"片段.mp4"},{"id":"audio-c","url":"/api/private-files/audio-c","kind":"audio","name":"声音"}],"total":3,"nextCursor":null}"#
     let video = Data("original video bytes".utf8), audio = Data("original audio bytes".utf8)
-    let videoStep = StudioStubStep(path: "/api/private-files/video-a", headers: ["Content-Type":"video/mp4"], json: "", bytes: video)
+    let videoStep = StudioStubStep(path: "/api/private-files/video-a", headers: ["Content-Type":"video/mp4", "ETag":"video-v1"], json: "", bytes: video)
     let transport = StudioStubTransport([
         studioLoginStep(), StudioStubStep(path: "/api/workspaces", json: studioWorkspaceJSON), StudioStubStep(path: "/api/assets", json: page),
         videoStep, videoStep,
-        StudioStubStep(path: "/api/private-files/video-b", headers: ["Content-Type":"video/mp4; charset=binary"], json: "", bytes: video),
-        StudioStubStep(path: "/api/private-files/audio-c", headers: ["Content-Type":"audio/mpeg"], json: "", bytes: audio),
-        StudioStubStep(path: "/api/private-files/audio-c", headers: ["Content-Type":"audio/mpeg"], json: "", bytes: audio),
+        StudioStubStep(path: "/api/private-files/video-b", headers: ["Content-Type":"video/mp4; charset=binary", "ETag":"video-v1"], json: "", bytes: video),
+        StudioStubStep(path: "/api/private-files/audio-c", headers: ["Content-Type":"audio/mpeg", "ETag":"audio-v1"], json: "", bytes: audio),
+        StudioStubStep(path: "/api/private-files/audio-c", headers: ["Content-Type":"audio/mpeg", "ETag":"audio-v1"], json: "", bytes: audio),
         videoStep,
         StudioStubStep(path: "/api/private-files/video-b", status: 500, json: "{}"),
-        StudioStubStep(path: "/api/private-files/audio-c", headers: ["Content-Type":"audio/mpeg"], json: "", bytes: audio), videoStep
+        StudioStubStep(path: "/api/private-files/audio-c", headers: ["Content-Type":"audio/mpeg", "ETag":"audio-v1"], json: "", bytes: audio), videoStep
     ])
     let store = StudioStore(directory: dir, credentials: StudioMemoryCredentials(), transport: transport)
     await store.login(email: "a@example.invalid", password: "test", code: "")

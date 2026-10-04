@@ -190,6 +190,7 @@ private struct ClipboardMetrics {
             TextField("", text: $controller.query, prompt: Text("搜索内容、标签或备注").foregroundColor(palette.subtle))
                 .textFieldStyle(.plain).font(.system(size: 13)).foregroundColor(palette.foreground)
                 .focused($searchFocused).accessibilityLabel("搜索剪贴板内容、标签或备注")
+            if controller.searching { ProgressView().controlSize(.mini).frame(width: 12) }
             if !controller.query.isEmpty {
                 Button { controller.query = ""; searchFocused = true } label: {
                     Image(systemName: "xmark.circle.fill").font(.system(size: 12)).foregroundColor(palette.subtle)
@@ -357,7 +358,7 @@ private struct ClipboardMetrics {
     private var selectionSummary: String {
         guard let item = controller.selectedItem else { return "选择一个项目开始操作" }
         if item.type == "image", let size = item.size { return "图片 · \(size.width) × \(size.height)" }
-        return String((item.text ?? "").split(whereSeparator: { $0.isWhitespace }).joined(separator: " ").prefix(160))
+        return controller.summary(for: item)
     }
 }
 
@@ -373,6 +374,7 @@ private struct ClipboardMetrics {
     let height: CGFloat
     @State private var image: NSImage?
     @State private var hovered = false
+    @State private var cardVisible = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -415,12 +417,17 @@ private struct ClipboardMetrics {
         .accessibilityElement(children: .contain)
         .accessibilityLabel(item.type == "image" ? "图片 \(index + 1)" : "剪贴板条目 \(index + 1)，\(String((item.text ?? "").prefix(120)))")
         .accessibilityValue(selected ? "已选中" : "")
-        .onAppear { if item.type == "image" { image = store.thumbnail(for: item) } }
-        .onReceive(store.thumbnailChanges.filter { $0 == item.id }) { _ in
+        .onAppear {
+            cardVisible = true
             if item.type == "image" { image = store.thumbnail(for: item) }
+            else { controller.requestTextPresentation(item) }
+        }
+        .onDisappear { cardVisible = false; image = nil }
+        .onReceive(store.thumbnailChanges.filter { $0 == item.id }) { _ in
+            if cardVisible, item.type == "image" { image = store.thumbnail(for: item) }
         }
         .onChange(of: HistoryStore.ThumbnailSource(item)) { _ in
-            if item.type == "image" { image = store.thumbnail(for: item) }
+            if cardVisible, item.type == "image" { image = store.thumbnail(for: item) }
         }
     }
 
@@ -475,7 +482,7 @@ private struct ClipboardMetrics {
     }
     private var metadata: String {
         if item.type == "image", let size = item.size { return "\(size.width) × \(size.height)" }
-        let base = "\((item.text ?? "").utf16.count) 字"
+        let base = controller.textCount(for: item).map { "\($0) 字" } ?? "文本"
         return item.hasRichText ? base + " · 富文本" : base
     }
     private var age: String {

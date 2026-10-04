@@ -62,6 +62,7 @@ actor DreaminaFixtureRunner: DreaminaRunning {
 }
 
 @MainActor func runDreaminaTests() async throws {
+    try await runDreaminaProcessLifecycleTests()
     try await runDreaminaRefreshTests()
     try await runDreaminaExecutableRefreshTests()
     try await runDreaminaLateDiscoveryFailureTest()
