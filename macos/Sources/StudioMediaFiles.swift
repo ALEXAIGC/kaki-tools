@@ -1,6 +1,10 @@
 import Foundation
 
 enum StudioMediaFiles {
+    static func mediaExtension(_ mime: String) -> String {
+        ["image/png":"png", "image/jpeg":"jpg", "image/webp":"webp", "image/gif":"gif", "image/heic":"heic", "image/avif":"avif", "video/mp4":"mp4", "video/quicktime":"mov", "video/webm":"webm", "audio/mpeg":"mp3", "audio/wav":"wav", "audio/x-wav":"wav", "audio/mp4":"m4a", "audio/ogg":"ogg"][mime] ?? "bin"
+    }
+
     struct PreparedClipboard {
         let directory: URL
         let file: URL
@@ -49,7 +53,7 @@ enum StudioMediaFiles {
         let pending = directory.appendingPathComponent("pending-" + UUID().uuidString, isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: pending, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
-            let file = pending.appendingPathComponent(filename(title: title, suffix: StudioStore.mediaExtension(mime(result))))
+            let file = pending.appendingPathComponent(filename(title: title, suffix: mediaExtension(mime(result))))
             try FileManager.default.copyItem(at: result.file, to: file)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
             return PreparedClipboard(directory: pending, file: file)

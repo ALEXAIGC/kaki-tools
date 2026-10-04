@@ -55,34 +55,20 @@ final class ClipboardService {
                   let data = try? Data(contentsOf: URL(fileURLWithPath: file), options: .mappedIfSafe) {
             entry.setData(data, forType: .png)
         } else { return nil }
-        entry.setString(sourceMarker, forType: sourceType)
-        pasteboard.clearContents()
-        guard pasteboard.writeObjects([entry]) else { return nil }
-        let count = pasteboard.changeCount
-        lastChangeCount = count
-        return count
+        return commit(entry)
     }
     @discardableResult
     func writeImage(_ data: Data) -> Int? {
         let entry = NSPasteboardItem()
         entry.setData(data, forType: .png)
-        entry.setString(sourceMarker, forType: sourceType)
-        pasteboard.clearContents()
-        guard pasteboard.writeObjects([entry]) else { return nil }
-        let count = pasteboard.changeCount
-        lastChangeCount = count
-        return count
+        return commit(entry)
     }
     @discardableResult
     func writeMaterialFile(_ file: URL) -> Int? {
         guard file.isFileURL, FileManager.default.fileExists(atPath: file.path) else { return nil }
         let entry = NSPasteboardItem()
         entry.setString(file.absoluteString, forType: .fileURL)
-        entry.setString(sourceMarker, forType: sourceType)
-        pasteboard.clearContents()
-        guard pasteboard.writeObjects([entry]) else { return nil }
-        lastChangeCount = pasteboard.changeCount
-        return lastChangeCount
+        return commit(entry)
     }
     @discardableResult
     func writeStudioReferences(_ text: String) -> Int? {
@@ -92,11 +78,15 @@ final class ClipboardService {
         // native type is supplementary and is never the only representation.
         entry.setString(text, forType: .string)
         entry.setString(text, forType: NSPasteboard.PasteboardType("com.kaki.studio.material-references"))
+        return commit(entry)
+    }
+    private func commit(_ entry: NSPasteboardItem) -> Int? {
         entry.setString(sourceMarker, forType: sourceType)
         pasteboard.clearContents()
         guard pasteboard.writeObjects([entry]) else { return nil }
-        lastChangeCount = pasteboard.changeCount
-        return lastChangeCount
+        let count = pasteboard.changeCount
+        lastChangeCount = count
+        return count
     }
     func matchesWrite(_ count: Int) -> Bool {
         pasteboard.changeCount == count && pasteboard.string(forType: sourceType) == sourceMarker

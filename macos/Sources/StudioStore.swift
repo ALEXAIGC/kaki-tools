@@ -576,7 +576,7 @@ import ImageIO
                     defer { try? FileManager.default.removeItem(at: stage) }
                     try Task.checkCancellation()
                     guard self.generation == revision else { return }
-                    let filename = StudioMediaFiles.filename(title: asset.title, suffix: Self.mediaExtension(StudioMediaFiles.mime(result)))
+                    let filename = StudioMediaFiles.filename(title: asset.title, suffix: StudioMediaFiles.mediaExtension(StudioMediaFiles.mime(result)))
                     _ = try StudioMediaFiles.commitUnique(stage, filename: filename, directory: directory)
                     completed += 1
                 } catch {
@@ -595,21 +595,18 @@ import ImageIO
         let revision = generation, api = client, workspace = workspaceID
         var suffix = "bin"
         if let key = cacheKey(asset, url: asset.url, role: "original"), let entry = await diskCache.lookup(key).entry {
-            return StudioMediaFiles.filename(title: asset.title, suffix: Self.mediaExtension(entry.mime))
+            return StudioMediaFiles.filename(title: asset.title, suffix: StudioMediaFiles.mediaExtension(entry.mime))
         }
         do {
             let result = try await api.media(asset.url, session: saved, workspace: workspace, maximumBytes: 2 * 1024 * 1024, method: "HEAD")
             defer { try? FileManager.default.removeItem(at: result.file) }
             let mime = result.response.value(forHTTPHeaderField: "Content-Type")?.split(separator: ";").first?.lowercased() ?? ""
-            suffix = Self.mediaExtension(mime)
+            suffix = StudioMediaFiles.mediaExtension(mime)
         } catch {
             if generation == revision, case StudioError.http(401, _) = error { handle(error); return nil }
         }
         guard generation == revision else { return nil }
         return StudioMediaFiles.filename(title: asset.title, suffix: suffix)
-    }
-    nonisolated static func mediaExtension(_ mime: String) -> String {
-        ["image/png":"png", "image/jpeg":"jpg", "image/webp":"webp", "image/gif":"gif", "image/heic":"heic", "image/avif":"avif", "video/mp4":"mp4", "video/quicktime":"mov", "video/webm":"webm", "audio/mpeg":"mp3", "audio/wav":"wav", "audio/x-wav":"wav", "audio/mp4":"m4a", "audio/ogg":"ogg"][mime] ?? "bin"
     }
     func download(_ asset: StudioAsset, destination: URL) {
         runMedia(asset, maximumBytes: 512 * 1024 * 1024, prepare: { result in

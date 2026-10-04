@@ -36,6 +36,8 @@ actor StudioDiskCache {
     private var writes: [String: UUID] = [:]
     private var loaded = false
     private var dirty = false
+    private var accessDirty = false
+    private var persistedUses: [String: Date] = [:]
     private var epoch = 0
     private var limit: Int64
     private var days: Int
@@ -82,7 +84,7 @@ actor StudioDiskCache {
         var cleared = oldAvailable
         for entry in Array(entries.values) { if !remove(entry.key) { cleared = false } }
         save()
-        directory = target; volumeUUID = expected; entries = [:]; writes = [:]; loaded = false; dirty = false
+        directory = target; volumeUUID = expected; entries = [:]; writes = [:]; loaded = false; dirty = false; accessDirty = false; persistedUses = [:]
         load()
         return cleared
     }
@@ -97,6 +99,7 @@ actor StudioDiskCache {
                    values.isRegularFile == true, values.isSymbolicLink != true, Int64(values.fileSize ?? -1) == entry.bytes {
                     entries[entry.key] = entry
                     writes[entry.key] = UUID()
+                    persistedUses[entry.key] = entry.lastUsed
                 }
             }
         }
@@ -109,16 +112,16 @@ actor StudioDiskCache {
                 try? FileManager.default.removeItem(at: path)
             }
         }
-        trim(); save()
     }
     private static func validKey(_ value: String) -> Bool {
         value.count == 64 && value.unicodeScalars.allSatisfy { (48...57).contains($0.value) || (97...102).contains($0.value) }
     }
-    private func save() {
-        guard dirty, available(), FileManager.default.fileExists(atPath: directory.path) else { return }
+    private func save(includeAccess: Bool = false) {
+        guard dirty || (includeAccess && accessDirty) else { return }
+        guard available(), FileManager.default.fileExists(atPath: directory.path) else { return }
         let path = directory.appendingPathComponent("index.json")
         if let data = try? JSONEncoder().encode(Index(entries: Array(entries.values))) {
-            do { try data.write(to: path, options: .atomic); dirty = false } catch { return }
+            do { try data.write(to: path, options: .atomic); dirty = false; accessDirty = false; persistedUses = entries.mapValues { $0.lastUsed } } catch { return }
             try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
         }
     }
@@ -127,26 +130,27 @@ actor StudioDiskCache {
         if FileManager.default.fileExists(atPath: file(key).path) {
             do { try FileManager.default.removeItem(at: file(key)) } catch { return false }
         }
-        dirty = true; entries.removeValue(forKey: key); writes.removeValue(forKey: key); return true
+        dirty = true; entries.removeValue(forKey: key); writes.removeValue(forKey: key); persistedUses.removeValue(forKey: key); return true
     }
     private func trim(now: Date = Date()) {
         for entry in Array(entries.values) where limit == 0 || (days > 0 && now.timeIntervalSince(entry.lastUsed) > Double(days) * 86400) { remove(entry.key) }
         var bytes = entries.values.reduce(Int64(0)) { $0 + $1.bytes }
         var count = entries.count
+        guard bytes > limit || count > 1000 else { return }
         for entry in entries.values.sorted(by: { $0.lastUsed < $1.lastUsed }) where bytes > limit || count > 1000 {
             if remove(entry.key) { bytes -= entry.bytes; count -= 1 }
         }
     }
     func lookup(_ key: Key, now: Date = Date()) -> Lookup {
         guard available() else { return Lookup(entry: nil, epoch: epoch, version: Version(epoch: epoch, write: nil)) }
-        load(); trim(now: now)
+        load(); trim(now: now); save()
         let entry = limit > 0 ? entries[key.value] : nil
         if let entry, !FileManager.default.fileExists(atPath: file(entry.key).path) { remove(entry.key); save(); return Lookup(entry: nil, epoch: epoch, version: Version(epoch: epoch, write: nil)) }
         return Lookup(entry: entry, epoch: epoch, version: Version(epoch: epoch, write: writes[key.value]))
     }
     func lease(_ key: Key, responseURL: URL, maximumBytes: Int64) throws -> StudioHTTPFile? {
         guard available() else { return nil }
-        load(); trim()
+        load(); trim(); save()
         guard limit > 0, var entry = entries[key.value] else { return nil }
         guard entry.bytes <= maximumBytes else { throw StudioError.tooLarge }
         let leased = FileManager.default.temporaryDirectory.appendingPathComponent("kaki-cache-" + UUID().uuidString)
@@ -156,7 +160,10 @@ actor StudioDiskCache {
             guard Int64(try leased.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? -1) == entry.bytes else { throw StudioError.invalidResponse }
             var headers = entry.headers; headers["Content-Type"] = entry.mime; headers["Content-Length"] = String(entry.bytes)
             let response = HTTPURLResponse(url: responseURL, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: headers)!
-            entry.lastUsed = Date(); entries[key.value] = entry; dirty = true; save()
+            entry.lastUsed = Date(); entries[key.value] = entry; accessDirty = true
+            // Keep exact LRU in memory. Persist each entry's access at least once
+            // per minute; an abrupt exit can lose at most 60s of access recency.
+            if entry.lastUsed.timeIntervalSince(persistedUses[key.value] ?? .distantPast) >= 60 { save(includeAccess: true) }
             return StudioHTTPFile(file: leased, response: response)
         } catch { try? FileManager.default.removeItem(at: leased); remove(key.value); save(); return nil }
     }

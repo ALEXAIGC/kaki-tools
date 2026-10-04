@@ -65,8 +65,8 @@ import ServiceManagement
         studio.$user.combineLatest(studio.$environment).sink { [weak self] user, environment in
             self?.dreamina.setOwner(user.map { KakiConnectionOwner(environment: environment.rawValue, userID: $0.id) })
         }.store(in: &subscriptions)
-        settings.objectWillChange.sink { [weak self] in
-            DispatchQueue.main.async { self?.applyAppearance() }
+        settings.$appearance.removeDuplicates().sink { [weak self] value in
+            self?.applyAppearance(value)
         }.store(in: &subscriptions)
         NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification).sink { [weak self] _ in
             self?.refreshAccessibilityPermission()
@@ -78,7 +78,6 @@ import ServiceManagement
         }.store(in: &subscriptions)
         refreshAccessibilityPermission()
         refreshItems()
-        applyAppearance()
     }
     func start() {
         studio.startCacheMaintenance()
@@ -360,7 +359,7 @@ import ServiceManagement
             _ = hotkeys.register(bindings: previousBindings) { [weak self] action in self?.performHotkey(action) }
             report("快捷键已被占用或格式无效，设置尚未保存。"); return
         }
-        do { try settings.save(); applyAppearance(); message = "设置已保存。" }
+        do { try settings.save(); message = "设置已保存。" }
         catch {
             if !testMode { _ = hotkeys.register(bindings: previousBindings) { [weak self] action in self?.performHotkey(action) } }
             lastBindings = previousBindings; effectiveHotkey = previousEffectiveHotkey; failedShortcutActions = previousFailures
@@ -369,15 +368,15 @@ import ServiceManagement
     }
     func setAppearance(_ appearance: String) {
         guard ["system", "light", "dark"].contains(appearance) else { return }
-        // A toolbar theme change must not save unregistered shortcut drafts from Settings.
-        let saved = AppSettings(directory: store.directory)
-        if let error = saved.loadError { report(error); return }
-        saved.appearance = appearance
-        do { try saved.save(); settings.appearance = appearance; applyAppearance() }
+        do {
+            _ = try AppSettings.updateSaved(.appearance(appearance), directory: store.directory)
+            settings.appearance = appearance
+        }
         catch { report("主题保存失败：" + error.localizedDescription) }
     }
-    func applyAppearance() {
-        NSApp.appearance = settings.appearance == "dark" ? NSAppearance(named: .darkAqua) : settings.appearance == "light" ? NSAppearance(named: .aqua) : nil
+    private func applyAppearance(_ value: String) {
+        // Published emits before the stored property changes; use its new value.
+        NSApp.appearance = value == "dark" ? NSAppearance(named: .darkAqua) : value == "light" ? NSAppearance(named: .aqua) : nil
     }
     func showSettings(section: String? = nil) {
         refreshAccessibilityPermission()
@@ -424,22 +423,15 @@ import ServiceManagement
         })
     }
     func setDownloadPreferences(askEachTime: Bool, folder: String) {
-        // Download preferences must not persist unregistered shortcut drafts.
-        let saved = AppSettings(directory: store.directory)
-        if let error = saved.loadError { report(error); return }
-        saved.downloadAskEachTime = askEachTime; saved.downloadFolder = folder
         do {
-            try saved.save()
+            _ = try AppSettings.updateSaved(.downloads(askEachTime: askEachTime, folder: folder), directory: store.directory)
             settings.downloadAskEachTime = askEachTime; settings.downloadFolder = folder
             message = "下载设置已保存。"
         } catch { report("下载设置保存失败：" + error.localizedDescription) }
     }
     func setCachePreferences(limitMB: Int, days: Int) {
-        let saved = AppSettings(directory: store.directory)
-        if let error = saved.loadError { report(error); return }
-        saved.studioCacheLimitMB = AppSettings.cacheLimit(limitMB); saved.studioCacheDays = AppSettings.cacheDays(days)
         do {
-            try saved.save()
+            let saved = try AppSettings.updateSaved(.cachePolicy(limitMB: limitMB, days: days), directory: store.directory)
             settings.studioCacheLimitMB = saved.studioCacheLimitMB; settings.studioCacheDays = saved.studioCacheDays
             Task { await studio.configureCache(limitMB: saved.studioCacheLimitMB, days: saved.studioCacheDays) }
             message = "缓存设置已保存。"
@@ -467,8 +459,7 @@ import ServiceManagement
             let oldFolder = saved.studioCacheFolder, oldVolume = saved.studioCacheVolumeUUID
             do {
                 try await self.studio.changeCacheLocation(folder: folder, volumeUUID: volumeUUID)
-                saved.studioCacheFolder = folder; saved.studioCacheVolumeUUID = volumeUUID
-                do { try saved.save() }
+                do { _ = try AppSettings.updateSaved(.cacheLocation(folder: folder, volumeUUID: volumeUUID), directory: self.store.directory) }
                 catch {
                     try? await self.studio.changeCacheLocation(folder: oldFolder, volumeUUID: oldVolume)
                     throw error
@@ -645,13 +636,9 @@ import ServiceManagement
         menu.addItem(menuItem("打开剪贴板", selector: #selector(menuShowPanel), shortcutAction: "panel"))
         menu.addItem(menuItem("打开素材库", selector: #selector(menuShowStudio), shortcutAction: "studio"))
         let arrange = NSMenuItem(title: "调整窗口", action: nil, keyEquivalent: ""), layouts = NSMenu()
-        let groups = [["maximize", "center"], ["left-half", "right-half", "top-half", "bottom-half"],
-                      ["top-left", "top-right", "bottom-left", "bottom-right"],
-                      ["left-third", "center-third", "right-third", "left-two-thirds", "right-two-thirds"]]
-        for (index, group) in groups.enumerated() {
+        for (index, group) in WindowManager.menuGroups.enumerated() {
             if index > 0 { layouts.addItem(.separator()) }
-            for key in group {
-                guard let layout = WindowManager.layouts.first(where: { $0.id == key }) else { continue }
+            for layout in WindowManager.layouts(in: group) {
                 let item = menuItem(layout.label, selector: #selector(menuArrange(_:)), shortcutAction: "window:" + layout.id)
                 item.representedObject = layout.id; layouts.addItem(item)
             }

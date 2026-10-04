@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import AppKit
 import ImageIO
 import UniformTypeIdentifiers
@@ -24,6 +25,8 @@ private func historyTestDirectory() throws -> URL {
 
 @MainActor
 func runHistoryTests() async throws {
+    try await runHistoryPersistenceOrderingTests()
+    try await runThumbnailNotificationTests()
     let manager = FileManager.default
     let directory = try historyTestDirectory()
     defer { try? manager.removeItem(at: directory) }
@@ -261,4 +264,96 @@ func runHistoryTests() async throws {
     try check(clipboard.matchesWrite(plain) && pasteboard.data(forType: .html) == nil && pasteboard.data(forType: .rtf) == nil, "plain text playback strips formatting")
     clipboard.stop(); clipboardStore.flush()
     print("History/clipboard tests passed (temporary data and private pasteboard)")
+}
+
+@MainActor private func runThumbnailNotificationTests() async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("kaki-thumbnail-events-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let store = HistoryStore(directory: dir)
+    let png = try historyTestPNG(width: 5)
+    let reused = try ImageCodec.png(png)
+    try check(reused == png, "already normalized PNG preserves exact bytes and canonical hash input")
+    var events: [String] = [], delivered: NSImage?
+    let observer = store.thumbnailChanges.sink { id in
+        events.append(id)
+        if let item = store.item(id: id) { delivered = store.thumbnail(for: item) }
+    }
+    defer { observer.cancel() }
+    try check(store.captureImage(data: png), "pending thumbnail fixture admitted")
+    let pending = store.items[0]
+    try check(store.thumbnail(for: pending) == nil, "pending image has no premature thumbnail request")
+    store.flush()
+    for _ in 0..<200 { if delivered != nil { break }; try await Task.sleep(nanoseconds: 1_000_000) }
+    try check(delivered != nil && events == [pending.id, pending.id], "image completion and thumbnail completion notify only the matching ID and deliver immediately")
+    let count = events.count
+    store.addText("unrelated text"); store.updateMetadata(id: pending.id, tags: ["tag"], note: "note"); store.togglePin(id: pending.id)
+    try await Task.sleep(nanoseconds: 10_000_000)
+    try check(events.count == count, "unrelated history edits do not trigger thumbnail notifications")
+    try check(store.captureImage(data: png), "canonical duplicate fixture admitted")
+    let duplicateID = store.items[0].id
+    store.flush()
+    try check(!store.items.contains(where: { $0.id == duplicateID }) && !events.contains(duplicateID), "dedup removes pending duplicate without publishing a stale thumbnail ID")
+    let removedPNG = try historyTestPNG(width: 7)
+    try check(store.captureImage(data: removedPNG), "deleted thumbnail fixture admitted")
+    let removedID = store.items[0].id
+    store.flush(); store.remove(id: removedID)
+    let beforeLate = events.filter { $0 == removedID }.count
+    try await Task.sleep(nanoseconds: 20_000_000)
+    try check(events.filter { $0 == removedID }.count == beforeLate && !store.items.contains(where: { $0.id == removedID }), "late thumbnail completion cannot publish or resurrect a deleted item")
+    let evictions = HistoryStore(directory: dir.appendingPathComponent("evictions"))
+    for width in 1...25 { let data = try historyTestPNG(width: width); try check(evictions.captureImage(data: data), "thumbnail LRU fixture admitted") }
+    evictions.flush()
+    let first = evictions.items[0]
+    for item in evictions.items {
+        _ = evictions.thumbnail(for: item)
+        for _ in 0..<200 { if evictions.thumbnail(for: item) != nil { break }; try await Task.sleep(nanoseconds: 1_000_000) }
+        try check(evictions.thumbnail(for: item) != nil, "asynchronous thumbnail cache delivers each image")
+    }
+    try check(evictions.thumbnail(for: first) == nil, "twenty-fifth thumbnail evicts the first of the 24-image cache")
+    for _ in 0..<200 { if evictions.thumbnail(for: first) != nil { break }; try await Task.sleep(nanoseconds: 1_000_000) }
+    try check(evictions.thumbnail(for: first) != nil, "evicted thumbnail can be requested and delivered again")
+    store.flush(); evictions.flush()
+}
+
+@MainActor private func runHistoryPersistenceOrderingTests() async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("kaki-history-order-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let store = HistoryStore(directory: dir)
+    let large = String(repeating: "大文本📝", count: 150_000)
+    store.addText(large + "-old")
+    try await Task.sleep(nanoseconds: 300_000_000)
+    for value in 0..<20 { store.addText("revision-" + String(value)) }
+    let board = store.createBoard("保留")!
+    let retained = store.items[0].id
+    store.addToBoard(id: retained, board: board)
+    store.togglePin(id: retained)
+    store.addText(large + "-final")
+    let png = try historyTestPNG(width: 8)
+    try check(store.captureImage(data: png), "image worker interleaves with automatic history snapshots")
+    let cancelledPNG = try historyTestPNG(width: 9)
+    try check(store.captureImage(data: cancelledPNG), "second concurrent image snapshot fixture admitted")
+    let cancelled = store.items[0]
+    store.remove(id: cancelled.id)
+    store.flush()
+    let expected = store.items
+    let disk = dir.appendingPathComponent("history.json")
+    let immediate = try Data(contentsOf: disk)
+    try await Task.sleep(nanoseconds: 350_000_000)
+    let later = try Data(contentsOf: disk)
+    try check(immediate == later, "older queued snapshots and completion callbacks cannot overwrite flushed final history")
+    let restored = HistoryStore(directory: dir)
+    try check(restored.items == expected && restored.boards == [board], "rapid edits plus flush reload retain exact values, order, fixed items and board copies")
+    try check(restored.items.contains(where: { $0.text == large + "-final" }), "large UTF-8 text retains complete content without truncation")
+    try check(!restored.items.contains(where: { $0.id == cancelled.id }) && !FileManager.default.fileExists(atPath: cancelled.file!), "cancelled pending image never enters final serialized history")
+    try check(restored.items.filter { $0.type == "image" }.allSatisfy { $0.hash != nil && ($0.bytes ?? 0) > 0 && $0.file.map { FileManager.default.fileExists(atPath: $0) } == true }, "persisted images always refer to completed payloads and canonical hashes")
+    try check(restored.pendingImageBytes == 0 && !restored.isReadOnly, "final image snapshots reload without pending reservations or format migration")
+    let automatic = HistoryStore(directory: dir.appendingPathComponent("automatic"))
+    automatic.addText(large)
+    for _ in 0..<200 {
+        if FileManager.default.fileExists(atPath: automatic.directory.appendingPathComponent("history.json").path) { break }
+        try await Task.sleep(nanoseconds: 5_000_000)
+    }
+    let autoReload = HistoryStore(directory: automatic.directory)
+    try check(autoReload.items.first?.text == large, "automatic background encoding atomically saves full large text without explicit flush")
+    automatic.flush(); restored.flush()
 }

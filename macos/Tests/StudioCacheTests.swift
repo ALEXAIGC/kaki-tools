@@ -90,6 +90,7 @@ import AppKit
     catch CocoaError.fileWriteNoPermission { try check((try? Data(contentsOf: untouched)) == bytes, "occupied unowned directory is rejected without changing user files") }
     let stillCurrent = await cache.lookup(key("disk")).entry
     try check(stillCurrent != nil, "failed location switch keeps prior cache active")
+    try await runStudioAccessPersistenceTests(directory: directory)
     try await runStudioCacheVersionTests(directory: directory)
     try await runStudioCachedMediaTests(directory: directory)
 }
@@ -213,4 +214,46 @@ private actor CacheTransport: StudioTransport {
     let removedReloaded = await restarted.remove(key, ifUnchanged: reloaded.version)
     let reloadedEmpty = await restarted.lookup(key)
     try check(removedReloaded && reloadedEmpty.entry == nil, "post-restart validation can still remove its observed cache entry")
+}
+
+@MainActor private func runStudioAccessPersistenceTests(directory: URL) async throws {
+    let root = directory.appendingPathComponent("access-write-tests")
+    let cache = StudioDiskCache(directory: root, limitMB: 1)
+    let key = StudioDiskCache.Key(environment: "test", user: "fixture", workspace: "w", asset: "hot", url: "https://example.invalid/hot", role: "original")
+    let file = directory.appendingPathComponent("hot-payload")
+    let data = Data("hot-media".utf8)
+    try data.write(to: file)
+    let url = URL(string: "https://example.invalid/hot")!
+    let media = StudioHTTPFile(file: file, response: HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type":"video/mp4"])!)
+    let initial = await cache.lookup(key)
+    await cache.store(media, key: key, epoch: initial.epoch)
+    let index = root.appendingPathComponent("index.json")
+    let before = try Data(contentsOf: index)
+    var changedFiles = 0, previous = before
+    for _ in 0..<10 {
+        guard let lease = try await cache.lease(key, responseURL: url, maximumBytes: 1024) else { throw NativeTestFailure(description: "Hot cache lease missing") }
+        try check((try? Data(contentsOf: lease.file)) == data, "hot cache lease preserves owned payload")
+        try? FileManager.default.removeItem(at: lease.file)
+        _ = await cache.stats()
+        let current = try Data(contentsOf: index)
+        if current != previous { changedFiles += 1 }; previous = current
+    }
+    try check(changedFiles == 0, "ten hot leases and stats do not rewrite the index inside the access persistence window")
+    let used = await cache.lookup(key).entry!.lastUsed
+    let other = StudioDiskCache.Key(environment: "test", user: "fixture", workspace: "w", asset: "other", url: "https://example.invalid/other", role: "original")
+    await cache.store(media, key: other, epoch: initial.epoch)
+    let restarted = StudioDiskCache(directory: root, limitMB: 1)
+    let savedUse = await restarted.lookup(key).entry!.lastUsed
+    try check(abs(savedUse.timeIntervalSince(used)) < 0.001, "structural write includes pending access timestamps for relaunch")
+    await cache.store(media, key: key, epoch: initial.epoch, now: Date().addingTimeInterval(-120))
+    let old = try Data(contentsOf: index)
+    guard let lease = try await cache.lease(key, responseURL: url, maximumBytes: 1024) else { throw NativeTestFailure(description: "Old access fixture missing") }
+    try? FileManager.default.removeItem(at: lease.file)
+    let persisted = try Data(contentsOf: index)
+    try check(persisted != old, "first access after the persistence window immediately updates the disk timestamp")
+    await cache.remove(key)
+    let deleted = StudioDiskCache(directory: root, limitMB: 1)
+    let removed = await deleted.lookup(key).entry
+    try check(removed == nil, "entry deletion is durable despite access write throttling")
+    print("Cache index observation: 10 hot leases plus stats, \(changedFiles) index content changes")
 }

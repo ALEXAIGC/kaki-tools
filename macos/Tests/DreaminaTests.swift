@@ -22,6 +22,9 @@ struct DreaminaStudioFixture: StudioTransport {
 }
 
 actor DreaminaFixtureRunner: DreaminaRunning {
+    var installed = true
+    var cliVersion = "fixture"
+    func setInstallation(_ installed: Bool, version: String = "fixture") { self.installed = installed; cliVersion = version }
     var active = false
     var account: Int64 = 1234567890123456789
     var supported = true
@@ -35,11 +38,12 @@ actor DreaminaFixtureRunner: DreaminaRunning {
     func releaseWait() { continuation?.resume(); continuation = nil }
     func run(_ arguments: [String], timeout: TimeInterval) async throws -> DreaminaOutput {
         calls.append(arguments)
+        guard installed else { throw DreaminaError.missingCLI }
         guard arguments.prefix(7) == ["--format", "json", "--non-interactive", "--region", "cn", "--profile", arguments[6]] else { throw NativeTestFailure(description: "CLI globals missing") }
         let profile = arguments[6], command = Array(arguments.dropFirst(7))
         let data: [String: Any]
         switch command.prefix(2).joined(separator: " ") {
-        case "version": data = ["version":"fixture", "edition":"public", "distribution":"cn"]
+        case "version": data = ["version":cliVersion, "edition":"public", "distribution":"cn"]
         case "schema": data = ["subcommands":[["name":"auth", "subcommands":(supported ? ["account", "status", "login", "wait", "logout"] : ["status", "login"]).map { ["name":$0] }]]]
         case "auth status": data = ["loggedIn":active, "profile":profile, "region":"cn", "environment":"prod"]
         case "auth account": data = ["userId":NSNumber(value: account)]
@@ -58,6 +62,9 @@ actor DreaminaFixtureRunner: DreaminaRunning {
 }
 
 @MainActor func runDreaminaTests() async throws {
+    try await runDreaminaRefreshTests()
+    try await runDreaminaExecutableRefreshTests()
+    try await runDreaminaLateDiscoveryFailureTest()
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("kaki-dreamina-test-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -171,4 +178,110 @@ actor DreaminaFixtureRunner: DreaminaRunning {
     app.shutdown()
     connector.shutdown(); restored.shutdown(); racing.shutdown(); unsupported.shutdown(); damaged.shutdown()
     print("Dreamina binding tests passed (synthetic OAuth, private IDs, no real CLI credentials)")
+}
+
+@MainActor private func runDreaminaRefreshTests() async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("kaki-cli-refresh-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let runner = DreaminaFixtureRunner()
+    await runner.setInstallation(false)
+    let connector = DreaminaConnector(directory: dir, runner: runner)
+    await connector.refresh()
+    try check(connector.version.isEmpty && connector.message.contains("安装"), "missing CLI refresh reports installation requirement")
+    await runner.setInstallation(true)
+    await connector.refresh()
+    try check(connector.version == "fixture" && connector.message.isEmpty, "installation after startup is discovered on refresh")
+    await runner.setInstallation(true, version: "upgraded")
+    await runner.setSupported(false)
+    await connector.refresh()
+    try check(connector.version.isEmpty && connector.message.contains("更新"), "refresh rechecks upgraded CLI schema instead of retaining stale capabilities")
+    await runner.setSupported(true)
+    await connector.refresh()
+    try check(connector.version == "upgraded" && connector.message.isEmpty, "failed discovery can be retried after CLI repair")
+    await runner.setInstallation(false)
+    await connector.refresh()
+    try check(connector.version.isEmpty && connector.message.contains("安装"), "deleted CLI clears displayed version and supported state")
+    await runner.setInstallation(true, version: "reinstalled")
+    await connector.refresh()
+    try check(connector.version == "reinstalled", "reinstalled CLI receives a fresh version check")
+    connector.shutdown()
+}
+
+@MainActor private func runDreaminaExecutableRefreshTests() async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("kaki-cli-locate-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let first = dir.appendingPathComponent("first-cli"), second = dir.appendingPathComponent("second-cli")
+    let runner = DreaminaProcessRunner(locator: { [first, second].first { FileManager.default.isExecutableFile(atPath: $0.path) } })
+    let connector = DreaminaConnector(directory: dir, runner: runner)
+    defer { connector.shutdown() }
+    func install(_ path: URL, version: String, supported: Bool = true) throws {
+        let names = supported ? ["account", "status", "login", "wait", "logout"] : ["status"]
+        let schema = try JSONSerialization.data(withJSONObject: ["schemaVersion":"1", "ok":true, "data":["subcommands":[["name":"auth", "subcommands":names.map { ["name":$0] }]]]])
+        let schemaText = String(data: schema, encoding: .utf8)!
+        let script = """
+        #!/bin/sh
+        case "$8" in
+        version) printf '%s' '{"schemaVersion":"1","ok":true,"data":{"version":"\(version)","edition":"public","distribution":"cn"}}' ;;
+        schema) printf '%s' '\(schemaText)' ;;
+        *) exit 1 ;;
+        esac
+        """
+        try Data(script.utf8).write(to: path, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions:0o700], ofItemAtPath: path.path)
+    }
+    await connector.refresh()
+    try check(connector.version.isEmpty && connector.message.contains("安装"), "dynamic process runner initially discovers no executable")
+    try install(first, version: "fixture-v1")
+    await connector.refresh()
+    try check(connector.version == "fixture-v1", "process runner rediscovers CLI installed after connector initialization")
+    try install(first, version: "fixture-v2")
+    await connector.refresh()
+    try check(connector.version == "fixture-v2", "process refresh rereads replaced executable version")
+    try install(first, version: "fixture-v3", supported: false)
+    await connector.refresh()
+    try check(connector.version.isEmpty && connector.message.contains("更新"), "process refresh rejects upgraded executable with incompatible schema")
+    try FileManager.default.removeItem(at: first)
+    await connector.refresh()
+    try check(connector.version.isEmpty && connector.message.contains("安装"), "process refresh detects deleted executable")
+    try install(second, version: "fixture-repaired")
+    await connector.refresh()
+    try check(connector.version == "fixture-repaired" && connector.message.isEmpty, "process refresh recovers after executable installation at a new discovered path")
+    try Data("#!/bin/sh\nexit 1\n".utf8).write(to: second)
+    await connector.refresh()
+    try check(connector.version.isEmpty && !connector.message.isEmpty, "failed version command cannot retain stale supported version")
+    try install(second, version: "fixture-retry")
+    await connector.refresh()
+    try check(connector.version == "fixture-retry" && connector.message.isEmpty, "failed version invocation can be retried after executable repair")
+}
+
+private actor DreaminaLateMissingRunner: DreaminaRunning {
+    private let fixture = DreaminaFixtureRunner()
+    private var first = true
+    private var waiter: CheckedContinuation<Void, Never>?
+    var waiting = false
+    func release() { waiter?.resume(); waiter = nil }
+    func run(_ arguments: [String], timeout: TimeInterval) async throws -> DreaminaOutput {
+        if first {
+            first = false; waiting = true
+            await withCheckedContinuation { waiter = $0 }
+            throw DreaminaError.missingCLI
+        }
+        return try await fixture.run(arguments, timeout: timeout)
+    }
+}
+@MainActor private func runDreaminaLateDiscoveryFailureTest() async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("kaki-cli-late-failure-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let runner = DreaminaLateMissingRunner(), connector = DreaminaConnector(directory: dir, runner: runner)
+    let old = Task { await connector.refresh() }
+    for _ in 0..<200 { if await runner.waiting { break }; await Task.yield() }
+    let started = await runner.waiting
+    guard started else { await runner.release(); old.cancel(); throw NativeTestFailure(description: "Late discovery fixture failed to start") }
+    let owner = KakiConnectionOwner(environment: "test", userID: "new-owner")
+    connector.setOwner(owner)
+    await connector.refresh()
+    await runner.release(); await old.value
+    try check(connector.owner == owner && connector.version == "fixture" && connector.message.isEmpty && !connector.busy, "old cancelled missing-CLI result cannot invalidate a new owner's completed discovery")
+    connector.shutdown()
 }

@@ -2,6 +2,13 @@ import AppKit
 import Carbon
 
 func runSystemTests() throws {
+    let settingsOrder = WindowLayout.Group.allCases.flatMap { WindowManager.layouts(in: $0).map(\.id) }
+    let menuOrder = WindowManager.menuGroups.flatMap { WindowManager.layouts(in: $0).map(\.id) }
+    try check(settingsOrder == ["left-half", "right-half", "top-half", "bottom-half", "top-left", "top-right", "bottom-left", "bottom-right", "left-third", "center-third", "right-third", "left-two-thirds", "right-two-thirds", "maximize", "center"], "shared groups retain settings layout order")
+    try check(menuOrder == ["maximize", "center", "left-half", "right-half", "top-half", "bottom-half", "top-left", "top-right", "bottom-left", "bottom-right", "left-third", "center-third", "right-third", "left-two-thirds", "right-two-thirds"], "shared groups retain status menu order")
+    try check(WindowLayout.Group.allCases.map(\.settingsTitle) == ["半屏", "四分屏", "三分屏", "其他布局"], "settings grouping labels remain unchanged")
+    let maximize = WindowManager.layouts.first { $0.id == "maximize" }!
+    try check(maximize.label == "最大化" && maximize.settingsLabel == "铺满窗口" && maximize.defaultShortcut == "Control+Alt+Return", "maximize keeps distinct menu/settings labels and Return default")
     try check(WindowManager.layouts.count == 15, "All fifteen window layouts migrate")
     try check(Set(WindowManager.layouts.map(\.id)) == Set(WindowManager.defaultShortcuts.keys), "Every layout retains its shortcut")
     for layout in WindowManager.layouts {

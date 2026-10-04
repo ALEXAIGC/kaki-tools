@@ -41,7 +41,9 @@ struct DreaminaUnavailableRunner: DreaminaRunning {
 // Execute fixed argv directly. No shell, inherited stdin, credential logging or
 // writes to the CLI credential store; its own OAuth client owns the Keychain.
 struct DreaminaProcessRunner: DreaminaRunning {
-    let executable: URL?
+    private let locator: @Sendable () -> URL?
+    init(executable: URL?) { locator = { executable } }
+    init(locator: @escaping @Sendable () -> URL? = { DreaminaProcessRunner.locate() }) { self.locator = locator }
     static func locate() -> URL? {
         let home = FileManager.default.homeDirectoryForCurrentUser
         return [home.appendingPathComponent(".local/bin/dreamina-canvas"),
@@ -51,7 +53,7 @@ struct DreaminaProcessRunner: DreaminaRunning {
         }
     }
     func run(_ arguments: [String], timeout: TimeInterval) async throws -> DreaminaOutput {
-        guard let executable else { throw DreaminaError.missingCLI }
+        guard let executable = locator(), FileManager.default.isExecutableFile(atPath: executable.path) else { throw DreaminaError.missingCLI }
         let invocation = DreaminaInvocation()
         return try await withTaskCancellationHandler(operation: {
             try Task.checkCancellation()

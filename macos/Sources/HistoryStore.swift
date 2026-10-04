@@ -5,7 +5,7 @@ import CryptoKit
 import ImageIO
 import UniformTypeIdentifiers
 
-private struct HistorySnapshot: Codable {
+private struct HistorySnapshot: Codable, Sendable {
     var items: [HistoryItem]
     var boards: [String]
     init(items: [HistoryItem], boards: [String]) { self.items = items; self.boards = boards }
@@ -104,6 +104,7 @@ final class HistoryStore: ObservableObject {
     @Published private(set) var lastError: String?
     private(set) var isReadOnly = false
     private(set) var pendingImageBytes = 0
+    let thumbnailChanges = PassthroughSubject<String, Never>()
     var onError: ((String) -> Void)?
     let directory: URL
     private let images: URL
@@ -115,7 +116,12 @@ final class HistoryStore: ObservableObject {
     private var persistWork: DispatchWorkItem?
     private var thumbnails: [String: NSImage] = [:]
     private var thumbnailOrder: [String] = []
-    private var loadingThumbnails: Set<String> = []
+    struct ThumbnailSource: Equatable {
+        let file: String?; let thumb: String?; let hash: String?
+        init(_ item: HistoryItem) { file = item.file; thumb = item.thumb; hash = item.hash }
+    }
+    private var thumbnailSources: [String: ThumbnailSource] = [:]
+    private var loadingThumbnails: [String: UUID] = [:]
 
     init(directory: URL, limit: Int = 100, imageBudget: Int = 384 * 1024 * 1024) {
         self.directory = directory
@@ -192,29 +198,31 @@ final class HistoryStore: ObservableObject {
         persistWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
     }
-    private func snapshotData() throws -> Data {
-        try JSONEncoder().encode(HistorySnapshot(items: items.filter { pending[$0.id] == nil }, boards: boards))
+    private func snapshot() -> HistorySnapshot {
+        HistorySnapshot(items: items.filter { pending[$0.id] == nil }, boards: boards)
+    }
+    private nonisolated static func write(_ snapshot: HistorySnapshot, to file: URL) throws {
+        let data = try JSONEncoder().encode(snapshot)
+        try data.write(to: file, options: .atomic)
     }
     private func persistAsync() {
         guard !isReadOnly else { return }
-        do {
-            let payload = try snapshotData(), file = history
-            queue.async { [weak self] in
-                do {
-                    try payload.write(to: file, options: .atomic)
-                } catch { DispatchQueue.main.async { self?.report(error) } }
-            }
-        } catch { report(error) }
+        let snapshot = snapshot(), file = history
+        queue.async { [weak self] in
+            do { try Self.write(snapshot, to: file) }
+            catch { DispatchQueue.main.async { self?.report(error) } }
+        }
     }
     func flush() {
         persistWork?.cancel(); persistWork = nil
         guard !isReadOnly else { return }
+        // Drain older snapshots and image workers before collecting final values.
         queue.sync {}
         for job in Array(pending.values) { complete(job) }
-        do {
-            let payload = try snapshotData()
-            try queue.sync { try payload.write(to: history, options: .atomic) }
-        } catch { report(error) }
+        persistWork?.cancel(); persistWork = nil
+        let final = snapshot(), file = history
+        do { try queue.sync { try Self.write(final, to: file) } }
+        catch { report(error) }
     }
     func isPending(id: String) -> Bool { pending[id] != nil }
     func item(id: String) -> HistoryItem? {
@@ -283,7 +291,7 @@ final class HistoryStore: ObservableObject {
             guard let path = items[index].file else { throw HistoryFailure.invalidImage }
             try FileManager.default.moveItem(at: job.temporary, to: URL(fileURLWithPath: path))
             items[index].hash = image.hash; items[index].bytes = image.bytes
-            release(job); trim(); changed()
+            release(job); trim(); changed(); thumbnailChanges.send(job.id)
         } catch { removeInternal(id: job.id); report(error); changed() }
     }
     private func trim() {
@@ -295,7 +303,7 @@ final class HistoryStore: ObservableObject {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
         let item = items.remove(at: index)
         if let job = pending[id] { release(job) }
-        thumbnails[id] = nil; thumbnailOrder.removeAll { $0 == id }
+        thumbnails[id] = nil; thumbnailSources[id] = nil; loadingThumbnails[id] = nil; thumbnailOrder.removeAll { $0 == id }
         if item.type == "image", let path = item.file {
             for suffix in ["", ".thumb", ".thumbnail.png"] { try? FileManager.default.removeItem(atPath: path + suffix) }
         }
@@ -362,21 +370,30 @@ final class HistoryStore: ObservableObject {
         changed()
     }
     func thumbnail(for item: HistoryItem) -> NSImage? {
+        guard pending[item.id] == nil, let current = items.first(where: { $0.id == item.id }), current.type == "image" else { return nil }
+        let source = ThumbnailSource(current)
+        guard source == ThumbnailSource(item) else { return nil }
+        if thumbnailSources[item.id] != source {
+            thumbnails[item.id] = nil; thumbnailOrder.removeAll { $0 == item.id }; loadingThumbnails[item.id] = nil
+            thumbnailSources[item.id] = source
+        }
         if let cached = thumbnails[item.id] { return cached }
         if let value = item.thumb, let image = legacyThumbnail(value) { cache(image, id: item.id); return image }
         guard let path = item.file else { return nil }
         if let value = try? String(contentsOfFile: path + ".thumb", encoding: .utf8), let image = legacyThumbnail(value) {
             cache(image, id: item.id); return image
         }
-        guard !loadingThumbnails.contains(item.id) else { return nil }
-        loadingThumbnails.insert(item.id)
+        guard loadingThumbnails[item.id] == nil else { return nil }
+        let ticket = UUID(); loadingThumbnails[item.id] = ticket
         let id = item.id, file = URL(fileURLWithPath: path)
         queue.async { [weak self] in
             let image = autoreleasepool { ImageCodec.thumbnail(file: file) }
             DispatchQueue.main.async {
-                guard let self else { return }
-                self.loadingThumbnails.remove(id)
-                if let image, self.items.contains(where: { $0.id == id }) { self.cache(image, id: id); self.objectWillChange.send() }
+                guard let self, self.loadingThumbnails[id] == ticket else { return }
+                self.loadingThumbnails[id] = nil
+                if let image, let current = self.items.first(where: { $0.id == id }), ThumbnailSource(current) == source {
+                    self.cache(image, id: id); self.thumbnailChanges.send(id)
+                }
             }
         }
         return nil

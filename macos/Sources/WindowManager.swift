@@ -2,9 +2,22 @@ import AppKit
 import ApplicationServices
 
 struct WindowLayout: Identifiable {
+    enum Group: String, CaseIterable, Identifiable {
+        case halves, quarters, thirds, other
+        var id: String { rawValue }
+        var settingsTitle: String {
+            switch self { case .halves: return "半屏"; case .quarters: return "四分屏"; case .thirds: return "三分屏"; case .other: return "其他布局" }
+        }
+    }
     let id: String
     let label: String
     let fractions: [Double]
+    let group: Group
+    let defaultShortcut: String
+    var settingsLabel: String { id == "maximize" ? "铺满窗口" : label }
+    init(id: String, label: String, fractions: [Double], group: Group = .other, defaultShortcut: String = "") {
+        self.id = id; self.label = label; self.fractions = fractions; self.group = group; self.defaultShortcut = defaultShortcut
+    }
 }
 
 struct WindowScreenArea {
@@ -52,33 +65,26 @@ final class WindowRequestGate {
 
 final class WindowManager {
     static let layouts: [WindowLayout] = [
-        WindowLayout(id: "left-half", label: "左半屏", fractions: [0, 0, 0.5, 1]),
-        WindowLayout(id: "right-half", label: "右半屏", fractions: [0.5, 0, 0.5, 1]),
-        WindowLayout(id: "top-half", label: "上半屏", fractions: [0, 0, 1, 0.5]),
-        WindowLayout(id: "bottom-half", label: "下半屏", fractions: [0, 0.5, 1, 0.5]),
-        WindowLayout(id: "top-left", label: "左上 1/4", fractions: [0, 0, 0.5, 0.5]),
-        WindowLayout(id: "top-right", label: "右上 1/4", fractions: [0.5, 0, 0.5, 0.5]),
-        WindowLayout(id: "bottom-left", label: "左下 1/4", fractions: [0, 0.5, 0.5, 0.5]),
-        WindowLayout(id: "bottom-right", label: "右下 1/4", fractions: [0.5, 0.5, 0.5, 0.5]),
-        WindowLayout(id: "left-third", label: "左 1/3", fractions: [0, 0, 1.0 / 3, 1]),
-        WindowLayout(id: "center-third", label: "中 1/3", fractions: [1.0 / 3, 0, 1.0 / 3, 1]),
-        WindowLayout(id: "right-third", label: "右 1/3", fractions: [2.0 / 3, 0, 1.0 / 3, 1]),
-        WindowLayout(id: "left-two-thirds", label: "左 2/3", fractions: [0, 0, 2.0 / 3, 1]),
-        WindowLayout(id: "right-two-thirds", label: "右 2/3", fractions: [1.0 / 3, 0, 2.0 / 3, 1]),
-        WindowLayout(id: "maximize", label: "最大化", fractions: [0, 0, 1, 1]),
-        WindowLayout(id: "center", label: "居中", fractions: [0.125, 0.1, 0.75, 0.8]),
+        WindowLayout(id: "left-half", label: "左半屏", fractions: [0, 0, 0.5, 1], group: .halves, defaultShortcut: "Control+Alt+Left"),
+        WindowLayout(id: "right-half", label: "右半屏", fractions: [0.5, 0, 0.5, 1], group: .halves, defaultShortcut: "Control+Alt+Right"),
+        WindowLayout(id: "top-half", label: "上半屏", fractions: [0, 0, 1, 0.5], group: .halves, defaultShortcut: "Control+Alt+Up"),
+        WindowLayout(id: "bottom-half", label: "下半屏", fractions: [0, 0.5, 1, 0.5], group: .halves, defaultShortcut: "Control+Alt+Down"),
+        WindowLayout(id: "top-left", label: "左上 1/4", fractions: [0, 0, 0.5, 0.5], group: .quarters, defaultShortcut: "Control+Alt+U"),
+        WindowLayout(id: "top-right", label: "右上 1/4", fractions: [0.5, 0, 0.5, 0.5], group: .quarters, defaultShortcut: "Control+Alt+I"),
+        WindowLayout(id: "bottom-left", label: "左下 1/4", fractions: [0, 0.5, 0.5, 0.5], group: .quarters, defaultShortcut: "Control+Alt+J"),
+        WindowLayout(id: "bottom-right", label: "右下 1/4", fractions: [0.5, 0.5, 0.5, 0.5], group: .quarters, defaultShortcut: "Control+Alt+K"),
+        WindowLayout(id: "left-third", label: "左 1/3", fractions: [0, 0, 1.0 / 3, 1], group: .thirds, defaultShortcut: "Control+Alt+D"),
+        WindowLayout(id: "center-third", label: "中 1/3", fractions: [1.0 / 3, 0, 1.0 / 3, 1], group: .thirds, defaultShortcut: "Control+Alt+F"),
+        WindowLayout(id: "right-third", label: "右 1/3", fractions: [2.0 / 3, 0, 1.0 / 3, 1], group: .thirds, defaultShortcut: "Control+Alt+G"),
+        WindowLayout(id: "left-two-thirds", label: "左 2/3", fractions: [0, 0, 2.0 / 3, 1], group: .thirds, defaultShortcut: "Control+Alt+E"),
+        WindowLayout(id: "right-two-thirds", label: "右 2/3", fractions: [1.0 / 3, 0, 2.0 / 3, 1], group: .thirds, defaultShortcut: "Control+Alt+T"),
+        WindowLayout(id: "maximize", label: "最大化", fractions: [0, 0, 1, 1], group: .other, defaultShortcut: "Control+Alt+Return"),
+        WindowLayout(id: "center", label: "居中", fractions: [0.125, 0.1, 0.75, 0.8], group: .other, defaultShortcut: "Control+Alt+C"),
     ]
 
-    static let defaultShortcuts: [String: String] = [
-        "left-half": "Control+Alt+Left", "right-half": "Control+Alt+Right",
-        "top-half": "Control+Alt+Up", "bottom-half": "Control+Alt+Down",
-        "top-left": "Control+Alt+U", "top-right": "Control+Alt+I",
-        "bottom-left": "Control+Alt+J", "bottom-right": "Control+Alt+K",
-        "left-third": "Control+Alt+D", "center-third": "Control+Alt+F",
-        "right-third": "Control+Alt+G", "left-two-thirds": "Control+Alt+E",
-        "right-two-thirds": "Control+Alt+T", "maximize": "Control+Alt+Return",
-        "center": "Control+Alt+C",
-    ]
+    static let defaultShortcuts = Dictionary(uniqueKeysWithValues: layouts.map { ($0.id, $0.defaultShortcut) })
+    static let menuGroups: [WindowLayout.Group] = [.other, .halves, .quarters, .thirds]
+    static func layouts(in group: WindowLayout.Group) -> [WindowLayout] { layouts.filter { $0.group == group } }
 
     var onError: ((String) -> Void)?
     private let queue = DispatchQueue(label: "com.openclaw.kakitools.windows", qos: .userInitiated)

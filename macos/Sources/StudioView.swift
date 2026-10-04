@@ -98,9 +98,7 @@ import AVKit
     }
 }
 
-private enum StudioLibraryAssets {
-    static let logo = Bundle.main.url(forResource: "kaki-logo", withExtension: "png").flatMap { NSImage(contentsOf: $0) }
-}
+
 
 @MainActor struct StudioLibraryView: View {
     @ObservedObject var studio: StudioStore
@@ -209,7 +207,7 @@ private enum StudioLibraryAssets {
     }
     private var toolbar: some View {
         HStack(spacing: 12) {
-            if let logo = StudioLibraryAssets.logo {
+            if let logo = NativeBrand.logo {
                 Image(nsImage: logo).resizable().scaledToFill().frame(width: 76, height: 34).clipped()
                     .accessibilityLabel("KAKI").help(studio.environment.baseURL.host ?? "Studio")
             }

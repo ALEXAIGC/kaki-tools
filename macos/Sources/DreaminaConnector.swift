@@ -50,7 +50,7 @@ struct DreaminaAuthorization: Identifiable {
     private var operation: Task<Void, Never>?
 
     init(directory: URL, runner: DreaminaRunning? = nil) {
-        self.runner = runner ?? DreaminaProcessRunner(executable: DreaminaProcessRunner.locate())
+        self.runner = runner ?? DreaminaProcessRunner()
         file = directory.appendingPathComponent("dreamina-bindings.json")
         if FileManager.default.fileExists(atPath: file.path) {
             do {
@@ -81,10 +81,18 @@ struct DreaminaAuthorization: Identifiable {
     }
     private func command(_ args: [String], owner: KakiConnectionOwner?, timeout: TimeInterval = 30) async throws -> [String: Any] {
         let prefix = ["--format", "json", "--non-interactive", "--region", "cn", "--profile", owner?.profile ?? "kaki-unlinked-check"]
-        return try DreaminaJSON.data(await runner.run(prefix + args, timeout: timeout))
+        let revision = generation
+        do { return try DreaminaJSON.data(await runner.run(prefix + args, timeout: timeout)) }
+        catch {
+            if generation == revision, self.owner == owner, case DreaminaError.missingCLI = error {
+                supportsAccount = false; version = ""; videoModels = []
+            }
+            throw error
+        }
     }
-    private func discover(_ revision: Int, _ expected: KakiConnectionOwner?) async throws {
-        if supportsAccount { return }
+    private func discover(_ revision: Int, _ expected: KakiConnectionOwner?, force: Bool = false) async throws {
+        if supportsAccount && !force { return }
+        supportsAccount = false; version = ""
         let info = try await command(["version"], owner: expected)
         try check(revision, owner: expected)
         guard info["edition"] as? String == "public", info["distribution"] as? String == "cn",
@@ -135,7 +143,8 @@ struct DreaminaAuthorization: Identifiable {
     }
     func refresh() async {
         await perform { [self] revision, expected in
-            try await discover(revision, expected)
+            videoModels = []
+            try await discover(revision, expected, force: true)
             guard let expected else { return }
             guard try await loggedIn(expected) else { try check(revision, owner: expected); message = binding == nil ? "" : "即梦授权已失效，请重新连接。"; return }
             try check(revision, owner: expected)

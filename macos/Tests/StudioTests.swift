@@ -36,6 +36,8 @@ private func studioLoginStep(delay: UInt64 = 0) -> StudioStubStep {
 @MainActor func runStudioTests() async throws {
     try runStudioReferenceSelectionTests()
     try await runStudioExportTests()
+    let suffixes = ["image/png":"png", "image/jpeg":"jpg", "image/webp":"webp", "image/gif":"gif", "image/heic":"heic", "image/avif":"avif", "video/mp4":"mp4", "video/quicktime":"mov", "video/webm":"webm", "audio/mpeg":"mp3", "audio/wav":"wav", "audio/x-wav":"wav", "audio/mp4":"m4a", "audio/ogg":"ogg"]
+    try check(suffixes.allSatisfy { StudioMediaFiles.mediaExtension($0.key) == $0.value } && StudioMediaFiles.mediaExtension("application/octet-stream") == "bin", "low-level MIME mapping preserves every existing export extension and fallback")
     let secret = StudioSession(value: "test-session", expiresAt: Date().addingTimeInterval(600))
     let api = StudioClient(environment: .test, transport: StudioStubTransport([]))
     let privateRequest = try api.mediaRequest("/api/private-files/asset-a", session: secret, workspace: "ws-a")
@@ -60,7 +62,7 @@ private func studioLoginStep(delay: UInt64 = 0) -> StudioStubStep {
     task.taskDescription = "10"
     guardDelegate.urlSession(sessionForRedirect, downloadTask: task, didWriteData: 11, totalBytesWritten: 11, totalBytesExpectedToWrite: 11)
     try check(task.taskDescription?.hasPrefix("oversized:") == true, "oversized streamed downloads are distinguished from user cancellation")
-    try check(StudioStore.mediaExtension("image/jpeg") == "jpg" && StudioStore.mediaExtension("video/mp4") == "mp4", "download filename follows verified MIME rather than private opaque object id")
+    try check(StudioMediaFiles.mediaExtension("image/jpeg") == "jpg" && StudioMediaFiles.mediaExtension("video/mp4") == "mp4", "download filename follows verified MIME rather than private opaque object id")
     let expired = StudioSession(value: "old", expiresAt: Date().addingTimeInterval(-1))
     try check(!expired.valid && api.request(path: "api/me", session: expired).value(forHTTPHeaderField: "Cookie") == nil, "expired session cannot be sent")
     let response = HTTPURLResponse(url: StudioEnvironment.test.baseURL, statusCode: 200, httpVersion: nil, headerFields: ["Set-Cookie": "kaki_session=a; Max-Age=3600; Path=/; Secure; HttpOnly"])!

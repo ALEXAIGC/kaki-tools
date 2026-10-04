@@ -163,22 +163,20 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
             SettingsCard {
                 switchRow("窗口调整", detail: "快捷键作用于当前窗口，需要辅助功能权限。", value: $settings.windowManagerEnabled)
             }
-            windowShortcuts("半屏", ids: ["left-half", "right-half", "top-half", "bottom-half"])
-            windowShortcuts("四分屏", ids: ["top-left", "top-right", "bottom-left", "bottom-right"])
-            windowShortcuts("三分屏", ids: ["left-third", "center-third", "right-third", "left-two-thirds", "right-two-thirds"])
-            windowShortcuts("其他布局", ids: ["maximize", "center"])
+            ForEach(WindowLayout.Group.allCases) { group in
+                windowShortcuts(group.settingsTitle, layouts: WindowManager.layouts(in: group))
+            }
         }
     }
-    private func windowShortcuts(_ title: String, ids: [String]) -> some View {
-        let layouts = ids.compactMap { id in WindowManager.layouts.first { $0.id == id } }
+    private func windowShortcuts(_ title: String, layouts: [WindowLayout]) -> some View {
         return SettingsCard(title) {
             VStack(spacing: 0) {
                 ForEach(Array(layouts.enumerated()), id: \.element.id) { index, layout in
                     if index > 0 { Divider() }
                     HStack(spacing: 12) {
                         WindowLayoutGlyph(layout: layout).frame(width: 26, height: 19).foregroundStyle(.secondary)
-                        shortcutRow(layout.id == "maximize" ? "铺满窗口" : layout.label, value: Binding(get: {
-                            settings.windowShortcuts[layout.id] ?? WindowManager.defaultShortcuts[layout.id] ?? ""
+                        shortcutRow(layout.settingsLabel, value: Binding(get: {
+                            settings.windowShortcuts[layout.id] ?? layout.defaultShortcut
                         }, set: { settings.windowShortcuts[layout.id] = $0 }))
                     }
                 }

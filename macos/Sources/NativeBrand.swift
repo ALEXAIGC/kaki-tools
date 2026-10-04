@@ -2,6 +2,7 @@ import AppKit
 
 // Shared geometric K for the menu bar and application icon. The panel keeps its KAKI wordmark.
 enum NativeBrand {
+    static let logo = Bundle.main.url(forResource: "kaki-logo", withExtension: "png").flatMap { NSImage(contentsOf: $0) }
     static let menuMarkRect = NSRect(x: 2.4375, y: 1.5, width: 13.125, height: 14)
     static func markPath(in rect: NSRect) -> NSBezierPath {
         let points: [(CGFloat, CGFloat)] = [

@@ -3,13 +3,12 @@ import AppKit
 
 enum SettingsStyle {
     static let accent = Color(red: 0.988, green: 0.388, blue: 0.004)
-    static let logo = Bundle.main.url(forResource: "kaki-logo", withExtension: "png").flatMap { NSImage(contentsOf: $0) }
     static var version: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development" }
 }
 
 struct SettingsWordmark: View {
     var body: some View {
-        if let logo = SettingsStyle.logo {
+        if let logo = NativeBrand.logo {
             Image(nsImage: logo).resizable().scaledToFill().frame(width: 64, height: 30).clipped()
                 .accessibilityLabel("KAKI")
         } else {

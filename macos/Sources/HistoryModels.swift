@@ -1,11 +1,11 @@
 import Foundation
 
-struct ImageDimensions: Codable, Equatable {
+struct ImageDimensions: Codable, Equatable, Sendable {
     var width: Int
     var height: Int
 }
 
-struct HistoryItem: Identifiable, Codable, Equatable {
+struct HistoryItem: Identifiable, Codable, Equatable, Sendable {
     var id: String
     var type: String
     var text: String?

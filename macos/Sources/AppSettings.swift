@@ -57,6 +57,26 @@ import Combine
     }
     static func cacheLimit(_ value: Int) -> Int { (0...1_048_576).contains(value) ? value : 1024 }
     static func cacheDays(_ value: Int) -> Int { (1...3650).contains(value) ? value : 7 }
+    enum PreferenceUpdate {
+        case appearance(String)
+        case downloads(askEachTime: Bool, folder: String)
+        case cachePolicy(limitMB: Int, days: Int)
+        case cacheLocation(folder: String, volumeUUID: String)
+    }
+    // Read, change selected fields, and persist without suspension on MainActor.
+    // Call after asynchronous work; never persist the editable shortcut draft.
+    static func updateSaved(_ update: PreferenceUpdate, directory: URL) throws -> AppSettings {
+        let saved = AppSettings(directory: directory)
+        if let error = saved.loadError { throw NSError(domain: "KakiSettings", code: 1, userInfo: [NSLocalizedDescriptionKey: error]) }
+        switch update {
+        case .appearance(let value): saved.appearance = value
+        case .downloads(let ask, let folder): saved.downloadAskEachTime = ask; saved.downloadFolder = folder
+        case .cachePolicy(let limit, let days): saved.studioCacheLimitMB = cacheLimit(limit); saved.studioCacheDays = cacheDays(days)
+        case .cacheLocation(let folder, let volume): saved.studioCacheFolder = folder; saved.studioCacheVolumeUUID = volume
+        }
+        try saved.save()
+        return saved
+    }
     func save() throws {
         let fm = FileManager.default
         try fm.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)

@@ -49,9 +49,7 @@ private extension Color {
     }
 }
 
-private enum ClipboardAssets {
-    static let logo: NSImage? = Bundle.main.url(forResource: "kaki-logo", withExtension: "png").flatMap { NSImage(contentsOf: $0) }
-}
+
 
 private struct ClipboardMetrics {
     let width: CGFloat
@@ -137,7 +135,7 @@ private struct ClipboardMetrics {
     private func commandbar(_ metrics: ClipboardMetrics) -> some View {
         HStack(spacing: 12) {
             Button { controller.showSettings() } label: {
-                if let logo = ClipboardAssets.logo {
+                if let logo = NativeBrand.logo {
                     Image(nsImage: logo).resizable().scaledToFit().frame(width: 42, height: 42)
                 } else {
                     Text("KAKI").font(.system(size: 15, weight: .black)).italic().foregroundColor(palette.accent).frame(width: 42, height: 42)
@@ -418,8 +416,11 @@ private struct ClipboardMetrics {
         .accessibilityLabel(item.type == "image" ? "图片 \(index + 1)" : "剪贴板条目 \(index + 1)，\(String((item.text ?? "").prefix(120)))")
         .accessibilityValue(selected ? "已选中" : "")
         .onAppear { if item.type == "image" { image = store.thumbnail(for: item) } }
-        .onReceive(store.objectWillChange) { _ in
-            if item.type == "image" { DispatchQueue.main.async { image = store.thumbnail(for: item) } }
+        .onReceive(store.thumbnailChanges.filter { $0 == item.id }) { _ in
+            if item.type == "image" { image = store.thumbnail(for: item) }
+        }
+        .onChange(of: HistoryStore.ThumbnailSource(item)) { _ in
+            if item.type == "image" { image = store.thumbnail(for: item) }
         }
     }
 

@@ -25,7 +25,7 @@ import CryptoKit
         } catch { showLaunchFailure("无法打开数据目录：" + error.localizedDescription); return }
         let app = AppController(directory: directory, testMode: testing)
         if testing, let theme = environment["KAKI_NATIVE_TEST_THEME"], ["system", "light", "dark"].contains(theme) {
-            app.settings.appearance = theme; app.applyAppearance()
+            app.settings.appearance = theme
         }
         controller = app; app.start()
         for number in [SIGTERM, SIGINT] {

@@ -38,6 +38,9 @@ import Combine
 }
 
 @MainActor func runAppTests() async throws {
+    try await runAppearanceUpdateTests()
+    try await runConcurrentSettingsTests()
+    try await runCacheLocationRollbackTest()
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("kaki-native-app-test-" + UUID().uuidString)
     let controller = AppController(directory: directory, testMode: true, messageLifetime: 0.12)
     defer { controller.hidePanel(); controller.shutdown(); try? FileManager.default.removeItem(at: directory) }
@@ -233,4 +236,81 @@ import Combine
     try check(controller.settingsSection == "downloads", "unknown section cannot replace the selected settings tab")
     for window in NSApp.windows where window.title == "Kaki Tools 设置" { window.close() }
     print("Native controller interaction tests passed (private pasteboard, no external window actions)")
+}
+
+@MainActor private func runConcurrentSettingsTests() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("kaki-settings-interleave-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    for attempt in 0..<5 {
+        let dir = root.appendingPathComponent(String(attempt))
+        let target = dir.appendingPathComponent("selected-disk")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: ["hotkey":"Command+Option+V", "unknownSetting":["keep":true]]).write(to: dir.appendingPathComponent("settings.json"))
+        let app = AppController(directory: dir, testMode: true, accessibilityPermissionCheck: { _ in true })
+        defer { app.shutdown() }
+        let savedHotkey = app.settings.hotkey
+        app.settings.hotkey = "Command+Option+X"
+        app.setCacheLocation(folder: target.path, volumeUUID: "")
+        for _ in 0..<200 { if app.studio.cacheChanging { break }; await Task.yield() }
+        try check(app.studio.cacheChanging, "cache switch is suspended before concurrent settings updates")
+        app.setDownloadPreferences(askEachTime: false, folder: dir.path)
+        app.setAppearance("dark")
+        app.setCachePreferences(limitMB: 768, days: 21)
+        for _ in 0..<200 { if app.settings.studioCacheFolder == target.path { break }; try await Task.sleep(nanoseconds: 1_000_000) }
+        let saved = AppSettings(directory: dir)
+        try check(saved.studioCacheFolder == target.path && !saved.downloadAskEachTime && saved.downloadFolder == dir.path && saved.appearance == "dark" && saved.studioCacheLimitMB == 768 && saved.studioCacheDays == 21, "cache switch commits location without overwriting concurrent saved settings")
+        try check(saved.hotkey == savedHotkey && app.settings.hotkey == "Command+Option+X", "cache switch preserves shortcut draft separately from effective saved binding")
+        let json = try JSONSerialization.jsonObject(with: Data(contentsOf: dir.appendingPathComponent("settings.json"))) as! [String: Any]
+        try check((json["unknownSetting"] as? [String: Bool])?["keep"] == true, "field update preserves unknown settings")
+        let occupied = dir.appendingPathComponent("occupied/Kaki Tools Cache")
+        try FileManager.default.createDirectory(at: occupied, withIntermediateDirectories: true)
+        try Data("user-document".utf8).write(to: occupied.appendingPathComponent("keep.txt"))
+        app.setCacheLocation(folder: occupied.deletingLastPathComponent().path, volumeUUID: "")
+        for _ in 0..<200 { if app.message.contains("切换失败") { break }; try await Task.sleep(nanoseconds: 1_000_000) }
+        let failed = AppSettings(directory: dir)
+        try check(failed.studioCacheFolder == target.path && app.settings.studioCacheFolder == target.path && app.studio.cacheLocation == target.appendingPathComponent("Kaki Tools Cache").path, "failed cache switch leaves saved and active location unchanged")
+        try check(failed.appearance == "dark" && failed.studioCacheLimitMB == 768 && !failed.downloadAskEachTime, "failed switch does not pollute independently saved preferences")
+    }
+}
+
+@MainActor private func runCacheLocationRollbackTest() async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("kaki-settings-rollback-" + UUID().uuidString)
+    let target = dir.appendingPathComponent("new-disk")
+    try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+    let app = AppController(directory: dir, testMode: true, accessibilityPermissionCheck: { _ in true })
+    defer { app.shutdown(); try? FileManager.default.removeItem(at: dir) }
+    try app.settings.save()
+    app.setCacheLocation(folder: target.path, volumeUUID: "")
+    for _ in 0..<200 { if app.studio.cacheChanging { break }; await Task.yield() }
+    try check(app.studio.cacheChanging, "rollback fixture overlaps the asynchronous cache move")
+    let damaged = Data("preserve-invalid-settings".utf8)
+    try damaged.write(to: dir.appendingPathComponent("settings.json"), options: .atomic)
+    for _ in 0..<200 { if app.message.contains("切换失败") && !app.studio.cacheChanging { break }; try await Task.sleep(nanoseconds: 1_000_000) }
+    try check(app.message.contains("切换失败") && app.settings.studioCacheFolder.isEmpty && app.studio.cacheLocation == dir.appendingPathComponent("studio-cache").path, "failed post-move settings commit rolls active location back")
+    try check((try? Data(contentsOf: dir.appendingPathComponent("settings.json"))) == damaged, "fresh settings read failure preserves the newly damaged file rather than overwriting it with old snapshot")
+    try app.settings.save()
+    app.message = ""
+    app.setCacheLocation(folder: target.path, volumeUUID: "not-the-selected-volume")
+    for _ in 0..<200 { if app.message.contains("切换失败") { break }; try await Task.sleep(nanoseconds: 1_000_000) }
+    try check(AppSettings(directory: dir).studioCacheFolder.isEmpty && app.studio.cacheLocation == dir.appendingPathComponent("studio-cache").path, "wrong volume identity cannot be committed as a cache location")
+}
+
+@MainActor private func runAppearanceUpdateTests() async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("kaki-theme-events-" + UUID().uuidString)
+    let app = AppController(directory: dir, testMode: true, accessibilityPermissionCheck: { _ in true })
+    defer { app.shutdown(); try? FileManager.default.removeItem(at: dir) }
+    var writes = 0
+    let observation = NSApp.observe(\.appearance, options: .new) { _, _ in writes += 1 }
+    defer { observation.invalidate() }
+    app.settings.appearance = "dark"
+    try check(NSApp.appearance?.name == .darkAqua && writes == 1, "Published appearance callback applies its new value exactly once")
+    app.settings.autoPaste.toggle(); app.settings.hotkey = "draft"; app.settings.studioCacheDays = 30
+    app.settings.appearance = "dark"
+    try await Task.sleep(nanoseconds: 10_000_000)
+    try check(writes == 1, "unrelated settings and duplicate theme value do not reapply NSApp appearance")
+    app.setAppearance("light")
+    try check(NSApp.appearance?.name == .aqua && writes == 2, "toolbar theme update applies once without a second explicit update")
+    app.settings.appearance = "system"
+    try check(NSApp.appearance == nil && writes == 3, "system appearance clears the override using the emitted new value")
 }

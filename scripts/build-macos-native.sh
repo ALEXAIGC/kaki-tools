@@ -37,8 +37,8 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>Kaki Tools</string>
 <key>CFBundleDisplayName</key><string>Kaki Tools</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.4.3</string>
-<key>CFBundleVersion</key><string>10403</string>
+<key>CFBundleShortVersionString</key><string>1.4.4</string>
+<key>CFBundleVersion</key><string>10404</string>
 <key>CFBundleIconFile</key><string>icon.icns</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
