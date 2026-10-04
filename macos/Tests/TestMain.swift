@@ -16,10 +16,15 @@ func check(_ condition: @autoclosure () -> Bool, _ message: String, file: Static
         do {
             _ = NSApplication.shared
             try runSystemTests()
+            try runShortcutRecorderTests()
+            try await runClipboardPreviewTests()
             try await runHistoryTests()
             try runSettingsTests()
+            try runShortcutValidationTests()
             try await runAppTests()
             try runPermissionRefreshTests()
+            try await runScreenCapturePermissionTests()
+            try await runScreenCaptureTests()
             try await runStudioFailureTests()
             try await runStudioTests()
             try await runStudioVideoTests()

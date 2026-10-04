@@ -90,8 +90,13 @@ mkdir "$stage/payload"
 ln -s /Applications "$stage/payload/Applications"
 [ ! -f "$project_root/macos/README.md" ] || cp "$project_root/macos/README.md" "$stage/payload/README.md"
 [ ! -f "$project_root/macos/INSTALL.txt" ] || cp "$project_root/macos/INSTALL.txt" "$stage/payload/安装说明.txt"
-if [ -f "$project_root/macos/REAUTHORIZE.command.in" ]; then
-  python3 - "$project_root/macos/REAUTHORIZE.command.in" "$app_input" "$stage/payload/重新授权.command" <<'PYTHON'
+for authorization_template in REAUTHORIZE.command.in REAUTHORIZE-SCREEN.command.in; do
+  [ -f "$project_root/macos/$authorization_template" ] || continue
+  case "$authorization_template" in
+    REAUTHORIZE.command.in) authorization_name='重新授权.command' ;;
+    REAUTHORIZE-SCREEN.command.in) authorization_name='修复截图权限.command' ;;
+  esac
+  python3 - "$project_root/macos/$authorization_template" "$app_input" "$stage/payload/$authorization_name" <<'PYTHON'
 import pathlib,re,shlex,subprocess,sys
 template,app,output=map(pathlib.Path,sys.argv[1:])
 result=subprocess.run(['/usr/bin/codesign','-d','-r-',str(app)],check=True,capture_output=True,text=True)
@@ -100,8 +105,8 @@ if match is None or 'cdhash' in match.group(1): raise SystemExit('Signing identi
 output.write_text(template.read_text().replace('__KAKI_SIGNING_REQUIREMENT__',shlex.quote(match.group(1))))
 output.chmod(0o755)
 PYTHON
-  bash -n "$stage/payload/重新授权.command"
-fi
+  bash -n "$stage/payload/$authorization_name"
+done
 [ ! -f "$project_root/LICENSE" ] || cp "$project_root/LICENSE" "$stage/payload/LICENSE"
 verify_native "$stage/payload/Kaki Tools.app"
 python3 "$stage/app-manifest.py" "$stage/payload/Kaki Tools.app" > "$stage/staged-manifest.json"
@@ -128,12 +133,13 @@ cmp "$stage/source-manifest.json" "$stage/mounted-manifest.json"
 if [ -f "$stage/payload/安装说明.txt" ]; then
   cmp "$stage/payload/安装说明.txt" "$mount_point/安装说明.txt"
 fi
-if [ -f "$stage/payload/重新授权.command" ]; then
-  cmp "$stage/payload/重新授权.command" "$mount_point/重新授权.command"
-  [ -x "$mount_point/重新授权.command" ] || fail '重新授权工具缺少执行权限。'
-  bash -n "$mount_point/重新授权.command"
-  /usr/bin/grep -q '__KAKI_SIGNING_REQUIREMENT__' "$mount_point/重新授权.command" && fail '重新授权工具尚未填入签名身份。'
-fi
+for authorization_name in '重新授权.command' '修复截图权限.command'; do
+  [ -f "$stage/payload/$authorization_name" ] || continue
+  cmp "$stage/payload/$authorization_name" "$mount_point/$authorization_name"
+  [ -x "$mount_point/$authorization_name" ] || fail "$authorization_name 缺少执行权限。"
+  bash -n "$mount_point/$authorization_name"
+  /usr/bin/grep -q '__KAKI_SIGNING_REQUIREMENT__' "$mount_point/$authorization_name" && fail "$authorization_name 尚未填入签名身份。"
+done
 /usr/bin/hdiutil detach "$mount_device"
 mount_device=''
 final="$output/$(basename "$image")"

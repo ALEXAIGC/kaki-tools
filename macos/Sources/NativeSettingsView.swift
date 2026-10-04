@@ -25,8 +25,8 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
     var subtitle: String {
         switch self {
         case .clipboard: return "让常用内容随手可得。"
-        case .shortcuts: return "点击按键框，录制你习惯的组合键。"
-        case .studio: return "连接 Studio 素材库与即梦账号。"
+        case .shortcuts: return "点击按键框 → 按下组合键 → 保存生效。"
+        case .studio: return "你的创作账号，一处管理。"
         case .downloads: return "原始素材的保存位置与本地空间管理。"
         case .about: return "管理系统授权，了解 Kaki Tools。"
         }
@@ -36,6 +36,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
 @MainActor struct NativeSettingsView: View {
     @ObservedObject var controller: AppController
     @ObservedObject var settings: AppSettings
+    @State private var shortcutRecording = false
     private var section: SettingsSection { SettingsSection(rawValue: controller.settingsSection) ?? .clipboard }
     private var needsSave: Bool { section == .clipboard || section == .shortcuts }
     var body: some View {
@@ -92,8 +93,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
         case .clipboard: clipboardPage
         case .shortcuts: shortcutsPage
         case .studio:
-            StudioAccountView(studio: controller.studio, openLibrary: controller.showStudio, settingsPresentation: true)
-            DreaminaConnectionView(connector: controller.dreamina, studio: controller.studio)
+            AccountConnectionsView(studio: controller.studio, connector: controller.dreamina, openLibrary: controller.showStudio)
         case .downloads: downloadsPage
         case .about: aboutPage
         }
@@ -150,50 +150,10 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
         SettingsRow(name, detail: detail) { Toggle(name, isOn: value).labelsHidden().toggleStyle(.switch).controlSize(.small) }
     }
     private var shortcutsPage: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            SettingsCard("常用操作") {
-                VStack(spacing: 0) {
-                    shortcutRow("剪贴板", icon: "clipboard", value: $settings.hotkey)
-                    Divider()
-                    shortcutRow("素材库", icon: "photo.on.rectangle.angled", value: $settings.studioHotkey)
-                    Divider()
-                    shortcutRow("区域截图", icon: "viewfinder", value: $settings.screenshotHotkey)
-                }
-            }
-            SettingsCard {
-                switchRow("窗口调整", detail: "快捷键作用于当前窗口，需要辅助功能权限。", value: $settings.windowManagerEnabled)
-            }
-            ForEach(WindowLayout.Group.allCases) { group in
-                windowShortcuts(group.settingsTitle, layouts: WindowManager.layouts(in: group))
-            }
+        ShortcutSettingsView(controller: controller, settings: settings) { recording in
+            shortcutRecording = recording
+            controller.setShortcutRecording(recording)
         }
-    }
-    private func windowShortcuts(_ title: String, layouts: [WindowLayout]) -> some View {
-        return SettingsCard(title) {
-            VStack(spacing: 0) {
-                ForEach(Array(layouts.enumerated()), id: \.element.id) { index, layout in
-                    if index > 0 { Divider() }
-                    HStack(spacing: 12) {
-                        WindowLayoutGlyph(layout: layout).frame(width: 26, height: 19).foregroundStyle(.secondary)
-                        shortcutRow(layout.settingsLabel, value: Binding(get: {
-                            settings.windowShortcuts[layout.id] ?? layout.defaultShortcut
-                        }, set: { settings.windowShortcuts[layout.id] = $0 }))
-                    }
-                }
-            }.disabled(!settings.windowManagerEnabled)
-        }
-    }
-    private func shortcutRow(_ name: String, icon: String? = nil, value: Binding<String>) -> some View {
-        HStack(spacing: 12) {
-            if let icon { Image(systemName: icon).frame(width: 26).foregroundStyle(.secondary) }
-            Text(name).font(.system(size: 13, weight: .medium))
-            Spacer(minLength: 8)
-            ShortcutRecorder(value: value, onRecordingChanged: controller.setShortcutRecording)
-                .frame(width: 154, height: 28).accessibilityLabel(name + "快捷键")
-            Button { value.wrappedValue = "" } label: {
-                Image(systemName: "minus.circle").foregroundStyle(.tertiary).frame(width: 22, height: 28)
-            }.buttonStyle(.plain).help("停用" + name + "快捷键").accessibilityLabel("停用" + name + "快捷键")
-        }.padding(.vertical, 7)
     }
     private var downloadsPage: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -241,11 +201,28 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
                         permissionIcon("viewfinder")
                         VStack(alignment: .leading, spacing: 5) {
                             Text("屏幕录制").font(.system(size: 13, weight: .semibold))
-                            SettingsFootnote("首次区域截图时，按 macOS 提示授权。")
+                            SettingsFootnote("仅用于截图，不录制音频。")
                         }
+                        Spacer()
+                        SettingsStatus(title: controller.screenshotPermissionIssue ? "本次被拒绝" : (controller.screenCaptureTrusted ? "已确认" : "未确认"), active: controller.screenCaptureTrusted && !controller.screenshotPermissionIssue)
                     }
-                    Button("打开屏幕录制设置") {
-                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+                    HStack {
+                        if !controller.screenCaptureTrusted && !controller.screenCapturePermissionRequested {
+                            Button("申请屏幕权限") { controller.requestScreenCapturePermission() }.buttonStyle(SettingsPrimaryButtonStyle())
+                        }
+                        Button("管理权限") { controller.openScreenCaptureSettings() }
+                        Spacer()
+                        Button("重新检查") { controller.refreshScreenCapturePermission() }
+                            .help("读取当前程序的屏幕权限，不弹出系统授权框")
+                    }
+                    if !controller.screenCaptureTrusted || controller.screenshotPermissionIssue {
+                        SettingsFootnote("已开启开关仍未确认时，请完全退出软件，再从「应用程序」重新打开。")
+                    }
+                    HStack {
+                        Button("尝试截图") { controller.takeScreenshot(retryPermissionFailure: true) }
+                        Button("复制截图诊断") { controller.copyScreenshotDiagnostics() }
+                            .help("复制版本、运行位置、签名和最近截图失败原因，不包含账号或素材")
+                        Spacer()
                     }
                 }
             }
@@ -270,35 +247,30 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
         Image(systemName: name).font(.system(size: 20, weight: .light)).foregroundStyle(.secondary)
             .frame(width: 40, height: 40).background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
     }
+    private var footerMessage: String {
+        if section == .shortcuts {
+            if shortcutRecording { return "按下组合键，Esc 取消 · Delete 停用" }
+            if !controller.shortcutIssues.isEmpty { return "请调整标红的快捷键，再保存。" }
+        }
+        return controller.message.isEmpty ? "更改后点击保存" : controller.message
+    }
     private var footer: some View {
         HStack(spacing: 12) {
             if section == .shortcuts {
                 Button("恢复默认") {
+                    ShortcutField.cancelRecording(in: NSApp.keyWindow)
                     settings.hotkey = "CommandOrControl+Shift+V"
                     settings.studioHotkey = "Command+Shift+B"
                     settings.screenshotHotkey = "CommandOrControl+Shift+2"
                     settings.windowShortcuts = WindowManager.defaultShortcuts
                 }
             }
-            Text(controller.message.isEmpty ? "更改后点击保存" : controller.message)
+            Text(footerMessage)
                 .font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(2)
             Spacer(minLength: 0)
-            if needsSave { Button("保存设置") { controller.saveSettings() }.buttonStyle(SettingsPrimaryButtonStyle()) }
+            if needsSave { Button("保存设置") { ShortcutField.cancelRecording(in: NSApp.keyWindow); controller.saveSettings() }.buttonStyle(SettingsPrimaryButtonStyle()).disabled(section == .shortcuts && !controller.shortcutIssues.isEmpty) }
         }.padding(.horizontal, 28).padding(.vertical, 15)
             .background(.bar).overlay(alignment: .top) { Divider() }
-    }
-}
-
-private struct WindowLayoutGlyph: View {
-    let layout: WindowLayout
-    var body: some View {
-        Canvas { context, size in
-            let frame = CGRect(origin: .zero, size: size).insetBy(dx: 1, dy: 1)
-            context.stroke(Path(roundedRect: frame, cornerRadius: 3), with: .foreground, lineWidth: 1)
-            let area = frame.insetBy(dx: 3, dy: 3), f = layout.fractions
-            let rect = CGRect(x: area.minX + f[0] * area.width, y: area.minY + f[1] * area.height, width: f[2] * area.width, height: f[3] * area.height)
-            context.fill(Path(roundedRect: rect, cornerRadius: 1), with: .color(SettingsStyle.accent.opacity(0.7)))
-        }.accessibilityHidden(true)
     }
 }
 
@@ -401,64 +373,5 @@ struct SettingsFolderRow: View {
         }
         validation = ""
         setPreferences(Int((value * Double(unit)).rounded()), age)
-    }
-}
-
-struct ShortcutRecorder: NSViewRepresentable {
-    @Binding var value: String
-    var onRecordingChanged: (Bool) -> Void
-    func makeNSView(context: Context) -> ShortcutField {
-        let field = ShortcutField(); field.onRecord = { value = $0 }; field.onRecordingChanged = onRecordingChanged; return field
-    }
-    func updateNSView(_ view: ShortcutField, context: Context) { view.accelerator = value; view.onRecord = { value = $0 }; view.onRecordingChanged = onRecordingChanged }
-    static func dismantleNSView(_ view: ShortcutField, coordinator: ()) { view.cancelRecording() }
-}
-final class ShortcutField: NSTextField {
-    var onRecord: ((String) -> Void)?
-    var onRecordingChanged: ((Bool) -> Void)?
-    private var recording = false
-    private var windowObservers: [NSObjectProtocol] = []
-    var accelerator = "" { didSet { if !recording { showValue() } } }
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect); isEditable = false; isSelectable = false; alignment = .center
-        isBezeled = true; bezelStyle = .roundedBezel; focusRingType = .exterior
-        font = .monospacedSystemFont(ofSize: 12, weight: .medium)
-    }
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    override var acceptsFirstResponder: Bool { true }
-    private func showValue() { stringValue = HotkeyChord.parse(accelerator)?.label ?? (accelerator.isEmpty ? "未设置" : accelerator) }
-    override func becomeFirstResponder() -> Bool {
-        guard super.becomeFirstResponder() else { return false }
-        recording = true; stringValue = "按快捷键…"; onRecordingChanged?(true); return true
-    }
-    private func finishRecording() {
-        guard recording else { return }
-        recording = false; showValue(); onRecordingChanged?(false)
-    }
-    func cancelRecording() {
-        if window?.firstResponder === self { window?.makeFirstResponder(nil) }
-        finishRecording()
-    }
-    override func resignFirstResponder() -> Bool {
-        guard super.resignFirstResponder() else { return false }
-        finishRecording(); return true
-    }
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        for observer in windowObservers { NotificationCenter.default.removeObserver(observer) }; windowObservers.removeAll()
-        guard let window else { finishRecording(); return }
-        for name in [NSWindow.didResignKeyNotification, NSWindow.willCloseNotification] {
-            windowObservers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
-                Task { @MainActor [weak self] in self?.cancelRecording() }
-            })
-        }
-    }
-    deinit { for observer in windowObservers { NotificationCenter.default.removeObserver(observer) } }
-    override func mouseDown(with event: NSEvent) { window?.makeFirstResponder(self); stringValue = "按快捷键…" }
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 { window?.makeFirstResponder(nil); stringValue = HotkeyChord.parse(accelerator)?.label ?? (accelerator.isEmpty ? "未设置" : accelerator); return }
-        guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty == false || Set<UInt16>([122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111, 105, 107, 113, 106, 64, 79, 80, 90]).contains(event.keyCode),
-              let chord = HotkeyChord.from(event: event) else { NSSound.beep(); return }
-        onRecord?(chord.accelerator); window?.makeFirstResponder(nil)
     }
 }

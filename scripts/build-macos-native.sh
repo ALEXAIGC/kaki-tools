@@ -37,8 +37,8 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>Kaki Tools</string>
 <key>CFBundleDisplayName</key><string>Kaki Tools</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.4.5</string>
-<key>CFBundleVersion</key><string>10405</string>
+<key>CFBundleShortVersionString</key><string>1.4.10</string>
+<key>CFBundleVersion</key><string>10410</string>
 <key>CFBundleIconFile</key><string>icon.icns</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
@@ -50,6 +50,7 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 PLIST
 cp "$project_root/macos/Resources/icon.icns" "$app/Contents/Resources/icon.icns"
 cp "$project_root/macos/Resources/kaki-logo.png" "$app/Contents/Resources/kaki-logo.png"
+cp "$project_root/macos/Resources/dreamina-icon.ico" "$app/Contents/Resources/dreamina-icon.ico"
 /usr/bin/codesign --force --sign "$identity" --options runtime --timestamp=none "$app"
 /usr/bin/codesign --verify --deep --strict "$app"
 if [ "$identity" != '-' ]; then

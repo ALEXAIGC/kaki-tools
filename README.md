@@ -1,6 +1,8 @@
 # Kaki Tools
 
-原生 macOS 效率工具，使用 Swift、AppKit 和 SwiftUI。最低 macOS 13；当前版本 1.4.5。默认应用不包含 Electron、Node.js、WebView、Qt 或第三方 Swift 包。剪贴板普通历史最多100条，固定与收藏独立保留；窗口调整和区域截图使用系统接口。Studio 账号与素材库复用现有用户身份和工作区权限，支持搜索、多选复制引用、单项复制真实素材及批量下载。
+原生 macOS 效率工具，使用 Swift、AppKit 和 SwiftUI。最低 macOS 13；当前版本 1.4.10。默认应用不包含 Electron、Node.js、WebView、Qt 或第三方 Swift 包。剪贴板普通历史最多100条，固定与收藏独立保留；窗口调整和区域截图使用系统接口。Studio 账号与素材库复用现有用户身份和工作区权限，支持搜索、多选复制引用、单项复制真实素材及批量下载。
+
+安装包见 [最新发布](https://github.com/ALEXAIGC/kaki-tools/releases/latest)。当前发布为 Apple Silicon、macOS 13 或更高版本。
 
 ## 开发与构建
 
@@ -32,9 +34,9 @@ bash scripts/run-macos-native.sh
 
 素材库支持图片、视频和音频，视频使用原生预览。设置中可选择下载位置、缓存磁盘、容量和未使用清理天数；原素材按需读取，缓存复用前重新检查访问权限。CDN 错误不会误退出 Studio；退出清理失败时阻止旧会话自动恢复；迟到的失败响应不会删除并发下载的新缓存。
 
-设置 → 账号提供即梦 CLI 官方网页或二维码授权，并按 KAKI 账号及测试/正式环境隔离关联。目前支持登录、刷新、解除关联和只读视频模型检查；Studio 生成任务调用即梦及结果回传尚未接入。CLI 单独安装，不包含在应用内。
+设置 → 账号与连接提供 Studio 与即梦品牌卡片，在本页登录或管理。即梦使用 CLI 官方网页或二维码授权，并按 KAKI 账号及测试/正式环境隔离关联。目前支持登录、刷新、解除关联和只读视频模型检查；Studio 生成任务调用即梦及结果回传尚未接入。CLI 单独安装，不包含在应用内。
 
-“复制代码”需要 Studio 接收端适配，部署边界见 [Studio 集成说明](macos/STUDIO-INTEGRATION.md)。源码同步到 GitHub 不会自动部署 Studio 网站。当前原生测试共716项断言，使用模拟传输、临时数据与私有剪贴板。
+“复制代码”需要 Studio 接收端适配，部署边界见 [Studio 集成说明](macos/STUDIO-INTEGRATION.md)。源码同步到 GitHub 不会自动部署 Studio 网站。当前版本通过1227项原生断言、656项快捷键页面渲染检查及16种按键框视觉状态检查，使用模拟传输、临时数据与私有剪贴板。另一台 Mac 的实际屏幕授权仍需在目标机器验证；设置 → 权限与关于可复制截图诊断。
 
 ## 目录
 
@@ -44,7 +46,6 @@ macos/Tests/         原生行为测试
 macos/Resources/     原生图标与品牌图片
 scripts/            原生编译、测试与打包工具
 dist/               原生应用与安装包
-legacy/             旧 Electron 与已停用跨屏组件的历史归档
 ```
 
-详见 [原生说明](macos/README.md) 和 [打包说明](macos/PACKAGING.md)。旧版开发资料和当前本地修改完整保留在 [Electron归档](legacy/electron/ARCHIVE.md)，不参与默认原生构建。没有跨平台构建需求时无需安装归档中的依赖。
+详见 [原生说明](macos/README.md) 和 [打包说明](macos/PACKAGING.md)。main 保留当前原生实现，GitHub 仅维护最新安装包发布；历史实现可通过 Git 提交历史查阅。已有本地 `legacy/` 归档保留在磁盘，并由 `.gitignore` 排除。

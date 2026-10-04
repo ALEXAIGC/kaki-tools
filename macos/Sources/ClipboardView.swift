@@ -419,16 +419,23 @@ private struct ClipboardMetrics {
         .accessibilityValue(selected ? "已选中" : "")
         .onAppear {
             cardVisible = true
-            if item.type == "image" { image = store.thumbnail(for: item) }
+            if item.type == "image" { reloadImage() }
             else { controller.requestTextPresentation(item) }
         }
         .onDisappear { cardVisible = false; image = nil }
         .onReceive(store.thumbnailChanges.filter { $0 == item.id }) { _ in
-            if cardVisible, item.type == "image" { image = store.thumbnail(for: item) }
+            if cardVisible, item.type == "image" { reloadImage() }
         }
         .onChange(of: HistoryStore.ThumbnailSource(item)) { _ in
-            if cardVisible, item.type == "image" { image = store.thumbnail(for: item) }
+            if cardVisible, item.type == "image" { reloadImage() }
         }
+    }
+
+    private func reloadImage() {
+        // Completion can arrive before SwiftUI replaces a callback's item
+        // snapshot. Resolve by stable ID so the pending hash cannot reject it.
+        guard let current = store.item(id: item.id), current.type == "image" else { image = nil; return }
+        image = store.thumbnail(for: current)
     }
 
     private func rule() -> some View { palette.border.frame(height: 1) }

@@ -5,59 +5,75 @@ import CoreImage.CIFilterBuiltins
 @MainActor struct DreaminaConnectionView: View {
     @ObservedObject var connector: DreaminaConnector
     @ObservedObject var studio: StudioStore
+    var isPresented: () -> Bool = { true }
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
-        SettingsCard {
-            VStack(alignment: .leading, spacing: 16) {
-                HStack {
-                    HStack(spacing: 10) {
-                        Image(systemName: "link").font(.system(size: 19)).foregroundStyle(SettingsStyle.accent)
-                            .frame(width: 38, height: 38).background(SettingsStyle.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("即梦").font(.system(size: 14, weight: .semibold))
-                            Text(connector.version.isEmpty ? "本机连接" : "CLI \(connector.version)").font(.system(size: 11)).foregroundStyle(.secondary)
-                        }
-                    }
-                    Spacer()
-                    SettingsStatus(title: connector.verified ? "已关联" : connector.binding != nil ? "待验证" : "未关联", active: connector.verified)
-                }
-                if let user = studio.user {
-                    Text("关联到 " + (user.name ?? user.email)).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1)
+        VStack(alignment: .leading, spacing: 16) {
+            if let user = studio.user {
+                HStack(spacing: 8) {
+                    Text("KAKI 账号").foregroundStyle(.secondary)
+                    Text(user.name ?? user.email).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
+                    Spacer(minLength: 8)
                     if let binding = connector.binding {
-                        Text("即梦账号 ···\(binding.dreaminaUserID.suffix(6))").font(.caption).foregroundStyle(.secondary)
+                        Text("即梦 ···\(binding.dreaminaUserID.suffix(6))").foregroundStyle(.secondary).monospacedDigit()
                     }
-                } else {
-                    SettingsFootnote("登录 Studio 后，即可授权你的即梦账号。")
-                }
-                HStack(spacing: 10) {
-                    Button(connector.busy ? "连接中…" : connector.binding == nil ? "连接即梦" : "验证关联") {
-                        Task { await connector.connect() }
-                    }.buttonStyle(SettingsPrimaryButtonStyle()).disabled(studio.user == nil || connector.busy)
-                    Button { Task { await connector.refresh() } } label: { Image(systemName: "arrow.clockwise") }
-                        .disabled(connector.busy).help("刷新关联状态").accessibilityLabel("刷新即梦关联状态")
-                    if connector.busy { Button("取消") { connector.cancel() } }
-                    if connector.binding != nil || connector.verified {
-                        Menu("更多") {
-                            if connector.verified { Button("检查视频模型") { Task { await connector.loadVideoModels() } } }
-                            if connector.binding != nil { Button("解除关联", role: .destructive) { Task { await connector.disconnect() } } }
-                        }.disabled(connector.busy).fixedSize()
+                }.font(.system(size: 12))
+            } else {
+                SettingsFootnote("先登录 KAKI Studio，再连接即梦。")
+            }
+
+            if let authorization = connector.authorization {
+                DreaminaAuthorizationView(authorization: authorization, cancel: connector.cancel)
+                    .id(authorization.id)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            } else {
+                HStack(spacing: 12) {
+                    Button(connector.busy ? "处理中…" : connector.binding == nil ? "连接即梦" : "验证关联") {
+                        Task { if isPresented() { await connector.connect() } }
+                    }.buttonStyle(SettingsPrimaryButtonStyle())
+                        .disabled(studio.user == nil || connector.owner == nil || connector.busy)
+                    Button { Task { if isPresented() { await connector.refresh() } } } label: {
+                        Label("刷新状态", systemImage: "arrow.clockwise")
+                    }.disabled(connector.busy)
+                    if connector.busy {
+                        ProgressView().controlSize(.small)
+                        Button("取消") { connector.cancel() }
                     }
-                    Spacer()
+                    Spacer(minLength: 0)
                 }
-                if !connector.videoModels.isEmpty {
-                    Text(connector.videoModels.joined(separator: " · "))
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(3).textSelection(.enabled)
+
+                if connector.binding != nil {
+                    HStack(spacing: 18) {
+                        Button { Task { if isPresented() { await connector.loadVideoModels() } } } label: {
+                            Label("视频模型", systemImage: "film")
+                        }.disabled(!connector.verified || connector.busy)
+                        Button("解除关联", role: .destructive) { Task { if isPresented() { await connector.disconnect() } } }
+                            .disabled(connector.busy)
+                        Spacer(minLength: 0)
+                    }.buttonStyle(.borderless).font(.system(size: 12))
                 }
-                if !connector.message.isEmpty {
-                    Text(connector.message).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-                }
-                SettingsFootnote("授权保存在本机。Studio 生成通道尚待接入。")
-            }.frame(maxWidth: .infinity, alignment: .leading)
+
+            }
+
+            if !connector.videoModels.isEmpty {
+                Text(connector.videoModels.joined(separator: " · "))
+                    .font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(3).textSelection(.enabled)
+            }
+            if !connector.message.isEmpty {
+                Text(connector.message).font(.system(size: 12)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+            }
+            HStack(spacing: 12) {
+                Text("授权保存在本机 · Studio 生成通道待接入")
+                Spacer(minLength: 0)
+                if !connector.version.isEmpty { Text("CLI \(connector.version)") }
+            }.font(.system(size: 11)).foregroundStyle(.tertiary)
         }
-        .task(id: connector.owner) { await connector.refresh() }
-        .sheet(item: Binding(get: { connector.authorization }, set: { value in
-            if value == nil && connector.authorization != nil { connector.cancel() }
-        })) { authorization in
-            DreaminaAuthorizationView(authorization: authorization, cancel: connector.cancel)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: connector.authorization?.id)
+        .task(id: connector.owner) {
+            guard !Task.isCancelled, isPresented() else { return }
+            await connector.refresh()
         }
     }
 }
@@ -66,7 +82,9 @@ import CoreImage.CIFilterBuiltins
     let authorization: DreaminaAuthorization
     let cancel: () -> Void
     @State private var openFailed = false
-    private var qrCode: NSImage? {
+    @State private var qrCode: NSImage?
+    @State private var renderedAuthorizationID: UUID?
+    private static func makeQRCode(_ authorization: DreaminaAuthorization) -> NSImage? {
         let filter = CIFilter.qrCodeGenerator()
         filter.message = Data(authorization.url.absoluteString.utf8)
         filter.correctionLevel = "M"
@@ -75,23 +93,50 @@ import CoreImage.CIFilterBuiltins
         return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
     }
     var body: some View {
-        VStack(spacing: 16) {
-            Text("连接即梦账号").font(.title2.bold())
-            Text("打开官方页面授权，或用手机扫码。").font(.callout).foregroundStyle(.secondary)
-            if let image = qrCode {
-                Image(nsImage: image).interpolation(.none).resizable().scaledToFit()
-                    .frame(width: 184, height: 184).padding(14).background(.white, in: RoundedRectangle(cornerRadius: 12))
-                    .accessibilityLabel("即梦官方授权二维码")
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .center, spacing: 22) {
+                qrPanel
+                actions.frame(minWidth: 200, alignment: .leading)
             }
-            Button("打开即梦授权页面") { openFailed = !NSWorkspace.shared.open(authorization.url) }
-                .buttonStyle(SettingsPrimaryButtonStyle()).controlSize(.large)
-            if openFailed {
-                Link("点击打开官方授权链接", destination: authorization.url).font(.caption)
+            VStack(alignment: .leading, spacing: 16) {
+                qrPanel
+                actions
             }
-            HStack(spacing: 8) { ProgressView().controlSize(.small); Text("等待授权确认…").font(.callout) }
-            Text("有效至 \(authorization.expiresAt.formatted(date: .omitted, time: .shortened))")
-                .font(.caption).foregroundStyle(.secondary)
-            Button("取消连接", action: cancel).keyboardShortcut(.cancelAction)
-        }.padding(28).frame(width: 440)
+        }.frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
+            .background(SettingsStyle.accent.opacity(0.04), in: RoundedRectangle(cornerRadius: 12))
+            .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(SettingsStyle.accent.opacity(0.13), lineWidth: 1) }
+            .task(id: authorization.id) {
+                guard !Task.isCancelled, renderedAuthorizationID != authorization.id else { return }
+                qrCode = Self.makeQRCode(authorization)
+                renderedAuthorizationID = authorization.id; openFailed = false
+            }
+    }
+    @ViewBuilder private var qrPanel: some View {
+        if renderedAuthorizationID == authorization.id, let image = qrCode {
+            Image(nsImage: image).interpolation(.none).resizable().scaledToFit()
+                .frame(width: 144, height: 144).padding(12)
+                .background(.white, in: RoundedRectangle(cornerRadius: 10))
+                .accessibilityLabel("即梦官方授权二维码")
+        }
+    }
+    private var actions: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("扫码或打开官方页面").font(.system(size: 13, weight: .semibold))
+            Button("打开官方授权页面") { openFailed = !NSWorkspace.shared.open(authorization.url) }
+                .buttonStyle(SettingsPrimaryButtonStyle())
+            Link(openFailed ? "重试打开官方授权链接" : "jimeng.jianying.com", destination: authorization.url)
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+            HStack(spacing: 7) {
+                ProgressView().controlSize(.small)
+                Text("等待授权确认…").font(.system(size: 12)).foregroundStyle(.secondary)
+            }
+            HStack(spacing: 12) {
+                Text("有效至 \(authorization.expiresAt.formatted(date: .omitted, time: .shortened))")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                Button("取消", action: cancel).keyboardShortcut(.cancelAction)
+                    .buttonStyle(.borderless).font(.system(size: 12))
+            }
+        }
     }
 }

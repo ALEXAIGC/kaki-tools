@@ -8,11 +8,8 @@ history.json
 images/
 settings.json
 
-# Compiled optional runtime and archived generated artifacts.
-legacy/deskflow/components/bin/
-legacy/deskflow/components/deskflow/
-legacy/electron/native/bin/
-legacy/electron/native/deskflow/
+# Historical source and generated archives stay local; current source is native.
+/legacy/
 
 # Legacy top-level entry files.
 /index.js

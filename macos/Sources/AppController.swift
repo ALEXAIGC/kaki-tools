@@ -3,6 +3,8 @@ import SwiftUI
 import Combine
 import ApplicationServices
 import ServiceManagement
+import Security
+import CryptoKit
 
 @MainActor final class AppController: NSObject, ObservableObject, NSWindowDelegate {
     enum Filter: String, CaseIterable { case all = "全部", text = "文本", image = "图片", pinned = "固定" }
@@ -33,7 +35,12 @@ import ServiceManagement
     @Published var settingsSection = "clipboard"
     @Published var screenshotBusy = false
     @Published private(set) var accessibilityTrusted = false
+    @Published private(set) var screenCaptureTrusted = false
+    @Published private(set) var screenCapturePermissionRequested = false
+    @Published private(set) var screenshotPermissionIssue = false
     private let accessibilityPermissionCheck: (Bool) -> Bool
+    private let screenCapturePermissionCheck: (Bool) -> Bool
+    private let screenshotRunner: ScreenCaptureRunning?
     private var panel: ClipboardPanel?
     private var settingsWindow: NSWindow?
     private var studioWindow: NSWindow?
@@ -67,15 +74,20 @@ import ServiceManagement
     private var searchGeneration = 0
     private var pasteGeneration = 0
     private var arrangementGeneration = 0
-    private var screenshotProcess: Process?
+    private var screenshotGeneration = 0
+    private var lastScreenshotFailure: ScreenCaptureFailure?
     private var lastBindings: [String: String] = [:]
     private var failedShortcutActions = Set<String>()
     private var shuttingDown = false
     private var shortcutRecording = false
 
-    init(directory: URL, testMode: Bool, messageLifetime: TimeInterval = 5, studioTransport: StudioTransport = StudioURLTransport(), dreaminaRunner: DreaminaRunning? = nil, accessibilityPermissionCheck: @escaping (Bool) -> Bool = { WindowManager.accessibilityTrusted(prompt: $0) }) {
+    init(directory: URL, testMode: Bool, messageLifetime: TimeInterval = 5, studioTransport: StudioTransport = StudioURLTransport(), dreaminaRunner: DreaminaRunning? = nil, accessibilityPermissionCheck: @escaping (Bool) -> Bool = { WindowManager.accessibilityTrusted(prompt: $0) }, screenCapturePermissionCheck: ((Bool) -> Bool)? = nil, screenshotRunner: ScreenCaptureRunning? = nil) {
         self.testMode = testMode
         self.accessibilityPermissionCheck = accessibilityPermissionCheck
+        self.screenCapturePermissionCheck = screenCapturePermissionCheck ?? (testMode ? { _ in false } : { prompt in
+            prompt ? CGRequestScreenCaptureAccess() : CGPreflightScreenCaptureAccess()
+        })
+        self.screenshotRunner = screenshotRunner ?? (testMode ? nil : SystemScreenCaptureRunner())
         self.messageLifetime = messageLifetime.isFinite && messageLifetime > 0 ? messageLifetime : 5
         settings = AppSettings(directory: directory)
         store = HistoryStore(directory: directory, limit: 100)
@@ -98,13 +110,16 @@ import ServiceManagement
         }.store(in: &subscriptions)
         NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification).sink { [weak self] _ in
             self?.refreshAccessibilityPermission()
+            self?.refreshScreenCapturePermission()
             self?.objectWillChange.send()
         }.store(in: &subscriptions)
         NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification).sink { [weak self] notification in
             guard let self, let window = notification.object as? NSWindow, window === self.settingsWindow else { return }
             self.refreshAccessibilityPermission()
+            self.refreshScreenCapturePermission()
         }.store(in: &subscriptions)
         refreshAccessibilityPermission()
+        refreshScreenCapturePermission()
         refreshItems()
     }
     func start() {
@@ -498,12 +513,19 @@ import ServiceManagement
             if !failures.isEmpty { report("快捷键恢复失败：" + failures.joined(separator: "、")) }
         }
     }
+    var shortcutIssues: [String: String] { ShortcutValidation.issues(in: shortcutBindings(panelShortcut: settings.hotkey)) }
     func saveSettings() {
+        let issues = shortcutIssues
+        guard issues.isEmpty else {
+            let action = issues.keys.sorted().first!
+            report(ShortcutValidation.title(for: action) + "：" + issues[action]! + "。请调整后保存。")
+            return
+        }
         let previousBindings = lastBindings, previousEffectiveHotkey = effectiveHotkey
         let previousFailures = failedShortcutActions
         let failures = registerShortcuts(allowFallback: false)
         guard failures.isEmpty else {
-            _ = hotkeys.register(bindings: previousBindings) { [weak self] action in self?.performHotkey(action) }
+            if !testMode { _ = hotkeys.register(bindings: previousBindings) { [weak self] action in self?.performHotkey(action) } }
             report("快捷键已被占用或格式无效，设置尚未保存。"); return
         }
         do { try settings.save(); message = "设置已保存。" }
@@ -528,6 +550,7 @@ import ServiceManagement
     func showSettings(section: String? = nil) {
         recordExternalFocus()
         refreshAccessibilityPermission()
+        refreshScreenCapturePermission()
         if let section, ["clipboard", "shortcuts", "studio", "downloads", "about"].contains(section) { settingsSection = section }
         hidePanel()
         if settingsWindow == nil {
@@ -677,25 +700,46 @@ import ServiceManagement
     func windowWillClose(_ notification: Notification) {
         if notification.object as? NSWindow === studioWindow { studio.setLibraryActive(false) }
     }
-    func takeScreenshot() {
-        guard !screenshotBusy && !testMode else { return }
-        hidePanel(restoreFocus: true); settingsWindow?.orderOut(nil)
-        let file = FileManager.default.temporaryDirectory.appendingPathComponent("kaki-shot-\(UUID().uuidString).png")
-        let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        process.arguments = ["-i", "-s", "-x", file.path]
-        screenshotBusy = true; screenshotProcess = process
-        process.terminationHandler = { [weak self] child in
-            DispatchQueue.main.async {
-                defer { try? FileManager.default.removeItem(at: file) }
-                guard let self, !self.shuttingDown, self.screenshotProcess === child else { return }
-                self.screenshotProcess = nil; self.screenshotBusy = false
-                guard child.terminationStatus == 0, let data = try? Data(contentsOf: file, options: .mappedIfSafe), !data.isEmpty else { return }
+    func takeScreenshot(retryPermissionFailure: Bool = false) {
+        guard !shuttingDown, !screenshotBusy, let screenshotRunner else { return }
+        refreshScreenCapturePermission()
+        // Preflight alone can lag a changed grant. Only an actual denial suppresses
+        // automatic retries; an explicit settings action can still try the tool.
+        if screenshotPermissionIssue && !retryPermissionFailure {
+            report("屏幕权限尚未生效。已开启开关的话，请完全退出 Kaki Tools 后重新打开。")
+            showSettings(section: "about")
+            return
+        }
+        hidePanel(restoreFocus: true); settingsWindow?.orderOut(nil); hideStudio()
+        screenshotBusy = true; screenshotGeneration += 1
+        let generation = screenshotGeneration
+        log.write("截图开始：系统预检=\(screenCaptureTrusted)，版本=\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development")，位置=\(Bundle.main.bundleURL.path)")
+        screenshotRunner.capture { [weak self] result in
+            guard let self, !self.shuttingDown, self.screenshotGeneration == generation else { return }
+            self.screenshotBusy = false
+            switch result {
+            case .captured(let data):
+                self.screenCaptureTrusted = true; self.screenshotPermissionIssue = false; self.lastScreenshotFailure = nil
                 let accepted = self.store.captureImage(data: data)
-                _ = self.clipboard.writeImage(data)
-                if accepted { self.message = "截图已复制，正在保存到历史。" }
+                let copied = self.clipboard.writeImage(data) != nil
+                self.log.write("截图完成：图片字节=\(data.count)，历史已接收=\(accepted)，剪贴板写入=\(copied)")
+                if copied { self.message = accepted ? "截图已复制，正在保存到历史。" : "截图已复制；未能加入历史，请查看日志。" }
+                else { self.report("截图已完成，但写入剪贴板失败，请重试。") }
+            case .cancelled:
+                self.log.write("区域截图已取消或未选择区域。")
+            case .failed(let failure):
+                self.lastScreenshotFailure = failure
+                self.refreshScreenCapturePermission()
+                self.log.write("截图失败：原因=\(failure.reason)，退出码=\(failure.exitStatus.map(String.init) ?? "无")，系统预检=\(self.screenCaptureTrusted)，诊断=\(failure.diagnostic)")
+                if failure.isPermissionDenied {
+                    self.screenshotPermissionIssue = true
+                    self.report("macOS 拒绝了本次截图。请检查屏幕录制权限；已开启时，完全退出后重新打开。")
+                    self.showSettings(section: "about")
+                } else {
+                    self.report("截图未完成。请在设置 → 权限与关于复制截图诊断，检查失败原因。")
+                }
             }
         }
-        do { try process.run() } catch { screenshotProcess = nil; screenshotBusy = false; report("无法截图：" + error.localizedDescription) }
     }
     func createBoard() { prompt(title: "新建收藏", value: "") { [weak self] name in self?.store.createBoard(name) } }
     func renameBoard(_ name: String) { prompt(title: "重命名收藏", value: name) { [weak self] value in guard let self else { return }
@@ -733,6 +777,65 @@ import ServiceManagement
         refreshAccessibilityPermission()
     }
     func openAccessibilitySettings() { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!) }
+    func refreshScreenCapturePermission() {
+        let trusted = screenCapturePermissionCheck(false)
+        let newlyGranted = trusted && !screenCaptureTrusted
+        if screenCaptureTrusted != trusted { screenCaptureTrusted = trusted }
+        // A grant transition can repair an earlier denial. A still-true preflight
+        // must not erase an actual tool denial just by opening the settings page.
+        if newlyGranted { screenshotPermissionIssue = false }
+    }
+    func requestScreenCapturePermission() {
+        guard !shuttingDown, !screenshotBusy else { return }
+        refreshScreenCapturePermission()
+        guard !screenCaptureTrusted else { return }
+        guard !screenCapturePermissionRequested else {
+            report("本次运行已申请屏幕权限。已开启开关的话，请完全退出后重新打开。")
+            return
+        }
+        screenCapturePermissionRequested = true
+        let granted = screenCapturePermissionCheck(true)
+        refreshScreenCapturePermission()
+        if granted { screenCaptureTrusted = true; screenshotPermissionIssue = false }
+        log.write("主动申请屏幕权限：系统返回=\(granted)，当前状态=\(screenCaptureTrusted)")
+        if !screenCaptureTrusted { message = "请在屏幕录制设置中允许 Kaki Tools；已开启时，完全退出后重新打开。" }
+    }
+    func openScreenCaptureSettings() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+    }
+    var screenshotDiagnostics: String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
+        var lines = ["Kaki Tools 截图诊断", "版本：\(version) (\(build))", "系统：\(ProcessInfo.processInfo.operatingSystemVersionString)",
+            "应用标识：\(Bundle.main.bundleIdentifier ?? "未打包测试进程")", "运行位置：\(Bundle.main.bundleURL.path)",
+            "屏幕权限系统预检：\(screenCaptureTrusted ? "已确认" : "未确认（不等同于设置开关关闭）")",
+            "本次运行主动申请权限：\(screenCapturePermissionRequested ? "是" : "否")"]
+        var code: SecCode?, staticCode: SecStaticCode?, information: CFDictionary?
+        if SecCodeCopySelf([], &code) == errSecSuccess, let code,
+           SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode,
+           SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
+           let values = information as? [String: Any] {
+            lines.append("签名标识：\(values[kSecCodeInfoIdentifier as String] as? String ?? "unknown")")
+            lines.append("签名团队：\(values[kSecCodeInfoTeamIdentifier as String] as? String ?? "本地签名或无团队")")
+            if let certificates = values[kSecCodeInfoCertificates as String] as? [SecCertificate], let leaf = certificates.first,
+               let name = SecCertificateCopySubjectSummary(leaf) {
+                lines.append("签名证书：\(name)")
+                let fingerprint = SHA256.hash(data: SecCertificateCopyData(leaf) as Data).map { String(format: "%02x", $0) }.joined()
+                lines.append("证书 SHA-256：\(fingerprint)")
+            }
+        }
+        if let failure = lastScreenshotFailure {
+            lines.append("最近截图失败：\(failure.reason)，退出码 \(failure.exitStatus.map(String.init) ?? "无")")
+            lines.append("系统诊断：\(failure.diagnostic)")
+        } else { lines.append("最近截图失败：无记录") }
+        return lines.joined(separator: "\n")
+    }
+    func copyScreenshotDiagnostics() {
+        refreshScreenCapturePermission()
+        let text = screenshotDiagnostics
+        if clipboard.write(item: HistoryItem(text: text)) != nil { message = "截图诊断已复制。" }
+        else { report("未能复制截图诊断，请重试。") }
+    }
     func setLaunchAtLogin(_ enabled: Bool) {
         do { if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }; message = "开机启动设置已更新。" }
         catch { report("开机启动设置失败：" + error.localizedDescription) }
@@ -829,7 +932,7 @@ import ServiceManagement
         studio.shutdown()
         dreamina.shutdown()
         clipboard.stop(); hotkeys.unregisterAll(); windows.cancel()
-        if let process = screenshotProcess, process.isRunning { process.terminate() }; screenshotProcess = nil
+        screenshotGeneration += 1; screenshotRunner?.cancel(); screenshotBusy = false
         if let monitor = eventMonitor { NSEvent.removeMonitor(monitor) }
         store.flush(); log.write("原生应用正常退出"); log.flush()
         if let item = statusItem { NSStatusBar.system.removeStatusItem(item) }

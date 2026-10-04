@@ -5,14 +5,14 @@ import AVKit
 @MainActor struct StudioAccountView: View {
     @ObservedObject var studio: StudioStore
     var openLibrary: (() -> Void)?
-    var settingsPresentation = false
+    var embedded = false
     @State private var email = ""
     @State private var password = ""
     @State private var code = ""
     var body: some View {
         Group {
-            if settingsPresentation {
-                SettingsCard("Studio 账号") { form }
+            if embedded {
+                form
             } else {
                 VStack(alignment: .leading, spacing: 18) {
                     Text("Studio 账号").font(.title2.bold())
@@ -23,6 +23,7 @@ import AVKit
         }.tint(SettingsStyle.accent).accentColor(SettingsStyle.accent)
             .task { await studio.restoreSession() }
             .onChange(of: studio.user?.id) { _ in password = ""; code = "" }
+            .onChange(of: studio.environment) { _ in password = ""; code = "" }
             .onDisappear { password = ""; code = "" }
     }
     private var form: some View {
@@ -35,7 +36,7 @@ import AVKit
                     Task { await studio.changeEnvironment(value) }
                 })) {
                     ForEach(StudioEnvironment.allCases) { Text($0.label).tag($0) }
-                }.labelsHidden().frame(width: 142).disabled(studio.busy)
+                }.pickerStyle(.segmented).labelsHidden().frame(width: 192).disabled(studio.busy)
             }
             Divider()
             if let user = studio.user {
@@ -53,7 +54,7 @@ import AVKit
                     if let openLibrary { Button("打开素材库", action: openLibrary).buttonStyle(SettingsPrimaryButtonStyle()) }
                     Button("退出账号") { password = ""; code = ""; Task { await studio.logout() } }
                 }.controlSize(.large)
-                SettingsFootnote("退出后保留已复制和下载的内容。")
+                SettingsFootnote("已复制和下载的内容会保留。")
             } else {
                 VStack(alignment: .leading, spacing: 12) {
                     VStack(alignment: .leading, spacing: 6) {
@@ -82,7 +83,7 @@ import AVKit
                 } else if !studio.message.isEmpty && !studio.twoFactorRequired {
                     Button("重试连接") { Task { await studio.retrySession() } }.disabled(studio.busy)
                 }
-                SettingsFootnote("密码不保存，登录会话由 macOS 钥匙串保管。")
+                Label("登录会话由 macOS 钥匙串保管", systemImage: "lock").font(.caption).foregroundStyle(.secondary)
             }
             if !studio.message.isEmpty {
                 SettingsFootnote(studio.message).textSelection(.enabled)
