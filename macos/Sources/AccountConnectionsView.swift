@@ -1,5 +1,4 @@
 import SwiftUI
-import Combine
 import AppKit
 
 enum AccountConnectionSite: String, CaseIterable, Identifiable {
@@ -11,17 +10,14 @@ enum AccountConnectionSite: String, CaseIterable, Identifiable {
 
 @MainActor struct AccountConnectionsView: View {
     @ObservedObject var studio: StudioStore
-    @ObservedObject var connector: DreaminaConnector
-    var classicCli: ClassicCliConnection?
+    @ObservedObject var classicCli: ClassicCliConnection
     var openLibrary: () -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var classicStatus = ""
-    @State private var classicConnected = false
     @State private var expanded: AccountConnectionSite?
 
-    init(studio: StudioStore, connector: DreaminaConnector, classicCli: ClassicCliConnection? = nil, openLibrary: @escaping () -> Void,
+    init(studio: StudioStore, classicCli: ClassicCliConnection, openLibrary: @escaping () -> Void,
          expanded: AccountConnectionSite? = nil) {
-        self.studio = studio; self.connector = connector; self.classicCli = classicCli; self.openLibrary = openLibrary
+        self.studio = studio; self.classicCli = classicCli; self.openLibrary = openLibrary
         _expanded = State(initialValue: expanded)
     }
 
@@ -41,10 +37,13 @@ enum AccountConnectionSite: String, CaseIterable, Identifiable {
                     .transition(.asymmetric(insertion: .opacity.combined(with: .move(edge: .top)), removal: .opacity))
             }
         }
-        .onReceive(classicCli?.$status.eraseToAnyPublisher() ?? Just("").eraseToAnyPublisher()) { classicStatus = $0 }
-        .onReceive(classicCli?.$connected.eraseToAnyPublisher() ?? Just(false).eraseToAnyPublisher()) { classicConnected = $0 }
         .animation(reduceMotion ? nil : .spring(response: 0.32, dampingFraction: 0.88), value: expanded)
-        .task { if !Task.isCancelled { await studio.restoreSession() } }
+        .task {
+            guard !Task.isCancelled else { return }
+            await studio.restoreSession()
+            guard !Task.isCancelled else { return }
+            classicCli.detect()
+        }
         .onDisappear { select(nil) }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { notification in
             if isSettingsWindow(notification) { select(nil) }
@@ -57,7 +56,7 @@ enum AccountConnectionSite: String, CaseIterable, Identifiable {
     private func select(_ site: AccountConnectionSite?) {
         // Cancel before the removal animation: an outgoing view must never cancel
         // a new operation started after the user reopens the same card.
-        if expanded == .dreamina, site != .dreamina, connector.busy || connector.authorization != nil { connector.cancel() }
+        if expanded == .dreamina, site != .dreamina, classicCli.busy || classicCli.authorizationURL != nil { classicCli.cancelOperation() }
         expanded = site
     }
     private func isSettingsWindow(_ notification: Notification) -> Bool {
@@ -66,42 +65,32 @@ enum AccountConnectionSite: String, CaseIterable, Identifiable {
     private func domain(_ site: AccountConnectionSite) -> String {
         site == .studio ? (studio.environment.siteLabel + " · " + (studio.environment.baseURL.host ?? "kakiai.xin")) : "jimeng.jianying.com"
     }
-    private func active(_ site: AccountConnectionSite) -> Bool { site == .studio ? studio.user != nil : (classicCli != nil ? classicConnected : connector.verified) }
+    private func active(_ site: AccountConnectionSite) -> Bool { site == .studio ? studio.user != nil : classicCli.connected }
     private func status(_ site: AccountConnectionSite) -> String {
         if site == .studio { return studio.user != nil ? "已登录" : "未登录" }
-        if classicCli != nil { return classicConnected ? "已连接" : classicStatus.isEmpty ? "未连接" : classicStatus }
-        return connector.verified ? "已关联" : connector.binding == nil ? "未关联" : "待验证"
+        if classicCli.connected { return "已连接" }
+        if classicCli.busy { return "处理中" }
+        if !classicCli.installed { return "待安装" }
+        return classicCli.needsUpgrade ? "待更新" : classicCli.loginChecked && classicCli.loggedIn ? "待连接" : "未连接"
     }
     private func subtitle(_ site: AccountConnectionSite) -> String {
         if site == .studio { return studio.user.map { $0.name ?? $0.email } ?? "素材与工作区" }
-        if classicCli != nil { return "使用本机即梦登录" }
-        return connector.binding == nil ? "连接创作账号" : "账号 ···" + (connector.binding?.dreaminaUserID.suffix(6) ?? "")
+        return classicCli.connected ? classicCli.targetWorkspaceName : "本机生成"
     }
     private func details(_ site: AccountConnectionSite) -> some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack(spacing: 10) {
                 RoundedRectangle(cornerRadius: 2).fill(site.accent).frame(width: 3, height: 18)
-                Text(site == .studio ? (studio.user == nil ? "登录 KAKI Studio" : "Studio 账号") : "即梦账号")
+                Text(site == .studio ? "Studio 账号" : "即梦连接")
                     .font(.system(size: 15, weight: .semibold))
                 Spacer()
                 Button { select(nil) } label: { Image(systemName: "xmark").font(.system(size: 11, weight: .semibold)).frame(width: 26, height: 26) }
                     .buttonStyle(.plain).foregroundStyle(.secondary)
                     .accessibilityLabel("收起" + site.title).help("收起")
             }
-            Divider()
             Group {
                 if site == .studio { StudioAccountView(studio: studio, openLibrary: openLibrary, embedded: true) }
-                else if let classicCli {
-                    ClassicCliConnectionView(connection: classicCli)
-                    DisclosureGroup("dreamina-canvas 独立连接") {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("此通路独立关联，连接结果不影响经典 CLI。")
-                                .font(.system(size: 11)).foregroundStyle(.secondary)
-                            DreaminaConnectionView(connector: connector, studio: studio, isPresented: { expanded == .dreamina })
-                        }
-                    }
-                }
-                else { DreaminaConnectionView(connector: connector, studio: studio, isPresented: { expanded == .dreamina }) }
+                else { ClassicCliConnectionView(connection: classicCli) }
             }
         }.padding(20).frame(maxWidth: .infinity, alignment: .leading)
             .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 16))
@@ -132,8 +121,7 @@ private struct AccountWebsiteCard: View {
                     }
                     Spacer(minLength: 0)
                 }
-                WebsiteIllustration(site: site).frame(height: 78).clipShape(RoundedRectangle(cornerRadius: 10))
-                    .accessibilityHidden(true)
+
                 HStack(spacing: 5) {
                     SettingsStatus(title: status, active: active)
                     Spacer(minLength: 0)
@@ -170,72 +158,88 @@ private struct WebsiteLogo: View {
     }
 }
 
-private struct WebsiteIllustration: View {
-    let site: AccountConnectionSite
-    var body: some View {
-        GeometryReader { geometry in
-            let width = geometry.size.width
-            ZStack {
-                LinearGradient(colors: [site.accent.opacity(0.13), site.accent.opacity(0.025)], startPoint: .topLeading, endPoint: .bottomTrailing)
-                if site == .studio {
-                    ForEach(0..<3) { index in
-                        ImageTile(accent: site.accent, index: index)
-                            .frame(width: 62, height: 49)
-                            .rotationEffect(.degrees(Double(index - 1) * 9))
-                            .position(x: width / 2 + CGFloat(index - 1) * 42, y: 39 + CGFloat(index % 2) * 4)
-                    }
-                } else {
-                    RoundedRectangle(cornerRadius: 10).fill(LinearGradient(colors: [Color(red: 0.09, green: 0.2, blue: 0.3), Color(red: 0.03, green: 0.52, blue: 0.59)], startPoint: .bottomLeading, endPoint: .topTrailing))
-                        .frame(width: 126, height: 59).rotationEffect(.degrees(-4))
-                        .overlay { Image(systemName: "play.fill").font(.system(size: 17)).foregroundStyle(.white.opacity(0.9)) }
-                    Image(systemName: "sparkle").font(.system(size: 18, weight: .light)).foregroundStyle(site.accent.opacity(0.65))
-                        .position(x: width / 2 + 86, y: 18)
-                    Capsule().fill(site.accent.opacity(0.3)).frame(width: 34, height: 3).position(x: width / 2 - 66, y: 64)
-                }
-            }
-        }
-    }
-    private struct ImageTile: View {
-        let accent: Color
-        let index: Int
-        var body: some View {
-            ZStack {
-                RoundedRectangle(cornerRadius: 7).fill(Color(nsColor: .controlBackgroundColor))
-                RoundedRectangle(cornerRadius: 5).fill(accent.opacity(index == 1 ? 0.2 : 0.09)).padding(5)
-                Image(systemName: index == 1 ? "photo.fill" : "square.stack.fill").font(.system(size: 22, weight: .light)).foregroundStyle(accent.opacity(index == 1 ? 0.85 : 0.35))
-            }.overlay { RoundedRectangle(cornerRadius: 7).strokeBorder(accent.opacity(0.12), lineWidth: 1) }
-        }
-    }
-}
-
 @MainActor struct ClassicCliConnectionView: View {
     @ObservedObject var connection: ClassicCliConnection
+    private var stage: Int { !connection.installed || connection.needsUpgrade ? 0 : !connection.loginChecked || !connection.loggedIn ? 1 : 2 }
+    private var heading: String {
+        if connection.connected { return "已连接 Studio" }
+        if connection.busy { return connection.authorizationURL == nil ? connection.actionTitle + "…" : "等待即梦授权" }
+        if !connection.installed { return "安装即梦 CLI" }
+        if connection.needsUpgrade { return "更新即梦 CLI" }
+        if !connection.loginChecked { return "检查本机登录" }
+        return connection.loggedIn ? "连接 Studio" : "登录即梦"
+    }
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("经典即梦 CLI").font(.system(size: 12, weight: .semibold))
-            Text(connection.status).font(.system(size: 13, weight: .medium))
-            VStack(alignment: .leading, spacing: 4) {
-                Text(connection.targetSiteDescription).lineLimit(1).truncationMode(.middle)
-                    .help(connection.targetSiteDescription)
-                Text("工作区：" + connection.targetWorkspaceName).lineLimit(1).truncationMode(.tail)
-                    .help(connection.targetWorkspaceName)
-            }.font(.system(size: 11)).foregroundStyle(.secondary).textSelection(.enabled)
-            Text("使用本机即梦登录 · 由画布发起 · 使用本人即梦额度").font(.system(size: 11)).foregroundStyle(.secondary)
-            if !connection.version.isEmpty {Text(connection.version).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)}
-            if let url=connection.authorizationURL {
-                Text("本次授权码：" + connection.authorizationUserCode).font(.system(size:15,weight:.semibold,design:.monospaced)).textSelection(.enabled)
-                Text(url.absoluteString).font(.system(size:11)).foregroundStyle(.secondary).textSelection(.enabled)
-                HStack {Button("复制授权码") {connection.copyAuthorizationCode()};Button("打开授权页面") {connection.openAuthorizationPage()}}
+        VStack(spacing: 20) {
+            HStack(spacing: 8) {
+                ForEach(0..<3) { index in
+                    HStack(spacing: 6) {
+                        Image(systemName: connection.connected || index < stage ? "checkmark.circle.fill" : "\(index + 1).circle")
+                        Text(["安装 CLI", "登录即梦", "连接 Studio"][index])
+                    }.font(.system(size: 12, weight: index == stage ? .semibold : .regular))
+                        .foregroundStyle(connection.connected || index <= stage ? Color.primary : Color.secondary)
+                    if index < 2 { Image(systemName: "chevron.right").font(.system(size: 9)).foregroundStyle(.tertiary) }
+                }
+            }.padding(.top, 4)
+            VStack(spacing: 10) {
+                if connection.busy { ProgressView().controlSize(.regular).frame(height: 36) }
+                else { Image(systemName: connection.connected ? "checkmark.circle.fill" : "link.circle.fill")
+                    .font(.system(size: 36, weight: .light)).foregroundStyle(connection.connected ? Color.green : SettingsStyle.accent) }
+                Text(heading).font(.system(size: 19, weight: .semibold))
+                if let _ = connection.authorizationURL {
+                    Text(connection.authorizationUserCode).font(.system(size: 24, weight: .semibold, design: .monospaced)).textSelection(.enabled)
+                    HStack {
+                        Button("复制授权码") { connection.copyAuthorizationCode() }
+                        Button("打开授权页面") { connection.openAuthorizationPage() }.buttonStyle(SettingsPrimaryButtonStyle())
+                    }
+                }
+            }.frame(maxWidth: .infinity).padding(.vertical, 8)
+            if connection.hasStudioAccount {
+                HStack(spacing: 28) {
+                    context("站点", value: connection.targetSiteName)
+                    Divider().frame(height: 28)
+                    context("工作区", value: connection.targetWorkspaceName)
+                }.frame(maxWidth: .infinity).padding(12)
+                    .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 10))
             }
-            HStack {
-                if connection.busy {Button("取消操作") {connection.cancelOperation()}}
-                if !connection.installed {Button("安装即梦 CLI") {connection.install()}.disabled(connection.busy)}
-                if connection.needsUpgrade {Button("更新即梦 CLI") {connection.upgrade()}.disabled(connection.busy || connection.connected)}
-                Button("重新检测") {connection.detect()}.disabled(connection.busy)
-                if connection.installed {Button("登录即梦") {connection.login()}.disabled(connection.busy)}
-                Button(connection.connected ? "重新检查" : "连接本机 CLI") { connection.connect() }.disabled(connection.busy || !connection.installed || connection.needsUpgrade)
-                if connection.connected { Button("断开") { connection.disconnect() } }
+            if stage == 2 && !connection.hasStudioAccount { Text("请先登录 Studio").font(.system(size: 12)).foregroundStyle(.secondary) }
+            if !connection.busy && !connection.status.isEmpty && !connection.status.hasPrefix("已") {
+                Text(connection.status).font(.system(size: 12)).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center).frame(maxWidth: 430)
             }
-        }.onAppear {connection.detect()}
+            HStack(spacing: 12) {
+                if connection.busy {
+                    Button("取消") { connection.cancelOperation() }
+                } else if connection.connected {
+                    Label("可在 Studio 中生成视频", systemImage: "play.circle").font(.system(size: 12)).foregroundStyle(.secondary)
+                } else {
+                    Button(heading) { primaryAction() }.buttonStyle(SettingsPrimaryButtonStyle())
+                        .disabled(stage == 2 && !connection.hasStudioAccount)
+                }
+                Menu {
+                    Button("重新检测") { connection.detect() }.disabled(connection.busy)
+                    if connection.installed {
+                        Button("更新 CLI") { connection.upgrade() }.disabled(connection.busy || connection.connected)
+                        Button("登录即梦") { connection.login() }.disabled(connection.busy || connection.connected || connection.needsUpgrade)
+                    }
+                    if connection.connected { Button("断开连接") { connection.disconnect() } }
+                    if !connection.version.isEmpty { Divider(); Text("CLI · " + connection.version) }
+                } label: { Image(systemName: "ellipsis").frame(width: 28, height: 28) }
+                    .menuStyle(.borderlessButton).fixedSize().help("更多操作").accessibilityLabel("即梦连接更多操作")
+            }.frame(maxWidth: .infinity).padding(.bottom, 4)
+        }.frame(maxWidth: .infinity)
+    }
+    private func context(_ label: String, value: String) -> some View {
+        VStack(spacing: 4) {
+            Text(label).font(.system(size: 10)).foregroundStyle(.secondary)
+            Text(value).font(.system(size: 12, weight: .medium)).lineLimit(1).help(value)
+        }.frame(maxWidth: .infinity)
+    }
+    private func primaryAction() {
+        if !connection.installed { connection.install() }
+        else if connection.needsUpgrade { connection.upgrade() }
+        else if !connection.loginChecked { connection.detect() }
+        else if !connection.loggedIn { connection.login() }
+        else { connection.connect() }
     }
 }

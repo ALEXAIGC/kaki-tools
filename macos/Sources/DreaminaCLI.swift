@@ -34,24 +34,12 @@ struct DreaminaOutput: Sendable {
 protocol DreaminaRunning: Sendable {
     func run(_ arguments: [String], timeout: TimeInterval) async throws -> DreaminaOutput
 }
-struct DreaminaUnavailableRunner: DreaminaRunning {
-    func run(_ arguments: [String], timeout: TimeInterval) async throws -> DreaminaOutput { throw DreaminaError.missingCLI }
-}
-
 // Execute fixed argv directly. No shell, inherited stdin, credential logging or
 // writes to the CLI credential store; its own OAuth client owns the Keychain.
 struct DreaminaProcessRunner: DreaminaRunning {
     private let locator: @Sendable () -> URL?
     init(executable: URL?) { locator = { executable } }
-    init(locator: @escaping @Sendable () -> URL? = { DreaminaProcessRunner.locate() }) { self.locator = locator }
-    static func locate() -> URL? {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return [home.appendingPathComponent(".local/bin/dreamina-canvas"),
-                URL(fileURLWithPath: "/opt/homebrew/bin/dreamina-canvas"),
-                URL(fileURLWithPath: "/usr/local/bin/dreamina-canvas")].first {
-            FileManager.default.isExecutableFile(atPath: $0.path)
-        }
-    }
+    init(locator: @escaping @Sendable () -> URL?) { self.locator = locator }
     func run(_ arguments: [String], timeout: TimeInterval) async throws -> DreaminaOutput {
         guard let executable = locator(), FileManager.default.isExecutableFile(atPath: executable.path) else { throw DreaminaError.missingCLI }
         let invocation = DreaminaInvocation()
@@ -187,18 +175,5 @@ private final class DreaminaInvocation: @unchecked Sendable {
         kill(pid, SIGKILL)
         var status: Int32 = 0
         while waitpid(pid, &status, 0) < 0 && errno == EINTR {}
-    }
-}
-
-enum DreaminaJSON {
-    static func data(_ output: DreaminaOutput) throws -> [String: Any] {
-        guard let root = try JSONSerialization.jsonObject(with: output.data) as? [String: Any],
-              root["schemaVersion"] as? String == "1" else { throw DreaminaError.invalidResponse }
-        guard output.status == 0, root["ok"] as? Bool == true,
-              let data = root["data"] as? [String: Any] else {
-            let error = root["error"] as? [String: Any]
-            throw DreaminaError.failed(error?["reason"] as? String ?? error?["code"] as? String ?? "unknown")
-        }
-        return data
     }
 }

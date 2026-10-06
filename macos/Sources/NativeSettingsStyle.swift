@@ -9,7 +9,9 @@ enum SettingsStyle {
 struct SettingsWordmark: View {
     var body: some View {
         if let logo = NativeBrand.logo {
-            Image(nsImage: logo).resizable().scaledToFill().frame(width: 64, height: 30).clipped()
+            // The square resource has transparent space above and below the wordmark.
+            Image(nsImage: logo).resizable().scaledToFit().frame(width: 76, height: 76)
+                .frame(height: 34).clipped()
                 .accessibilityLabel("KAKI")
         } else {
             Text("KAKI").font(.system(size: 21, weight: .black)).italic().foregroundStyle(SettingsStyle.accent)

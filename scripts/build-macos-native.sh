@@ -2,6 +2,9 @@
 set -euo pipefail
 project_root=$(cd "$(dirname "$0")/.." && pwd)
 arch=$(uname -m)
+version=$(/usr/bin/plutil -extract version raw -o - "$project_root/package.json")
+[[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || { echo '版本号格式无效。' >&2; exit 1; }
+build_number=$((10#${BASH_REMATCH[1]} * 10000 + 10#${BASH_REMATCH[2]} * 100 + 10#${BASH_REMATCH[3]}))
 output="${KAKI_NATIVE_OUTPUT_DIR:-$project_root/dist/native-$arch}"
 # Pin the local certificate by its public fingerprint; never silently fall back to ad-hoc.
 identity="${KAKI_NATIVE_IDENTITY:-}"
@@ -28,7 +31,7 @@ xcrun --sdk macosx swiftc -swift-version 5 -O -whole-module-optimization \
   -framework ImageIO -framework CryptoKit -framework ServiceManagement \
   -framework AVKit \
   "$project_root"/macos/Sources/*.swift -o "$app/Contents/MacOS/Kaki Tools"
-cat > "$app/Contents/Info.plist" <<'PLIST'
+cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -37,8 +40,8 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>Kaki Tools</string>
 <key>CFBundleDisplayName</key><string>Kaki Tools</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.5.2</string>
-<key>CFBundleVersion</key><string>10502</string>
+<key>CFBundleShortVersionString</key><string>$version</string>
+<key>CFBundleVersion</key><string>$build_number</string>
 <key>CFBundleIconFile</key><string>icon.icns</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>

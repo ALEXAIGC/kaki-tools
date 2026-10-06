@@ -29,6 +29,7 @@ import ImageIO
     @Published private(set) var cacheChanging = false
     private let defaultCacheDirectory: URL
     private var cacheTimer: Timer?
+    private var cacheStatsTask: Task<Void, Never>?
     private let diskCache: StudioDiskCache
     private var cacheRevision = 0
     @Published var query = "" {
@@ -48,6 +49,7 @@ import ImageIO
     private let transport: StudioTransport
     private let preference: URL
     private let clipboardDirectory: URL
+    private var preferredWorkspaces: [String: String] = [:]
     var mediaBusy: Bool { !mediaTasks.isEmpty }
     private var restored = false
     private var generation = 0
@@ -67,14 +69,19 @@ import ImageIO
         let cacheDirectory = cacheFolder.isEmpty ? defaultCacheDirectory : URL(fileURLWithPath: cacheFolder, isDirectory: true).appendingPathComponent("Kaki Tools Cache", isDirectory: true)
         cacheLocation = cacheDirectory.path
         diskCache = cache ?? StudioDiskCache(directory: cacheDirectory, limitMB: cacheLimitMB, days: cacheDays, volumeUUID: cacheVolumeUUID)
-        self.credentials = credentials ?? StudioKeychain(); self.transport = transport
+        self.credentials = credentials ?? StudioLocalCredentials(directory: directory); self.transport = transport
         clipboardDirectory = directory.appendingPathComponent("studio-clipboard", isDirectory: true)
         preference = directory.appendingPathComponent("studio-environment.json")
         if let data = try? Data(contentsOf: preference), let value = try? JSONDecoder().decode(String.self, from: data), let environment = StudioEnvironment(rawValue: value) { self.environment = environment }
+        let workspaceFile = directory.appendingPathComponent("studio-workspaces.json")
+        if let bytes = try? workspaceFile.resourceValues(forKeys: [.fileSizeKey]).fileSize, bytes <= 65536,
+           let data = try? Data(contentsOf: workspaceFile), let values = try? JSONDecoder().decode([String: String].self, from: data) {
+            preferredWorkspaces = values
+        }
         updateLogoutCleanupState()
         thumbnails.countLimit = 24; thumbnails.totalCostLimit = 12 * 1024 * 1024
     }
-    // A non-secret, per-environment tombstone survives failed keychain deletion.
+    // A non-secret, per-environment tombstone survives failed session deletion.
     // Only a successful explicit login may remove it and permit restoration.
     private var logoutMarker: URL { preference.deletingLastPathComponent().appendingPathComponent("studio-logout-" + environment.rawValue) }
     private var restoreSuppressed: Bool { suppressedEnvironments.contains(environment) || FileManager.default.fileExists(atPath: logoutMarker.path) }
@@ -133,6 +140,11 @@ import ImageIO
             await loadWorkspaces()
         } catch { if generation == revision { handle(error) } }
     }
+    func resumeSessionIfNeeded() async {
+        guard user == nil, !busy, !restoreSuppressed else { return }
+        restored = false
+        await restoreSession()
+    }
     func retrySession() async {
         if restoreSuppressed { await logout(); return }
         restored = false; await restoreSession()
@@ -167,18 +179,27 @@ import ImageIO
             let result = try await api.workspaces(saved)
             guard generation == revision else { return }
             workspaces = result.filter { $0.disabled != true }
-            workspaceID = workspaces.first(where: { $0.kind == "personal" })?.id ?? workspaces.first?.id ?? ""
+            let remembered = preferredWorkspaces[workspacePreferenceKey]
+            workspaceID = workspaces.first(where: { $0.id == remembered })?.id
+                ?? workspaces.first(where: { $0.kind == "personal" })?.id ?? workspaces.first?.id ?? ""
             if workspaceID.isEmpty { message = "当前账号暂无可用工作区，请在 Studio 中确认权限。"; return }
             await refresh()
         } catch { if generation == revision { handle(error) } }
     }
     func retryWorkspaces() async { guard user != nil && !busy else { return }; busy = true; let revision = generation; await loadWorkspaces(); if generation == revision { busy = false } }
+    private var workspacePreferenceKey: String { environment.rawValue + "|" + (user?.id ?? "") }
     func selectWorkspace(_ id: String) async {
         guard id != workspaceID, workspaces.contains(where: { $0.id == id }) else { return }
         generation += 1; sessionRevision += 1; thumbnails.removeAllObjects()
         thumbnailWork.cancelAll()
         clearVideoStreams()
         for task in mediaTasks.values { task.cancel() }; mediaTasks.removeAll()
+        preferredWorkspaces[workspacePreferenceKey] = id
+        do {
+            let file = preference.deletingLastPathComponent().appendingPathComponent("studio-workspaces.json")
+            try JSONEncoder().encode(preferredWorkspaces).write(to: file, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        } catch { message = "工作区已切换，但本地记忆保存失败。" }
         workspaceID = id; assets = []; total = 0; nextCursor = nil; busy = false
         loadedQuery = nil; lastSyncedAt = nil; syncNote = ""
         await refresh()
@@ -256,14 +277,14 @@ import ImageIO
             try saveLogoutIntent(pending: false)
         } catch {
             logoutCleanupPending = true
-            message = "已退出账号；本机会话清理未完成，请解锁钥匙串后点击“重试退出清理”。旧会话不会自动恢复。"
+            message = "已退出账号；本机会话清理未完成，请检查本地存储权限后点击“重试退出清理”。旧会话不会自动恢复。"
         }
         // Remote invalidation is best effort; local suppression does not depend on it.
         if let old { try? await api.logout(old) }
     }
     private func handle(_ error: Error) {
         if case StudioError.http(401, _) = error {
-            // Failed keychain cleanup must not reintroduce an expired identity.
+            // Failed local-session cleanup must not reintroduce an expired identity.
             suppressedEnvironments.insert(environment)
             try? saveLogoutIntent(pending: true)
             clearAccount(); restored = true
@@ -292,7 +313,19 @@ import ImageIO
         return try StudioReferenceEnvelope(version: 1, origin: environment.baseURL.absoluteString, items: references).clipboardText()
     }
     func refreshCacheStats() async {
-        let stats = await diskCache.stats(); cacheBytes = stats.bytes; cacheFiles = stats.files; cacheAvailable = stats.available
+        let stats = await diskCache.stats()
+        if cacheBytes != stats.bytes { cacheBytes = stats.bytes }
+        if cacheFiles != stats.files { cacheFiles = stats.files }
+        if cacheAvailable != stats.available { cacheAvailable = stats.available }
+    }
+    private func scheduleCacheStats() {
+        guard cacheStatsTask == nil else { return }
+        cacheStatsTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 250_000_000) } catch { return }
+            guard let self, !Task.isCancelled else { return }
+            await self.refreshCacheStats()
+            self.cacheStatsTask = nil
+        }
     }
     func startCacheMaintenance() {
         cacheTimer?.invalidate()
@@ -430,7 +463,7 @@ import ImageIO
                 if let png = await decodeThumbnail(cached.file), let image = NSImage(data: png) {
                     guard generation == revision, cacheRevision == cacheVersion, !Task.isCancelled else { return nil }
                     thumbnails.setObject(image, forKey: key, cost: Int(image.size.width * image.size.height * 4))
-                    await refreshCacheStats(); return image
+                    scheduleCacheStats(); return image
                 }
                 guard generation == revision, cacheRevision == cacheVersion, !Task.isCancelled else { return nil }
                 if !(await diskCache.remove(diskKey, ifUnchanged: lease.version)) {
@@ -444,7 +477,11 @@ import ImageIO
             var png: Data?
             if asset.kind == "video", asset.thumbUrl == nil {
                 image = await videoPoster(asset, key: key)
-                if let image, let data = image.tiffRepresentation { png = try? ImageCodec.png(data) }
+                if let image {
+                    png = await Task.detached(priority: .utility) {
+                        autoreleasepool { image.tiffRepresentation.flatMap { try? ImageCodec.png($0) } }
+                    }.value
+                }
             } else {
                 guard asset.thumbUrl != nil || (asset.kind == "image" && (asset.size ?? 0) <= 8 * 1024 * 1024) else { return nil }
                 let result: StudioHTTPFile
@@ -459,7 +496,7 @@ import ImageIO
             guard generation == revision, cacheRevision == cacheVersion, !Task.isCancelled else { return nil }
             if let image { thumbnails.setObject(image, forKey: key, cost: Int(image.size.width * image.size.height * 4)) }
             if let png { await cachePreview(png, key: diskKey, epoch: lookup.epoch) }
-            await refreshCacheStats()
+            scheduleCacheStats()
             return image
         } catch {
             if generation == revision, case StudioError.http(401, _) = error { handle(error) }
@@ -481,8 +518,10 @@ import ImageIO
         let file = FileManager.default.temporaryDirectory.appendingPathComponent("kaki-preview-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: file) }
         do {
-            try png.write(to: file)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+            try await Task.detached(priority: .utility) {
+                try png.write(to: file)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+            }.value
             let response = HTTPURLResponse(url: environment.baseURL, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type":"image/png"])!
             await diskCache.store(StudioHTTPFile(file: file, response: response), key: key, epoch: epoch)
         } catch { /* Preview caching is optional. */ }
@@ -680,5 +719,5 @@ import ImageIO
             } catch { if self.generation == revision { self.handle(error) } }
         }
     }
-    func shutdown() { cacheTimer?.invalidate(); cacheTimer = nil; libraryActive = false; generation += 1; for task in mediaTasks.values { task.cancel() }; mediaTasks.removeAll(); thumbnailWork.cancelAll(); clearVideoStreams(); thumbnails.removeAllObjects() }
+    func shutdown() { cacheStatsTask?.cancel(); cacheStatsTask = nil; cacheTimer?.invalidate(); cacheTimer = nil; libraryActive = false; generation += 1; for task in mediaTasks.values { task.cancel() }; mediaTasks.removeAll(); thumbnailWork.cancelAll(); clearVideoStreams(); thumbnails.removeAllObjects() }
 }

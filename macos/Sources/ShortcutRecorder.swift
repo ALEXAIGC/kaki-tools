@@ -71,11 +71,11 @@ private final class ShortcutFieldCell: NSTextFieldCell {
         showValue()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    override var intrinsicContentSize: NSSize { NSSize(width: 200, height: 40) }
+    override var intrinsicContentSize: NSSize { NSSize(width: 200, height: 38) }
     override var acceptsFirstResponder: Bool { isEnabled }
 
     private func showValue() {
-        font = .systemFont(ofSize: 18, weight: .medium)
+        font = .systemFont(ofSize: 16, weight: .medium)
         textColor = isEnabled ? .labelColor : .disabledControlTextColor
         if let chord = HotkeyChord.parse(accelerator) {
             let label = chord.label
@@ -86,7 +86,7 @@ private final class ShortcutFieldCell: NSTextFieldCell {
         setAccessibilityValue(stringValue)
     }
     private func showPrompt(_ hint: String = "按下组合键…") {
-        font = .systemFont(ofSize: hint == "按下组合键…" ? 16 : 13, weight: .medium)
+        font = .systemFont(ofSize: hint == "按下组合键…" ? 14 : 13, weight: .medium)
         textColor = .labelColor
         stringValue = hint
         setAccessibilityValue(hint)

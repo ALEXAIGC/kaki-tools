@@ -1,6 +1,6 @@
 import Foundation
-import CoreFoundation
 import Darwin
+import CoreFoundation
 import CryptoKit
 
 struct ClassicCliReference: Codable, Equatable, Sendable {
@@ -126,6 +126,24 @@ struct ClassicDreaminaCLI: Sendable {
     let runner: DreaminaRunning
     static func locate() -> URL? {
         [FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/dreamina"), URL(fileURLWithPath: "/opt/homebrew/bin/dreamina"), URL(fileURLWithPath: "/usr/local/bin/dreamina")].first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+    struct FileIdentity: Equatable, Sendable {
+        let path: String
+        let device: Int32
+        let inode: UInt64
+        let bytes: Int64
+        let modifiedSeconds: Int
+        let modifiedNanoseconds: Int
+        let changedSeconds: Int
+        let changedNanoseconds: Int
+    }
+    static func fileIdentity(_ executable: URL) throws -> FileIdentity {
+        let path = executable.resolvingSymlinksInPath().path
+        var value = stat()
+        guard stat(path, &value) == 0 else { throw POSIXError(.ENOENT) }
+        return FileIdentity(path: path, device: value.st_dev, inode: value.st_ino, bytes: value.st_size,
+                            modifiedSeconds: value.st_mtimespec.tv_sec, modifiedNanoseconds: value.st_mtimespec.tv_nsec,
+                            changedSeconds: value.st_ctimespec.tv_sec, changedNanoseconds: value.st_ctimespec.tv_nsec)
     }
     static func fingerprint(_ executable: URL) throws -> String {
         // Bind the actual executable bytes. Replacing an executable invalidates authorization.

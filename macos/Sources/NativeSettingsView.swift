@@ -22,13 +22,13 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
         case .about: return "lock.shield"
         }
     }
-    var subtitle: String {
+    var subtitle: String? {
         switch self {
         case .clipboard: return "让常用内容随手可得。"
-        case .shortcuts: return "点击按键框 → 按下组合键 → 保存生效。"
-        case .studio: return "你的创作账号，一处管理。"
+        case .shortcuts: return nil
+        case .studio: return nil
         case .downloads: return "原始素材的保存位置与本地空间管理。"
-        case .about: return "管理系统授权，了解 Kaki Tools。"
+        case .about: return nil
         }
     }
 }
@@ -46,8 +46,8 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     VStack(alignment: .leading, spacing: 7) {
-                        Text(section.title).font(.system(size: 25, weight: .bold))
-                        SettingsFootnote(section.subtitle)
+                        Text(section.title).font(.system(size: 19, weight: .semibold))
+                        if let subtitle = section.subtitle { SettingsFootnote(subtitle) }
                     }.padding(.bottom, 4)
                     page
                 }.padding(28).frame(maxWidth: 780, alignment: .leading).frame(maxWidth: .infinity, alignment: .top)
@@ -60,10 +60,9 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
     }
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 9) { SettingsWordmark(); Text("Tools").font(.system(size: 15, weight: .semibold)).foregroundStyle(.secondary) }
-                .padding(.top, 30).padding(.bottom, 30)
-            Text("设置").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
-                .padding(.leading, 12).padding(.bottom, 10)
+            SettingsWordmark()
+                .frame(maxWidth: .infinity)
+                .padding(.top, 28).padding(.bottom, 26)
             VStack(spacing: 5) {
                 ForEach(SettingsSection.allCases) { item in
                     Button { controller.settingsSection = item.rawValue } label: {
@@ -79,13 +78,14 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
                 }
             }
             Spacer()
-            Divider().padding(.bottom, 16)
-            HStack(spacing: 6) {
-                Image(systemName: "apple.logo").font(.system(size: 11))
-                Text("原生 macOS").font(.system(size: 11))
-            }.foregroundStyle(.secondary)
-            Text("Kaki Tools · \(SettingsStyle.version)").font(.system(size: 10)).foregroundStyle(.tertiary).padding(.top, 6)
-        }.padding(.horizontal, 16).padding(.bottom, 22).frame(width: 184)
+            Text("v\(SettingsStyle.version)")
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 10).padding(.vertical, 5)
+                .background(Color.primary.opacity(0.045), in: Capsule())
+                .frame(maxWidth: .infinity)
+                .accessibilityLabel("版本 \(SettingsStyle.version)")
+        }.padding(.horizontal, 14).padding(.bottom, 18).frame(width: 174)
             .frame(maxHeight: .infinity).background(.thinMaterial)
     }
     @ViewBuilder private var page: some View {
@@ -93,7 +93,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
         case .clipboard: clipboardPage
         case .shortcuts: shortcutsPage
         case .studio:
-            AccountConnectionsView(studio: controller.studio, connector: controller.dreamina, classicCli: controller.classicCli, openLibrary: controller.showStudio)
+            AccountConnectionsView(studio: controller.studio, classicCli: controller.classicCli, openLibrary: controller.showStudio)
         case .downloads: downloadsPage
         case .about: aboutPage
         }
@@ -122,7 +122,10 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
                 HStack(spacing: 14) {
                     Image(systemName: "clock.arrow.circlepath").font(.system(size: 22)).foregroundStyle(.secondary)
                     VStack(alignment: .leading, spacing: 5) {
-                        Text("最近 100 条历史").font(.system(size: 13, weight: .semibold))
+                        HStack(spacing: 8) {
+                            Text("最近 100 条历史").font(.system(size: 13, weight: .semibold))
+                            HistoryCapacityLabel(store: controller.store)
+                        }
                         SettingsFootnote("固定与收藏独立保留。")
                     }
                     Spacer()
@@ -177,71 +180,62 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
         }
     }
     private var aboutPage: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            SettingsCard("系统权限") {
-                VStack(alignment: .leading, spacing: 16) {
-                    HStack(spacing: 12) {
+        VStack(spacing: 18) {
+            HStack(alignment: .top, spacing: 16) {
+                SettingsCard {
+                    VStack(spacing: 16) {
                         permissionIcon("hand.raised")
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text("辅助功能").font(.system(size: 13, weight: .semibold))
-                            SettingsFootnote("用于自动粘贴和窗口调整。")
-                        }
-                        Spacer()
+                        Text("辅助功能").font(.system(size: 15, weight: .semibold))
                         SettingsStatus(title: controller.accessibilityTrusted ? "已允许" : "待授权", active: controller.accessibilityTrusted)
-                    }
-                    HStack {
-                        if !controller.accessibilityTrusted { Button("授权辅助功能") { controller.requestAccessibility() }.buttonStyle(SettingsPrimaryButtonStyle()) }
-                        Button("管理权限") { controller.openAccessibilitySettings() }
-                        Spacer()
-                        Button("重新检查") { controller.refreshAccessibilityPermission() }
-                            .help("重新读取 macOS 辅助功能授权状态")
-                    }
-                    Divider()
-                    HStack(spacing: 12) {
-                        permissionIcon("viewfinder")
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text("屏幕录制").font(.system(size: 13, weight: .semibold))
-                            SettingsFootnote("仅用于截图，不录制音频。")
+                        HStack(spacing: 10) {
+                            Button(controller.accessibilityTrusted ? "管理权限" : "授权") {
+                                if controller.accessibilityTrusted { controller.openAccessibilitySettings() }
+                                else { controller.requestAccessibility() }
+                            }.buttonStyle(SettingsPrimaryButtonStyle()).disabled(controller.permissionRepairBusy)
+                            Menu {
+                                Button("重新检查") { controller.refreshAccessibilityPermission() }
+                                Button("修复辅助功能") { controller.repairPermission(.accessibility) }
+                                    .disabled(controller.permissionRepairBusy || controller.screenshotBusy)
+                            } label: { Image(systemName: "ellipsis").frame(width: 26, height: 28) }
+                                .menuStyle(.borderlessButton).fixedSize().accessibilityLabel("辅助功能更多操作")
                         }
-                        Spacer()
-                        SettingsStatus(title: controller.screenshotPermissionIssue ? "本次被拒绝" : (controller.screenCaptureTrusted ? "已确认" : "未确认"), active: controller.screenCaptureTrusted && !controller.screenshotPermissionIssue)
-                    }
-                    HStack {
-                        if !controller.screenCaptureTrusted && !controller.screenCapturePermissionRequested {
-                            Button("申请屏幕权限") { controller.requestScreenCapturePermission() }.buttonStyle(SettingsPrimaryButtonStyle())
-                        }
-                        Button("管理权限") { controller.openScreenCaptureSettings() }
-                        Spacer()
-                        Button("重新检查") { controller.refreshScreenCapturePermission() }
-                            .help("读取当前程序的屏幕权限，不弹出系统授权框")
-                    }
-                    if !controller.screenCaptureTrusted || controller.screenshotPermissionIssue {
-                        SettingsFootnote("已开启开关仍未确认时，请完全退出软件，再从「应用程序」重新打开。")
-                    }
-                    HStack {
-                        Button("尝试截图") { controller.takeScreenshot(retryPermissionFailure: true) }
-                        Button("复制截图诊断") { controller.copyScreenshotDiagnostics() }
-                            .help("复制版本、运行位置、签名和最近截图失败原因，不包含账号或素材")
-                        Spacer()
-                    }
+                    }.frame(maxWidth: .infinity).padding(.vertical, 8)
                 }
+                SettingsCard {
+                    VStack(spacing: 16) {
+                        permissionIcon("viewfinder")
+                        Text("屏幕录制").font(.system(size: 15, weight: .semibold))
+                        SettingsStatus(title: controller.screenshotPermissionIssue ? "本次被拒绝" : (controller.screenCaptureTrusted ? "已确认" : "未确认"), active: controller.screenCaptureTrusted && !controller.screenshotPermissionIssue)
+                        HStack(spacing: 10) {
+                            Button(!controller.screenCaptureTrusted && !controller.screenCapturePermissionRequested ? "授权" : "尝试截图") {
+                                if !controller.screenCaptureTrusted && !controller.screenCapturePermissionRequested { controller.requestScreenCapturePermission() }
+                                else { controller.takeScreenshot(retryPermissionFailure: true) }
+                            }.buttonStyle(SettingsPrimaryButtonStyle()).disabled(controller.permissionRepairBusy || controller.screenshotBusy)
+                            Menu {
+                                Button("管理权限") { controller.openScreenCaptureSettings() }
+                                Button("重新检查") { controller.refreshScreenCapturePermission() }
+                                Button("修复截图权限") { controller.repairPermission(.screenCapture) }
+                                    .disabled(controller.permissionRepairBusy || controller.screenshotBusy)
+                                Divider()
+                                Button("复制截图诊断") { controller.copyScreenshotDiagnostics() }
+                            } label: { Image(systemName: "ellipsis").frame(width: 26, height: 28) }
+                                .menuStyle(.borderlessButton).fixedSize().accessibilityLabel("屏幕录制更多操作")
+                        }
+                    }.frame(maxWidth: .infinity).padding(.vertical, 8)
+                }
+            }
+            if !controller.permissionRepairMessage.isEmpty {
+                Text(controller.permissionRepairMessage).font(.system(size: 12)).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center).frame(maxWidth: .infinity)
             }
             SettingsCard {
-                VStack(alignment: .leading, spacing: 18) {
-                    HStack(spacing: 12) {
-                        SettingsWordmark()
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Kaki Tools").font(.system(size: 18, weight: .semibold))
-                            Text("版本 \(SettingsStyle.version)").font(.system(size: 12)).foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                    }
-                    Divider()
-                    SettingsFootnote("剪贴板、窗口调整、区域截图与 Studio 素材库。")
-                    HStack { Label("剪贴板历史仅存本机", systemImage: "lock").font(.system(size: 12)).foregroundStyle(.secondary); Spacer(); Button("关于…") { controller.showAbout() } }
+                HStack {
+                    SettingsWordmark()
+                    Spacer()
+                    Button("关于 Kaki Tools") { controller.showAbout() }
                 }
             }
-        }.onAppear { controller.refreshAccessibilityPermission() }
+        }.onAppear { controller.refreshAccessibilityPermission(); controller.refreshScreenCapturePermission() }
     }
     private func permissionIcon(_ name: String) -> some View {
         Image(systemName: name).font(.system(size: 20, weight: .light)).foregroundStyle(.secondary)
@@ -252,7 +246,8 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
             if shortcutRecording { return "按下组合键，Esc 取消 · Delete 停用" }
             if !controller.shortcutIssues.isEmpty { return "请调整标红的快捷键，再保存。" }
         }
-        return controller.message.isEmpty ? "更改后点击保存" : controller.message
+        if !controller.message.isEmpty { return controller.message }
+        return section == .shortcuts ? "" : "更改后点击保存"
     }
     private var footer: some View {
         HStack(spacing: 12) {
@@ -265,8 +260,10 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
                     settings.windowShortcuts = WindowManager.defaultShortcuts
                 }
             }
-            Text(footerMessage)
-                .font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(2)
+            if !footerMessage.isEmpty {
+                Text(footerMessage)
+                    .font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(2)
+            }
             Spacer(minLength: 0)
             if needsSave { Button("保存设置") { ShortcutField.cancelRecording(in: NSApp.keyWindow); controller.saveSettings() }.buttonStyle(SettingsPrimaryButtonStyle()).disabled(section == .shortcuts && !controller.shortcutIssues.isEmpty) }
         }.padding(.horizontal, 28).padding(.vertical, 15)
@@ -309,7 +306,7 @@ struct SettingsFolderRow: View {
         SettingsCard("本地缓存") {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(alignment: .firstTextBaseline) {
-                    Text(used).font(.system(size: 25, weight: .semibold, design: .rounded)).monospacedDigit()
+                    Text(used).font(.system(size: 20, weight: .medium, design: .rounded)).monospacedDigit()
                     Text(settings.studioCacheLimitMB > 0 ? "/ \(limit)" : "缓存已停用").font(.system(size: 12)).foregroundStyle(.secondary)
                     Spacer()
                     Button(studio.cacheClearing ? "清理中…" : "清理缓存") { Task { await studio.clearMaterialCache() } }
@@ -375,5 +372,14 @@ struct SettingsFolderRow: View {
         }
         validation = ""
         setPreferences(Int((value * Double(unit)).rounded()), age)
+    }
+}
+
+@MainActor private struct HistoryCapacityLabel: View {
+    @ObservedObject var store: HistoryStore
+    var body: some View {
+        Text(ByteCountFormatter.string(fromByteCount: store.contentBytes, countStyle: .file))
+            .font(.system(size: 11)).foregroundStyle(.secondary)
+            .help("记录内容容量，包含固定与文件夹内容；不含备份和预览缓存")
     }
 }

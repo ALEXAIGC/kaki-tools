@@ -129,6 +129,9 @@ final class HistoryStore: ObservableObject {
     @Published private(set) var boards: [String] = [] { didSet { revision &+= 1 } }
     @Published private(set) var lastError: String?
     private(set) var isReadOnly = false
+    @Published private(set) var loading = false
+    @Published private(set) var contentBytes: Int64 = 0
+    private var loadWaiters: [CheckedContinuation<Void, Never>] = []
     private(set) var pendingImageBytes = 0
     let thumbnailChanges = PassthroughSubject<String, Never>()
     var onError: ((String) -> Void)?
@@ -144,6 +147,7 @@ final class HistoryStore: ObservableObject {
     private var deferredImageFiles: Set<String> = []
     private var persistWork: DispatchWorkItem?
     private var thumbnails: [String: NSImage] = [:]
+    private var boardCopies = Set<String>()
     private var thumbnailOrder: [String] = []
     struct ThumbnailSource: Equatable {
         let file: String?; let thumb: String?; let hash: String?
@@ -152,7 +156,7 @@ final class HistoryStore: ObservableObject {
     private var thumbnailSources: [String: ThumbnailSource] = [:]
     private var loadingThumbnails: [String: UUID] = [:]
 
-    init(directory: URL, limit: Int = 100, imageBudget: Int = 384 * 1024 * 1024,
+    init(directory: URL, limit: Int = 100, imageBudget: Int = 384 * 1024 * 1024, deferredLoading: Bool = false,
          imageProcessor: @escaping @Sendable (Data) throws -> Data = { try ImageCodec.png($0) }) {
         self.directory = directory
         self.images = directory.appendingPathComponent("images", isDirectory: true)
@@ -160,21 +164,56 @@ final class HistoryStore: ObservableObject {
         self.limit = min(100, max(1, limit))
         self.imageBudget = imageBudget
         self.imageProcessor = imageProcessor
-        do {
-            try FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
-            try load()
-            cleanupTemporaryImages()
-            trim()
-        } catch {
-            isReadOnly = true
-            lastError = "历史加载失败，原文件保持完整：\(error.localizedDescription)"
+        if deferredLoading {
+            loading = true
+            let imageDirectory = images, historyFile = history
+            queue.async { [weak self] in
+                let result = Result { () -> (HistorySnapshot?, String?, Set<String>, Int64) in
+                    try FileManager.default.createDirectory(at: imageDirectory, withIntermediateDirectories: true)
+                    let (snapshot, warning) = try Self.readHistory(directory: directory, images: imageDirectory, history: historyFile)
+                    let candidates = Self.temporaryImages(images: imageDirectory, items: snapshot?.items ?? [])
+                    return (snapshot, warning, candidates, Self.contentSize(snapshot?.items ?? []))
+                }
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    switch result {
+                    case .success(let (snapshot, warning, candidates, bytes)):
+                        self.contentBytes = bytes
+                        self.applyHistory(snapshot, warning: warning)
+                        self.deferredImageFiles.formUnion(candidates)
+                        self.loading = false; self.trim()
+                    case .failure(let error):
+                        self.isReadOnly = true; self.loading = false
+                        self.lastError = "历史加载失败，原文件保持完整：\(error.localizedDescription)"
+                        self.onError?(self.lastError!)
+                    }
+                    let waiters = self.loadWaiters; self.loadWaiters.removeAll()
+                    for waiter in waiters { waiter.resume() }
+                }
+            }
+        } else {
+            do {
+                try FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
+                let (snapshot, warning) = try Self.readHistory(directory: directory, images: images, history: history)
+                contentBytes = Self.contentSize(snapshot?.items ?? [])
+                applyHistory(snapshot, warning: warning)
+                deferredImageFiles.formUnion(Self.temporaryImages(images: images, items: items))
+                trim()
+            } catch {
+                isReadOnly = true
+                lastError = "历史加载失败，原文件保持完整：\(error.localizedDescription)"
+            }
         }
     }
-    private func load() throws {
+    func waitUntilLoaded() async {
+        guard loading else { return }
+        await withCheckedContinuation { loadWaiters.append($0) }
+    }
+    private nonisolated static func readHistory(directory: URL, images: URL, history: URL) throws -> (HistorySnapshot?, String?) {
         let manager = FileManager.default
         let hasPrimary = manager.fileExists(atPath: history.path)
         let backupFile = directory.appendingPathComponent("history.backup.json")
-        guard hasPrimary || manager.fileExists(atPath: backupFile.path) else { return }
+        guard hasPrimary || manager.fileExists(atPath: backupFile.path) else { return (nil, nil) }
         let backup = directory.appendingPathComponent("native-import-backup", isDirectory: true)
         if !manager.fileExists(atPath: backup.path) {
             let staging = directory.appendingPathComponent("native-import-backup.\(UUID().uuidString).pending", isDirectory: true)
@@ -191,13 +230,19 @@ final class HistoryStore: ObservableObject {
         }
         let decoder = JSONDecoder()
         let snapshot: HistorySnapshot
+        var warning: String?
         do { snapshot = try decoder.decode(HistorySnapshot.self, from: Data(contentsOf: history)) }
         catch {
             let preserved = directory.appendingPathComponent("history.unreadable.\(UUID().uuidString).json")
             if hasPrimary { try manager.copyItem(at: history, to: preserved) }
             snapshot = try decoder.decode(HistorySnapshot.self, from: Data(contentsOf: backupFile))
-            lastError = "主历史文件无法解析，已保留原文件并从备份恢复。"
+            warning = "主历史文件无法解析，已保留原文件并从备份恢复。"
         }
+        return (snapshot, warning)
+    }
+    private func applyHistory(_ snapshot: HistorySnapshot?, warning: String?) {
+        lastError = warning
+        guard let snapshot else { return }
         items = snapshot.items.map { original in
             var item = original
             if item.type == "image", let file = item.file, !file.isEmpty {
@@ -207,15 +252,16 @@ final class HistoryStore: ObservableObject {
         }
         boards = snapshot.boards
     }
-    private func cleanupTemporaryImages() {
+    private nonisolated static func temporaryImages(images: URL, items: [HistoryItem]) -> Set<String> {
+        var candidates = Set<String>()
         guard let files = try? FileManager.default.contentsOfDirectory(at: images,
-            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]) else { return }
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]) else { return candidates }
         let liveFiles = Set(items.compactMap { $0.file.map { URL(fileURLWithPath: $0).lastPathComponent } })
         for file in files where file.pathExtension == "png" && !liveFiles.contains(file.lastPathComponent) {
             // Recover payloads left by a crash after an index commit, without
             // touching unrelated legacy files or the independent import backup.
             if UUID(uuidString: file.deletingPathExtension().lastPathComponent) != nil {
-                deferredImageFiles.insert(file.path)
+                candidates.insert(file.path)
             }
         }
         for file in files where file.lastPathComponent.hasSuffix(".png.pending") {
@@ -225,9 +271,11 @@ final class HistoryStore: ObservableObject {
                   values.isRegularFile == true, values.isSymbolicLink != true else { continue }
             try? FileManager.default.removeItem(at: file)
         }
+        return candidates
     }
     private func report(_ error: Error) { lastError = error.localizedDescription; onError?(error.localizedDescription) }
     private func mayWrite() -> Bool {
+        if loading { return false }
         if isReadOnly { report(HistoryFailure.unavailableHistory); return false }
         return true
     }
@@ -276,17 +324,35 @@ final class HistoryStore: ObservableObject {
         }
         return removed
     }
+    private nonisolated static func contentSize(_ items: [HistoryItem]) -> Int64 {
+        var total: Int64 = 0
+        for item in items {
+            for bytes in [item.bytes ?? 0, item.text?.utf8.count ?? 0, item.html?.utf8.count ?? 0,
+                          item.rtf?.utf8.count ?? 0, item.rtfData?.count ?? 0] {
+                let (sum, overflow) = total.addingReportingOverflow(Int64(max(0, bytes)))
+                if overflow { return Int64.max }
+                total = sum
+            }
+        }
+        return total
+    }
     private func persistAsync() {
         guard !isReadOnly else { return }
-        let snapshot = snapshot(), file = history, images = images, deleting = deferredImageFiles
+        let snapshot = snapshot(), file = history, images = images, deleting = deferredImageFiles, currentRevision = revision
         queue.async { [weak self] in
             do {
                 let removed = try Self.write(snapshot, to: file, images: images, deleting: deleting)
-                DispatchQueue.main.async { [weak self] in self?.deferredImageFiles.subtract(removed) }
+                let bytes = Self.contentSize(snapshot.items)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.deferredImageFiles.subtract(removed)
+                    if self.revision == currentRevision && self.contentBytes != bytes { self.contentBytes = bytes }
+                }
             } catch { DispatchQueue.main.async { [weak self] in self?.report(error) } }
         }
     }
     func flush() {
+        guard !loading else { return }
         persistWork?.cancel(); persistWork = nil
         guard !isReadOnly else { return }
         // Drain older snapshots and image workers before collecting final values.
@@ -295,6 +361,7 @@ final class HistoryStore: ObservableObject {
         for job in Array(pending.values) { complete(job) }
         persistWork?.cancel(); persistWork = nil
         let final = snapshot(), file = history, images = images, deleting = deferredImageFiles
+        contentBytes = Self.contentSize(final.items)
         do {
             let removed = try queue.sync { try Self.write(final, to: file, images: images, deleting: deleting) }
             deferredImageFiles.subtract(removed)
@@ -416,24 +483,55 @@ final class HistoryStore: ObservableObject {
         for item in items.filter({ $0.board == name }) { removeInternal(id: item.id) }
         boards.removeAll { $0 == name }; changed()
     }
-    func addToBoard(id: String, board: String) {
-        guard mayWrite(), boards.contains(board) else { return }
-        if isPending(id: id) { report(HistoryFailure.imageProcessing); return }
+    private func boardClone(id: String, board: String) -> HistoryItem? {
+        guard mayWrite(), boards.contains(board) else { return nil }
+        if isPending(id: id) { report(HistoryFailure.imageProcessing); return nil }
         guard let source = item(id: id),
-              !items.contains(where: { $0.board == board && ($0.type == "text" && $0.text == source.text || $0.type == "image" && $0.hash == source.hash) }) else { return }
+              !items.contains(where: { $0.board == board && ($0.type == "text" && $0.text == source.text || $0.type == "image" && $0.hash == source.hash) }) else { return nil }
         var clone = source; clone.id = UUID().uuidString.lowercased(); clone.board = board
         clone.pinned = false; clone.createdAt = Date().timeIntervalSince1970 * 1000
-        if source.type == "image", let path = source.file {
-            let destination = images.appendingPathComponent(clone.id + ".png")
-            do { try FileManager.default.copyItem(atPath: path, toPath: destination.path); clone.file = destination.path }
-            catch { report(error); return }
-            for suffix in [".thumb", ".thumbnail.png"] {
-                if FileManager.default.fileExists(atPath: path + suffix) {
-                    try? FileManager.default.copyItem(atPath: path + suffix, toPath: destination.path + suffix)
-                }
+        return clone
+    }
+    private nonisolated static func copyBoardImage(_ original: HistoryItem, images: URL) throws -> HistoryItem {
+        var clone = original
+        guard clone.type == "image", let path = clone.file else { return clone }
+        let destination = images.appendingPathComponent(clone.id + ".png")
+        do {
+            try FileManager.default.copyItem(atPath: path, toPath: destination.path)
+            clone.file = destination.path
+            for suffix in [".thumb", ".thumbnail.png"] where FileManager.default.fileExists(atPath: path + suffix) {
+                try? FileManager.default.copyItem(atPath: path + suffix, toPath: destination.path + suffix)
             }
+            return clone
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
+            throw error
         }
-        items.insert(clone, at: 0); changed()
+    }
+    func addToBoard(id: String, board: String) {
+        guard let clone = boardClone(id: id, board: board) else { return }
+        do { items.insert(try Self.copyBoardImage(clone, images: images), at: 0); changed() }
+        catch { report(error) }
+    }
+    func addToBoardInBackground(id: String, board: String) async {
+        let key = id + "|" + board
+        guard !boardCopies.contains(key), let clone = boardClone(id: id, board: board) else { return }
+        boardCopies.insert(key); defer { boardCopies.remove(key) }
+        let imageDirectory = images
+        do {
+            let copied = try await Task.detached(priority: .utility) {
+                try Self.copyBoardImage(clone, images: imageDirectory)
+            }.value
+            guard !Task.isCancelled, boards.contains(board), let source = item(id: id),
+                  source.file == clone.file, source.hash == clone.hash,
+                  !items.contains(where: { $0.board == board && ($0.type == "text" && $0.text == clone.text || $0.type == "image" && $0.hash == clone.hash) }) else {
+                if copied.type == "image", let path = copied.file {
+                    queue.async { for suffix in ["", ".thumb", ".thumbnail.png"] { try? FileManager.default.removeItem(atPath: path + suffix) } }
+                }
+                return
+            }
+            items.insert(copied, at: 0); changed()
+        } catch { report(error) }
     }
     func updateMetadata(id: String, tags: [String], note: String) {
         guard mayWrite(), let index = items.firstIndex(where: { $0.id == id }) else { return }

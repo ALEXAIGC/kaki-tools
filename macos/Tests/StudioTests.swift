@@ -34,6 +34,7 @@ private func studioLoginStep(delay: UInt64 = 0) -> StudioStubStep {
     StudioStubStep(path: "/api/auth/login", headers: ["Content-Type": "application/json", "Set-Cookie": "kaki_session=test-session-a; Max-Age=604800; Path=/; HttpOnly; Secure; SameSite=Lax"], json: "{\"user\":" + studioUserJSON + "}", delay: delay)
 }
 @MainActor func runStudioTests() async throws {
+    try await runStudioLocalSessionTests()
     try runNativeQAProfileTests()
     try runStudioReferenceSelectionTests()
     try await runStudioExportTests()
@@ -162,12 +163,12 @@ private func studioLoginStep(delay: UInt64 = 0) -> StudioStubStep {
     let identity = "com.openclaw.kakitools.qa.contract"
     let qa = root.appendingPathComponent("qa", isDirectory: true)
     let profile = try NativeQAProfile.resolve(arguments: ["Kaki Tools", "--qa-data-dir", qa.path], bundleIdentifier: identity, productionDirectory: production)!
-    try check(profile.directory.path == qa.resolvingSymlinksInPath().path && profile.keychainService.hasPrefix(StudioKeychain.defaultService + ".qa."), "live QA has independent data and credential namespace")
-    try check(StudioKeychain().service == StudioKeychain.defaultService && StudioKeychain(service: profile.keychainService).service != StudioKeychain().service, "default keychain service is unchanged; QA never selects installed session service")
+    try check(profile.directory.path == qa.resolvingSymlinksInPath().path && profile.sessionNamespace.hasPrefix(StudioLocalCredentials.defaultNamespace + ".qa."), "live QA has independent data and credential namespace")
+    try check(StudioLocalCredentials(directory: production).directory != StudioLocalCredentials(directory: qa, namespace: profile.sessionNamespace).directory, "QA and installed local sessions use separate directories")
     let normal = try NativeQAProfile.resolve(arguments: ["Kaki Tools"], bundleIdentifier: "com.openclaw.kakitools", productionDirectory: production)
     try check(normal == nil, "installed startup stays unchanged without QA flags")
     let plistProfile = try NativeQAProfile.resolve(arguments: ["Kaki Tools QA"], bundleIdentifier: identity, productionDirectory: production, bundleDataDirectory: qa.path)!
-    try check(plistProfile.directory == profile.directory && plistProfile.keychainService == profile.keychainService, "signed QA bundle directory uses identical validated isolation")
+    try check(plistProfile.directory == profile.directory && plistProfile.sessionNamespace == profile.sessionNamespace, "signed QA bundle directory uses identical validated isolation")
     let normalWithQAField = try NativeQAProfile.resolve(arguments: ["Kaki Tools"], bundleIdentifier: "com.openclaw.kakitools", productionDirectory: production, bundleDataDirectory: qa.path)
     try check(normalWithQAField == nil, "installed bundle ignores QA Info.plist field")
     let explicitProfile = try NativeQAProfile.resolve(arguments: ["Kaki Tools QA", "--qa-data-dir", qa.path], bundleIdentifier: identity, productionDirectory: production, bundleDataDirectory: production.path)!
@@ -193,9 +194,9 @@ private func studioLoginStep(delay: UInt64 = 0) -> StudioStubStep {
     do { _ = try NativeQAProfile.resolve(arguments: ["Kaki Tools", "--qa-data-dir", link.path], bundleIdentifier: identity, productionDirectory: production); throw NativeTestFailure(description: "production symlink accepted") }
     catch let error as NSError { try check(error.domain == "KakiToolsQA", "production symlink cannot bypass independent profile") }
     let other = try NativeQAProfile.resolve(arguments: ["Kaki Tools", "--qa-data-dir", root.appendingPathComponent("qa-other").path], bundleIdentifier: identity, productionDirectory: production)!
-    try check(other.keychainService != profile.keychainService, "separate QA profiles never share persisted login service")
+    try check(other.sessionNamespace != profile.sessionNamespace, "separate QA profiles never share persisted login service")
     try fm.createDirectory(at: qa, withIntermediateDirectories: true)
-    let app = AppController(directory: profile.directory, testMode: false, qaProfile: profile, studioTransport: StudioStubTransport([]), dreaminaRunner: DreaminaUnavailableRunner(), accessibilityPermissionCheck: { _ in false }, screenCapturePermissionCheck: { _ in false })
+    let app = AppController(directory: profile.directory, testMode: false, qaProfile: profile, studioTransport: StudioStubTransport([]), accessibilityPermissionCheck: { _ in false }, screenCapturePermissionCheck: { _ in false })
     try check(!app.testMode && app.qaProfile?.directory == profile.directory && app.store.directory == profile.directory, "live QA keeps real CLI execution mode and isolated history instead of native-test mode")
     let original = try Data(contentsOf: sentinel)
     try check(original == Data("existing user data".utf8), "QA construction does not read or replace installed history")
@@ -481,4 +482,55 @@ private func studioLoginStep(delay: UInt64 = 0) -> StudioStubStep {
     try await Task.sleep(nanoseconds: 140_000_000)
     let cancelledNames = try fm.contentsOfDirectory(atPath: emptyOutput.path)
     try check(!late.mediaBusy && cancelledNames.isEmpty, "logout cancels batch before late response can write any file")
+}
+
+@MainActor private func runStudioLocalSessionTests() async throws {
+    let fm = FileManager.default, root = fm.temporaryDirectory.appendingPathComponent("studio-local-session-" + UUID().uuidString)
+    try fm.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: root) }
+    let store = StudioLocalCredentials(directory: root)
+    let missing = try store.read(environment: .test)
+    try check(missing == nil, "missing local session is logged out without accessing keychain")
+    let session = StudioSession(value: "synthetic-local-session", expiresAt: Date().addingTimeInterval(600))
+    try store.write(session, environment: .test)
+    let file = store.directory.appendingPathComponent("test.json")
+    let object = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as! [String: Any]
+    try check(Set(object.keys) == Set(["value", "expiresAt"]), "only the session and expiry are saved, never password or account fields")
+    let folderMode = try fm.attributesOfItem(atPath: store.directory.path)[.posixPermissions] as! NSNumber
+    let fileMode = try fm.attributesOfItem(atPath: file.path)[.posixPermissions] as! NSNumber
+    try check(folderMode.intValue == 0o700 && fileMode.intValue == 0o600, "session directory and file are owner-only")
+    let restarted = StudioLocalCredentials(directory: root)
+    let savedTest = try restarted.read(environment: .test), missingProduction = try restarted.read(environment: .production)
+    try check(savedTest?.value == session.value && missingProduction == nil, "restarted credential store restores only the matching environment")
+    let transport = StudioStubTransport([StudioStubStep(path: "/api/me", json: studioUserJSON), StudioStubStep(path: "/api/workspaces", json: "[]")])
+    let appStore = StudioStore(directory: root, transport: transport)
+    await appStore.restoreSession()
+    try check(appStore.user?.id == "user-a", "default local credentials restore identity only after server verification")
+    let requests = await transport.requests
+    try check(requests.first?.value(forHTTPHeaderField: "Cookie") == "kaki_session=" + session.value, "restoration sends the saved session only to Studio")
+    appStore.shutdown()
+    try store.write(session, environment: .production)
+    try store.remove(environment: .test)
+    let removedTest = try restarted.read(environment: .test), keptProduction = try restarted.read(environment: .production)
+    try check(removedTest == nil && keptProduction?.value == session.value, "logout removes the selected environment without signing out the other")
+    try store.write(session, environment: .test)
+    try JSONEncoder().encode(StudioSession(value: "expired", expiresAt: Date().addingTimeInterval(-60))).write(to: file)
+    let expired = try restarted.read(environment: .test)
+    try check(expired == nil && !fm.fileExists(atPath: file.path), "expired local sessions are removed instead of restoring login")
+    try Data("not a session".utf8).write(to: file)
+    do { _ = try store.read(environment: .test); throw NativeTestFailure(description: "corrupt session accepted") } catch StudioError.credentials { try check(true, "corrupt session fails closed") }
+    try Data(repeating: 0, count: 16_385).write(to: file)
+    do { _ = try store.read(environment: .test); throw NativeTestFailure(description: "oversized session accepted") } catch StudioError.credentials { try check(true, "session reads have a strict size limit") }
+    try fm.removeItem(at: file)
+    let outside = root.appendingPathComponent("unrelated-data")
+    try Data("preserve unrelated file".utf8).write(to: outside)
+    try fm.createSymbolicLink(at: file, withDestinationURL: outside)
+    do { _ = try store.read(environment: .test); throw NativeTestFailure(description: "symlink session accepted") } catch StudioError.credentials { try check(true, "session reads reject symlinks") }
+    do { try store.write(session, environment: .test); throw NativeTestFailure(description: "symlink overwritten") } catch StudioError.credentials { try check(true, "session writes reject symlink targets") }
+    try store.remove(environment: .test)
+    let unrelated = try Data(contentsOf: outside)
+    try check(unrelated == Data("preserve unrelated file".utf8), "session cleanup cannot delete a symlink destination")
+    let linked = StudioLocalCredentials(directory: root, namespace: "linked")
+    try fm.createSymbolicLink(at: linked.directory, withDestinationURL: root)
+    do { try linked.write(session, environment: .test); throw NativeTestFailure(description: "symlink folder accepted") } catch StudioError.credentials { try check(true, "credential directories cannot redirect outside their own folder") }
 }

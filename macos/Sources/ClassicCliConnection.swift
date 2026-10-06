@@ -50,9 +50,12 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
 }
 
 @MainActor final class ClassicCliConnection: ObservableObject {
+    @Published private(set) var actionTitle = "检查连接"
     @Published private(set) var status = "未连接"
     @Published private(set) var connected = false
     @Published private(set) var busy = false
+    @Published private(set) var loggedIn = false
+    @Published private(set) var loginChecked = false
     @Published private(set) var installed = false
     @Published private(set) var version = ""
     @Published private(set) var needsUpgrade = false
@@ -69,6 +72,9 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
     private var loop: Task<Void, Never>?
     private var heartbeat: ClassicCliHeartbeat?
     private var operation: Task<Void, Never>?
+    private var restoreTask: Task<Void, Never>?
+    private var restoreAttempts = 0
+    private let restoreRetryNanoseconds: UInt64
     private var bridge: ClassicStudioBridge?
     private var generation = UUID()
     private var operationID=UUID()
@@ -76,9 +82,10 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
     private let inspector: @Sendable (URL) async throws -> ClassicCliInstallation
     private let runnerFactory: @Sendable (URL) -> DreaminaRunning
     private let detectionTimeout:TimeInterval
-    private struct Authorization: Codable { let owner: String; let fingerprint: String; let device: ClassicCliDevice; var profile: String? = nil }
-    init(studio: StudioStore, directory: URL, enabled: Bool, locator: @escaping @Sendable () -> URL? = {ClassicDreaminaCLI.locate()}, inspector: @escaping @Sendable (URL) async throws -> ClassicCliInstallation = {try await ClassicCliInstaller.inspect($0)}, runnerFactory: @escaping @Sendable (URL) -> DreaminaRunning = {DreaminaProcessRunner(executable:$0)}, detectionTimeout:TimeInterval = 30,loginTimeout:TimeInterval = 180,pollInterval:UInt64 = 2_000_000_000,openAuthorization:@escaping @MainActor (URL)->Bool = {NSWorkspace.shared.open($0)}) {
+    private struct Authorization: Codable { let owner: String; let fingerprint: String; let device: ClassicCliDevice; var profile: String? = nil; var autoResume: Bool? = nil }
+    init(studio: StudioStore, directory: URL, enabled: Bool, locator: @escaping @Sendable () -> URL? = {ClassicDreaminaCLI.locate()}, inspector: @escaping @Sendable (URL) async throws -> ClassicCliInstallation = {try await ClassicCliInstaller.inspect($0)}, runnerFactory: @escaping @Sendable (URL) -> DreaminaRunning = {DreaminaProcessRunner(executable:$0)}, detectionTimeout:TimeInterval = 30,loginTimeout:TimeInterval = 180,pollInterval:UInt64 = 2_000_000_000,restoreRetryNanoseconds: UInt64 = 30_000_000_000,openAuthorization:@escaping @MainActor (URL)->Bool = {NSWorkspace.shared.open($0)}) {
         self.studio=studio;self.directory=directory.appendingPathComponent("classic-cli",isDirectory:true);self.enabled=enabled
+        self.restoreRetryNanoseconds = max(1_000_000, min(120_000_000_000, restoreRetryNanoseconds))
         self.locator=locator;self.inspector=inspector;self.runnerFactory=runnerFactory;self.detectionTimeout=detectionTimeout;self.loginTimeout=loginTimeout;self.pollInterval=pollInterval;self.openAuthorization=openAuthorization;self.installed=locator() != nil
     }
     func cancelOperation() {clearAuthorization();operationID=UUID();operation?.cancel();operation=nil;busy=false;status="操作已取消，请重试"}
@@ -92,9 +99,12 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
         let site = studio.environment.siteLabel + " · " + (studio.environment.baseURL.host ?? "")
         return (connected ? "已关联：" : "当前站点：") + site
     }
+    var hasStudioAccount: Bool { owner != nil }
+    var targetSiteName: String { studio?.environment.siteLabel ?? "Studio" }
     var targetWorkspaceName: String { studio?.workspaceName ?? "未选择工作区" }
     var targetDescription: String { targetSiteDescription + "\n工作区：" + targetWorkspaceName }
     func identityChanged() {
+        restoreTask?.cancel(); restoreTask = nil
         clearAuthorization()
         generation = UUID(); loop?.cancel(); heartbeat?.stop(); operation?.cancel(); loop = nil; heartbeat = nil; operation = nil
         let previous = bridge; bridge = nil; connected = false; busy = false; status = "站点、账号或工作区已变更，请重新连接"
@@ -110,12 +120,17 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
     }
     func detect() {
         guard !busy else {return}
-        guard let executable = locator() else {installed = false; status = "未安装即梦 CLI"; return}
-        busy = true; status = "检查 CLI 与五种视频方式…"
+        guard let executable = locator() else {installed = false; loggedIn = false; loginChecked = false; needsUpgrade = false; version = ""; status = "未安装即梦 CLI"; return}
+        busy = true; actionTitle = "检查连接"; loginChecked = false; status = "检查 CLI 与五种视频方式…"
         let ticket = generation, op=UUID();operationID=op
         operation = Task { [weak self] in
             guard let self else {return}
-            defer {if self.generation == ticket && self.operationID == op {self.busy = false}}
+            defer {
+                if self.generation == ticket && self.operationID == op {
+                    self.busy = false
+                    if self.loggedIn && !self.connected { self.restoreRememberedConnection() }
+                }
+            }
             do {
                 let checked = try await classicCliDeadline(seconds:self.detectionTimeout) {
                     let receipt=try await self.inspector(executable)
@@ -130,6 +145,7 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
                 let object = try? JSONSerialization.jsonObject(with: Data(receipt.version.utf8)) as? [String: Any]
                 self.version = (object?["version"] as? String) ?? receipt.version.prefix(100).description
                 let loggedIn=checked.1
+                self.loggedIn = loggedIn; self.loginChecked = true
                 guard self.generation == ticket && self.operationID == op else {return}
                 self.status = self.connected ? "已连接 · 使用本机即梦登录" : loggedIn ? "已安装 · 即梦已登录 · 未连接" : "已安装 · 请登录即梦"
             } catch ClassicCliUpgradeError.required {if self.generation == ticket && self.operationID == op {self.installed=true;self.needsUpgrade=true;self.status="请更新即梦 CLI 以使用五种视频方式"}} catch {if self.generation == ticket && self.operationID == op {self.status = "CLI 检测失败或超时，请重试；登录状态尚未确认"}}
@@ -138,7 +154,7 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
     func install() {
         guard !busy else {return}
         if locator() != nil {detect(); return}
-        busy = true; status = "正在下载安装即梦 CLI…"
+        busy = true; actionTitle = "安装即梦 CLI"; status = "正在下载安装即梦 CLI…"
         let ticket = generation, op=UUID();operationID=op
         operation = Task { [weak self] in
             guard let self else {return}
@@ -146,7 +162,7 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
             do {
                 let receipt = try await ClassicCliInstaller().install(canReplace:{[self] in await self.canUpgrade(ticket,op:op)})
                 guard self.generation == ticket && self.operationID == op else {return}
-                self.installed = true; self.needsUpgrade = false
+                self.installed = true; self.needsUpgrade = false; self.loginChecked = false
                 self.version = receipt.version.prefix(100).description
                 self.status = "已安装 · 请登录即梦后连接"
             } catch {if self.generation == ticket && self.operationID == op {self.status = "安装失败，可重新检测或重试安装"}}
@@ -154,7 +170,7 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
     }
     func upgrade() {
         guard !busy, !claimed, !connected, let executable=locator() else {status="请先断开连接并等待本机任务结束";return}
-        busy=true;status="正在验证并更新即梦 CLI…"
+        busy=true;actionTitle="更新即梦 CLI";status="正在验证并更新即梦 CLI…"
         let ticket=generation, op=UUID();operationID=op
         operation=Task { [weak self] in
             guard let self else {return}
@@ -165,7 +181,7 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
                     return await self.executor?.isIdle() ?? true
                 })
                 guard self.generation == ticket && self.operationID == op else {return}
-                self.installed=true;self.needsUpgrade=false;self.version=""
+                self.installed=true;self.needsUpgrade=false;self.loginChecked=false;self.version=""
                 self.status="CLI 已更新，请重新检测、登录并关联工作区"
             } catch {if self.generation == ticket && self.operationID == op {self.status="CLI 更新未完成，原登录与任务记录保留"}}
         }
@@ -187,7 +203,7 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
     }
     func login() {
         guard !busy,!needsUpgrade,let executable=locator() else {return}
-        busy=true;clearAuthorization();status="检查即梦登录…"
+        busy=true;actionTitle="登录即梦";clearAuthorization();status="检查即梦登录…"
         let ticket=generation,op=UUID();operationID=op
         operation=Task { [weak self] in
             guard let self else {return}
@@ -208,13 +224,38 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
                     }
                 }
                 guard self.generation == ticket && self.operationID == op else {return}
+                self.loggedIn = true; self.loginChecked = true
                 self.status="即梦已登录 · 可连接当前 Studio 工作区"
             } catch {if self.generation == ticket && self.operationID == op {self.status="即梦登录取消、超时或未完成，请重试"}}
         }
     }
-    func connect() {
-        guard enabled, !busy, let studio, let owner, let context = studio.classicCliContext(), let executable = locator() else { status = "请先登录 Studio，并安装经典即梦 CLI"; return }
-        busy = true; status = "检查本机登录…"
+    // Restore only a previously approved device. Never register or open OAuth silently.
+    func restoreRememberedConnection() {
+        guard enabled else { return }
+        restoreTask?.cancel()
+        restoreTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 300_000_000) } catch { return }
+            guard let self, !Task.isCancelled, !self.busy, !self.connected,
+                  let owner = self.owner, let file = try? self.location(owner),
+                  let data = try? Data(contentsOf: file),
+                  let saved = try? JSONDecoder().decode(Authorization.self, from: data),
+                  saved.owner == owner, saved.autoResume != false else { return }
+            self.connect(automatically: true)
+        }
+    }
+    private func retryRememberedConnection(ticket: UUID) {
+        restoreTask?.cancel()
+        restoreAttempts = min(restoreAttempts + 1, 4)
+        let delay = min(120_000_000_000, restoreRetryNanoseconds * UInt64(1 << (restoreAttempts - 1)))
+        restoreTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: delay) } catch { return }
+            guard let self, !Task.isCancelled, self.generation == ticket else { return }
+            self.restoreRememberedConnection()
+        }
+    }
+    func connect(automatically: Bool = false) {
+        guard enabled, !busy, let studio, let owner, let context = studio.classicCliContext(), let executable = locator() else { status = "请先登录 Studio，并安装即梦 CLI"; return }
+        busy = true; actionTitle = automatically ? "恢复连接" : "连接 Studio"; status = "检查本机登录…"
         let ticket = generation, op=UUID();operationID=op
         operation = Task { [weak self] in
             guard let self else { return }
@@ -223,10 +264,12 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
                 let fingerprint = try await Task.detached { try ClassicDreaminaCLI.fingerprint(executable) }.value
                 let cli = ClassicDreaminaCLI(runner: self.runnerFactory(executable))
                 let models = try await classicCliDeadline(seconds:self.detectionTimeout) {try await cli.verify()}
+                self.loggedIn = true; self.loginChecked = true
                 let profile = "resolution-five"
                 guard self.owner == owner, self.generation == ticket && self.operationID == op && !Task.isCancelled else { return }
                 let file = try self.location(owner)
-                let saved = try? JSONDecoder().decode(Authorization.self, from: Data(contentsOf: file))
+                var saved = try? JSONDecoder().decode(Authorization.self, from: Data(contentsOf: file))
+                if automatically && (saved?.owner != owner || saved?.autoResume == false) { return }
                 let current: @Sendable () async -> Bool = { [self] in
                     guard await self.matches(owner: owner, ticket: ticket) else { return false }
                     return (try? await Task.detached { try ClassicDreaminaCLI.fingerprint(executable) }.value) == fingerprint
@@ -234,12 +277,24 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
                 var candidate: ClassicStudioBridge?
                 if let saved, saved.owner == owner, saved.fingerprint == fingerprint, saved.profile == profile {
                     let restored = ClassicStudioBridge(client: context.client, session: context.session, workspace: context.workspace, device: saved.device, current: current)
-                    do {try Task.checkCancellation(); _ = try await restored.client.json(restored.request("devices/resume")); candidate = restored } catch { /* explicit consent required before replacement */ }
+                    do {
+                        try Task.checkCancellation()
+                        _ = try await restored.client.json(restored.request("devices/resume"))
+                        candidate = restored
+                    } catch {
+                        guard !Task.isCancelled, self.generation == ticket else { return }
+                        if automatically {
+                            if error is URLError { throw error }
+                            if case StudioError.http(let status, _) = error, status >= 500 { throw error }
+                        }
+                        // A revoked association requires explicit confirmation; never register a replacement automatically.
+                    }
                 }
                 guard self.owner == owner, self.generation == ticket && self.operationID == op && !Task.isCancelled else { return }
                 if candidate == nil {
+                    guard !automatically else { self.status = "已保留即梦登录，请手动确认 Studio 连接"; return }
                     let alert = NSAlert(); alert.messageText = "关联本机即梦登录？"
-                    alert.informativeText = "使用本机即梦登录，经典 CLI 无法核验即梦账号 ID。关联当前 Studio 账号与工作区；画布点击生成后由本机直接执行，使用本人即梦额度。"
+                    alert.informativeText = "使用本机即梦登录，常规 CLI 不核验即梦账号 ID。关联当前 Studio 账号与工作区；画布点击生成后由本机直接执行，使用本人即梦额度。"
                     alert.addButton(withTitle: "关联"); alert.addButton(withTitle: "取消")
                     guard alert.runModal() == .alertFirstButtonReturn else { self.status = "未连接"; return }
                     guard await current(),self.operationID == op,!Task.isCancelled else { return }
@@ -250,27 +305,41 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
                     let authorization = Authorization(owner: owner, fingerprint: fingerprint, device: device, profile: profile)
                     try JSONEncoder().encode(authorization).write(to: file, options: .atomic)
                     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+                    saved = authorization
                     candidate = ClassicStudioBridge(client: context.client, session: context.session, workspace: context.workspace, device: device, current: current)
                 }
                 guard let candidate, await current(),self.operationID == op,!Task.isCancelled else { return }
-                self.bridge = candidate; self.connected = true; self.status = "已连接 · 使用本机即梦登录"
-                self.start(cli: cli, executable: executable, fingerprint: fingerprint, bridge: candidate, owner: owner, ticket: ticket)
-            } catch ClassicCliUpgradeError.required {if self.generation == ticket && self.operationID == op && !Task.isCancelled {self.needsUpgrade=true;self.status="请更新即梦 CLI 后重新关联"}} catch { if self.generation == ticket && self.operationID == op && !Task.isCancelled { self.status = "连接失败，请检查 Studio 与本机即梦登录" } }
+                if var remembered = saved {
+                    remembered.autoResume = true
+                    try JSONEncoder().encode(remembered).write(to: file, options: .atomic)
+                    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+                    saved = remembered
+                }
+                self.restoreAttempts = 0
+                self.bridge = candidate; self.loggedIn = true; self.loginChecked = true; self.connected = true; self.status = "已连接 · 使用本机即梦登录"
+                self.start(cli: cli, executable: executable, bridge: candidate, owner: owner, ticket: ticket)
+            } catch DreaminaError.notLinked {if self.generation == ticket && self.operationID == op && !Task.isCancelled {self.loggedIn=false;self.loginChecked=true;self.status="请先登录即梦"}} catch ClassicCliUpgradeError.required {if self.generation == ticket && self.operationID == op && !Task.isCancelled {self.needsUpgrade=true;self.status="请更新即梦 CLI 后重新关联"}} catch {
+                if self.generation == ticket && self.operationID == op && !Task.isCancelled {
+                    self.status = automatically ? "连接暂未恢复，稍后自动重试" : "连接失败，请检查 Studio 与本机即梦登录"
+                    if automatically { self.retryRememberedConnection(ticket: ticket) }
+                }
+            }
         }
     }
-    private func start(cli: ClassicDreaminaCLI, executable: URL, fingerprint: String, bridge: ClassicStudioBridge, owner: String, ticket: UUID) {
+    private func start(cli: ClassicDreaminaCLI, executable: URL, bridge: ClassicStudioBridge, owner: String, ticket: UUID) {
         loop?.cancel(); heartbeat?.stop()
         // Keep presence alive independently of confirmation, submission, and slow result downloads.
         // The copied bridge binds the original session/workspace; identityChanged cancels this task.
+        let identity = try? ClassicDreaminaCLI.fileIdentity(executable)
         heartbeat = ClassicCliHeartbeat { _ = try await bridge.client.json(bridge.request("devices/heartbeat")) }
         let executor = ClassicCliExecutor(cli: cli, directory: directory.appendingPathComponent("journal", isDirectory: true)); self.executor=executor
         loop = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self, self.owner == owner, self.generation == ticket else { return }
                 do {
-                    let actual = try await Task.detached { try ClassicDreaminaCLI.fingerprint(executable) }.value
-                    guard actual == fingerprint else { self.identityChanged(); self.status = "CLI 已变化，请重新关联"; return }
-                    _ = try await bridge.client.json(bridge.request("devices/heartbeat"))
+                    guard let identity, (try? ClassicDreaminaCLI.fileIdentity(executable)) == identity else {
+                        self.identityChanged(); self.status = "CLI 已变化，请重新关联"; return
+                    }
                     let (data, _) = try await bridge.client.json(bridge.request("devices/claim"))
                     struct Claim: Decodable { let task: ClassicVideoTask? }
                     if let task = try JSONDecoder().decode(Claim.self, from: data).task {
@@ -296,8 +365,20 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
         guard !tracks.isEmpty, duration.seconds.isFinite, duration.seconds > 0, try await asset.load(.isPlayable) else { throw DreaminaError.invalidResponse }
     }
     private func matches(owner: String, ticket: UUID) -> Bool { self.owner == owner && self.generation == ticket }
-    func disconnect() { identityChanged(); status = "未连接" }
-    func shutdown() { generation = UUID(); loop?.cancel(); heartbeat?.stop(); operation?.cancel() }
+    func disconnect() {
+        // Persist explicit disconnection so a restart cannot undo the user's choice.
+        if let owner, let file = try? location(owner) {
+            do {
+                if let data = try? Data(contentsOf: file), var saved = try? JSONDecoder().decode(Authorization.self, from: data) {
+                    saved.autoResume = false
+                    try JSONEncoder().encode(saved).write(to: file, options: .atomic)
+                    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+                }
+            } catch { status = "断开状态保存失败，请重试"; return }
+        }
+        identityChanged(); status = "未连接"
+    }
+    func shutdown() { restoreTask?.cancel(); generation = UUID(); loop?.cancel(); heartbeat?.stop(); operation?.cancel() }
 }
 
 // Review only the values used by the frozen CLI argv; never expose internal node IDs.

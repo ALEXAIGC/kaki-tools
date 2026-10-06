@@ -280,7 +280,7 @@ private struct ClipboardMetrics {
             if controller.visibleItems.isEmpty {
                 VStack(spacing: 9) {
                     Image(systemName: controller.query.isEmpty ? "clipboard" : "magnifyingglass").font(.system(size: 28, weight: .light)).foregroundColor(palette.faint)
-                    Text(controller.query.isEmpty ? "还没有剪贴板记录" : "没有找到匹配内容").font(.system(size: 13, weight: .medium)).foregroundColor(palette.muted)
+                    Text(store.loading ? "正在加载历史…" : controller.query.isEmpty ? "还没有剪贴板记录" : "没有找到匹配内容").font(.system(size: 13, weight: .medium)).foregroundColor(palette.muted)
                     Text(store.isReadOnly ? (store.lastError ?? "原历史文件已保留，当前只读。") : controller.query.isEmpty ? "复制文本或图片后会自动出现在这里" : "试试其他内容、标签或备注")
                         .font(.system(size: 12)).foregroundColor(store.isReadOnly ? palette.accent : palette.subtle)
                 }.frame(width: area.size.width, height: area.size.height)
@@ -408,7 +408,7 @@ private struct ClipboardMetrics {
             if item.board == nil { Button(item.pinned ? "取消固定" : "固定") { store.togglePin(id: item.id) } }
             Button("标签与备注…") { controller.editMetadata(item.id) }
             Menu("添加到收藏") {
-                ForEach(store.boards, id: \.self) { board in Button(board) { store.addToBoard(id: item.id, board: board) } }
+                ForEach(store.boards, id: \.self) { board in Button(board) { Task { await store.addToBoardInBackground(id: item.id, board: board) } } }
                 if store.boards.isEmpty { Text("请先新建收藏") }
             }
             Divider()

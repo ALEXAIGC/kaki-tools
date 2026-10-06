@@ -27,66 +27,59 @@ import AVKit
             .onDisappear { password = ""; code = "" }
     }
     private var form: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(spacing: 18) {
             HStack {
-                Text("连接环境").font(.system(size: 12)).foregroundStyle(.secondary)
                 Spacer()
-                Picker("连接环境", selection: Binding(get: { studio.environment }, set: { value in
+                Picker("环境", selection: Binding(get: { studio.environment }, set: { value in
                     password = ""; code = ""
                     Task { await studio.changeEnvironment(value) }
                 })) {
                     ForEach(StudioEnvironment.allCases) { Text($0.label).tag($0) }
-                }.pickerStyle(.segmented).labelsHidden().frame(width: 192).disabled(studio.busy)
+                }.pickerStyle(.menu).labelsHidden().fixedSize().disabled(studio.busy).help("切换环境")
             }
-            Divider()
             if let user = studio.user {
-                HStack(spacing: 13) {
-                    Image(systemName: "person.crop.circle.fill").font(.system(size: 40, weight: .light))
+                VStack(spacing: 9) {
+                    Image(systemName: "person.crop.circle.fill").font(.system(size: 44, weight: .light))
                         .foregroundStyle(SettingsStyle.accent.opacity(0.85))
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text(user.name ?? "Studio 用户").font(.system(size: 16, weight: .semibold)).lineLimit(1)
-                        Text(user.email).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-                    }
-                    Spacer(minLength: 0)
-                    SettingsStatus(title: "已登录", active: true)
-                }
-                HStack(spacing: 10) {
+                    Text(user.name ?? "Studio 用户").font(.system(size: 20, weight: .semibold)).lineLimit(1)
+                    Text(user.email).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                }.frame(maxWidth: .infinity).padding(.vertical, 8)
+                HStack(spacing: 12) {
                     if let openLibrary { Button("打开素材库", action: openLibrary).buttonStyle(SettingsPrimaryButtonStyle()) }
-                    Button("退出账号") { password = ""; code = ""; Task { await studio.logout() } }
-                }.controlSize(.large)
-                SettingsFootnote("已复制和下载的内容会保留。")
+                    Menu {
+                        Button("退出账号") { password = ""; code = ""; Task { await studio.logout() } }.disabled(studio.busy)
+                    } label: { Image(systemName: "ellipsis").frame(width: 28, height: 28) }
+                        .menuStyle(.borderlessButton).fixedSize().help("账号管理").accessibilityLabel("Studio 账号管理")
+                }.frame(maxWidth: .infinity).padding(.bottom, 8)
             } else {
-                VStack(alignment: .leading, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("邮箱").font(.system(size: 12)).foregroundStyle(.secondary)
-                        TextField("Studio 邮箱", text: $email).textFieldStyle(.roundedBorder).accessibilityLabel("Studio 邮箱")
-                    }
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("密码").font(.system(size: 12)).foregroundStyle(.secondary)
-                        SecureField("输入密码", text: $password).textFieldStyle(.roundedBorder).onSubmit { signIn() }
-                            .accessibilityLabel("Studio 密码")
-                    }
+                VStack(spacing: 14) {
+                    Text("登录 Studio").font(.system(size: 20, weight: .semibold))
+                    TextField("邮箱", text: $email).textFieldStyle(.roundedBorder).accessibilityLabel("Studio 邮箱")
+                    SecureField("密码", text: $password).textFieldStyle(.roundedBorder).onSubmit { signIn() }
+                        .accessibilityLabel("Studio 密码")
                     if studio.twoFactorRequired {
                         TextField("动态验证码或备用码", text: $code).textFieldStyle(.roundedBorder).onSubmit { signIn() }
+                            .accessibilityLabel("动态验证码或备用码")
                     }
                     HStack(spacing: 10) {
                         Button(studio.twoFactorRequired ? "验证并登录" : "登录 Studio", action: signIn)
                             .buttonStyle(SettingsPrimaryButtonStyle()).disabled(studio.busy || email.isEmpty || password.isEmpty)
                         if studio.busy { ProgressView().controlSize(.small) }
-                        Spacer()
+                    }.frame(maxWidth: .infinity).padding(.top, 2)
+                    HStack(spacing: 18) {
                         Button("注册") { NSWorkspace.shared.open(studio.environment.baseURL.appendingPathComponent("sign-up")) }.buttonStyle(.link)
                         Button("忘记密码") { NSWorkspace.shared.open(studio.environment.baseURL.appendingPathComponent("forgot-password")) }.buttonStyle(.link)
-                    }.padding(.top, 4)
-                }.controlSize(.large)
-                if studio.logoutCleanupPending {
-                    Button("重试退出清理") { Task { await studio.logout() } }.disabled(studio.busy)
-                } else if !studio.message.isEmpty && !studio.twoFactorRequired {
-                    Button("重试连接") { Task { await studio.retrySession() } }.disabled(studio.busy)
-                }
-                Label("登录会话由 macOS 钥匙串保管", systemImage: "lock").font(.caption).foregroundStyle(.secondary)
+                    }.font(.system(size: 12))
+                    if studio.logoutCleanupPending {
+                        Button("重试退出清理") { Task { await studio.logout() } }.disabled(studio.busy)
+                    } else if !studio.message.isEmpty && !studio.twoFactorRequired {
+                        Button("重试连接") { Task { await studio.retrySession() } }.disabled(studio.busy)
+                    }
+                }.controlSize(.large).frame(maxWidth: 340).frame(maxWidth: .infinity).padding(.bottom, 8)
             }
             if !studio.message.isEmpty {
-                SettingsFootnote(studio.message).textSelection(.enabled)
+                Text(studio.message).font(.system(size: 12)).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center).textSelection(.enabled).frame(maxWidth: .infinity)
             }
         }
     }

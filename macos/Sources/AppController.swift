@@ -8,7 +8,7 @@ import CryptoKit
 
 struct NativeQAProfile {
     let directory: URL
-    let keychainService: String
+    let sessionNamespace: String
     static func resolve(arguments: [String], bundleIdentifier: String, productionDirectory: URL, bundleDataDirectory: String? = nil) throws -> NativeQAProfile? {
         let qaBundle = bundleIdentifier.hasPrefix("com.openclaw.kakitools.qa.")
         let positions = arguments.indices.filter { arguments[$0] == "--qa-data-dir" }
@@ -27,7 +27,7 @@ struct NativeQAProfile {
             throw NSError(domain: "KakiToolsQA", code: 2, userInfo: [NSLocalizedDescriptionKey: "QA 数据目录不能使用安装版目录或其父子目录"])
         }
         let namespace = SHA256.hash(data: Data((bundleIdentifier + "|" + directory.path).utf8)).map { String(format: "%02x", $0) }.joined()
-        return NativeQAProfile(directory: directory, keychainService: StudioKeychain.defaultService + ".qa." + namespace)
+        return NativeQAProfile(directory: directory, sessionNamespace: StudioLocalCredentials.defaultNamespace + ".qa." + namespace)
     }
 }
 
@@ -40,7 +40,6 @@ struct NativeQAProfile {
     let hotkeys = HotkeyManager()
     let log: NativeLog
     let studio: StudioStore
-    let dreamina: DreaminaConnector
     let classicCli: ClassicCliConnection
     let testMode: Bool
     let qaProfile: NativeQAProfile?
@@ -65,6 +64,9 @@ struct NativeQAProfile {
     @Published private(set) var screenCaptureTrusted = false
     @Published private(set) var screenCapturePermissionRequested = false
     @Published private(set) var screenshotPermissionIssue = false
+    @Published private(set) var permissionRepairBusy = false
+    @Published private(set) var permissionRepairMessage = ""
+    private let permissionRepairRunner: PermissionRepairRunning?
     private let accessibilityPermissionCheck: (Bool) -> Bool
     private let screenCapturePermissionCheck: (Bool) -> Bool
     private let screenshotRunner: ScreenCaptureRunning?
@@ -100,6 +102,7 @@ struct NativeQAProfile {
     private let messageLifetime: TimeInterval
     private var searchGeneration = 0
     private var pasteGeneration = 0
+    private var imageActivation: Task<Void, Never>?
     private var arrangementGeneration = 0
     private var screenshotGeneration = 0
     private var lastScreenshotFailure: ScreenCaptureFailure?
@@ -108,7 +111,8 @@ struct NativeQAProfile {
     private var shuttingDown = false
     private var shortcutRecording = false
 
-    init(directory: URL, testMode: Bool, qaProfile: NativeQAProfile? = nil, messageLifetime: TimeInterval = 5, studioTransport: StudioTransport = StudioURLTransport(), dreaminaRunner: DreaminaRunning? = nil, accessibilityPermissionCheck: @escaping (Bool) -> Bool = { WindowManager.accessibilityTrusted(prompt: $0) }, screenCapturePermissionCheck: ((Bool) -> Bool)? = nil, screenshotRunner: ScreenCaptureRunning? = nil) {
+    init(directory: URL, testMode: Bool, qaProfile: NativeQAProfile? = nil, messageLifetime: TimeInterval = 5, studioTransport: StudioTransport = StudioURLTransport(), accessibilityPermissionCheck: @escaping (Bool) -> Bool = { WindowManager.accessibilityTrusted(prompt: $0) }, screenCapturePermissionCheck: ((Bool) -> Bool)? = nil, screenshotRunner: ScreenCaptureRunning? = nil, permissionRepairRunner: PermissionRepairRunning? = nil) {
+        self.permissionRepairRunner = permissionRepairRunner ?? (testMode ? nil : SystemPermissionRepairRunner())
         self.testMode = testMode
         self.qaProfile = qaProfile
         self.accessibilityPermissionCheck = accessibilityPermissionCheck
@@ -118,11 +122,10 @@ struct NativeQAProfile {
         self.screenshotRunner = screenshotRunner ?? (testMode ? nil : SystemScreenCaptureRunner())
         self.messageLifetime = messageLifetime.isFinite && messageLifetime > 0 ? messageLifetime : 5
         settings = AppSettings(directory: directory)
-        store = HistoryStore(directory: directory, limit: 100)
+        store = HistoryStore(directory: directory, limit: 100, deferredLoading: !testMode)
         clipboard = ClipboardService(store: store, pasteboard: testMode ? NSPasteboard(name: NSPasteboard.Name("kaki-native-test-" + UUID().uuidString)) : .general)
         log = NativeLog(directory: directory)
-        studio = StudioStore(directory: directory, credentials: testMode ? StudioMemoryCredentials() : StudioKeychain(service: qaProfile?.keychainService ?? StudioKeychain.defaultService), transport: studioTransport, cacheLimitMB: settings.studioCacheLimitMB, cacheDays: settings.studioCacheDays, cacheFolder: qaProfile == nil ? settings.studioCacheFolder : "", cacheVolumeUUID: qaProfile == nil ? settings.studioCacheVolumeUUID : "")
-        dreamina = DreaminaConnector(directory: directory, runner: dreaminaRunner ?? (testMode ? DreaminaUnavailableRunner() : nil))
+        studio = StudioStore(directory: directory, credentials: testMode ? StudioMemoryCredentials() : StudioLocalCredentials(directory: directory, namespace: qaProfile?.sessionNamespace ?? StudioLocalCredentials.defaultNamespace), transport: studioTransport, cacheLimitMB: settings.studioCacheLimitMB, cacheDays: settings.studioCacheDays, cacheFolder: qaProfile == nil ? settings.studioCacheFolder : "", cacheVolumeUUID: qaProfile == nil ? settings.studioCacheVolumeUUID : "")
         classicCli = ClassicCliConnection(studio: studio, directory: directory, enabled: !testMode)
         super.init()
         store.onError = { [weak self] text in self?.report(text) }
@@ -131,11 +134,9 @@ struct NativeQAProfile {
             self?.refreshItems()
             self?.pruneTextPresentations()
         }.store(in: &subscriptions)
-        studio.$user.combineLatest(studio.$environment).sink { [weak self] user, environment in
-            self?.dreamina.setOwner(user.map { KakiConnectionOwner(environment: environment.rawValue, userID: $0.id) })
-        }.store(in: &subscriptions)
         studio.$user.combineLatest(studio.$environment, studio.$workspaceID).map { user, environment, workspace in environment.rawValue + "|" + (user?.id ?? "") + "|" + workspace }.removeDuplicates().dropFirst().sink { [weak self] _ in
             self?.classicCli.identityChanged()
+            self?.classicCli.restoreRememberedConnection()
         }.store(in: &subscriptions)
         settings.$appearance.removeDuplicates().sink { [weak self] value in
             self?.applyAppearance(value)
@@ -144,6 +145,14 @@ struct NativeQAProfile {
             self?.refreshAccessibilityPermission()
             self?.refreshScreenCapturePermission()
             self?.objectWillChange.send()
+            if let self, !self.testMode && self.qaProfile == nil {
+                Task { [weak self] in
+                    guard let self else { return }
+                    await self.studio.resumeSessionIfNeeded()
+                    guard !self.shuttingDown else { return }
+                    self.classicCli.restoreRememberedConnection()
+                }
+            }
         }.store(in: &subscriptions)
         NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification).sink { [weak self] notification in
             guard let self, let window = notification.object as? NSWindow, window === self.settingsWindow else { return }
@@ -156,6 +165,14 @@ struct NativeQAProfile {
     }
     func start() {
         studio.startCacheMaintenance()
+        if !testMode && qaProfile == nil {
+            Task { [weak self] in
+                guard let self else { return }
+                await self.studio.restoreSession()
+                guard !self.shuttingDown else { return }
+                self.classicCli.restoreRememberedConnection()
+            }
+        }
         log.write("原生应用启动 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development")")
         buildStatusItem()
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -163,9 +180,14 @@ struct NativeQAProfile {
             return self.handleKey(event) ? nil : event
         }
         if !testMode && qaProfile == nil {
-            clipboard.start(interval: settings.pollInterval)
             _ = registerShortcuts(allowFallback: true)
             if settings.showOnLaunch { showPanel() }
+            Task { [weak self] in
+                guard let self else { return }
+                await self.store.waitUntilLoaded()
+                guard !self.shuttingDown else { return }
+                self.clipboard.start(interval: self.settings.pollInterval)
+            }
         }
         if let error = settings.loadError { report(error) }
         if let error = store.lastError { report(error) }
@@ -394,6 +416,7 @@ struct NativeQAProfile {
         if settings.hideOnBlur && settingsWindow?.isKeyWindow != true { hidePanel() }
     }
     func cancelPendingClipboardActions() {
+        imageActivation?.cancel(); imageActivation = nil
         pasteGeneration += 1
         pendingSelectionActions.removeAll()
     }
@@ -404,9 +427,37 @@ struct NativeQAProfile {
         }
         if store.isPending(id: id) { report("图片正在后台处理，完成后即可使用。"); return }
         guard visibleItems.contains(where: { $0.id == id }), let item = store.item(id: id) else { return }
-        let target = panelTarget, frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let target = panelTarget
+        if item.type == "image", let path = item.file {
+            imageActivation?.cancel(); pasteGeneration += 1
+            let ticket = pasteGeneration, clipboardCount = clipboard.changeCount
+            imageActivation = Task { [weak self] in
+                let data = await Task.detached(priority: .userInitiated) { () -> Data? in
+                    let file = URL(fileURLWithPath: path)
+                    guard let bytes = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+                          bytes > 0, bytes <= ImageCodec.maximumBytes else { return nil }
+                    return try? Data(contentsOf: file)
+                }.value
+                guard let self, !Task.isCancelled, !self.shuttingDown, self.pasteGeneration == ticket,
+                      self.clipboard.changeCount == clipboardCount,
+                      let current = self.store.item(id: id), current.file == item.file, current.hash == item.hash,
+                      self.visibleItems.contains(where: { $0.id == id }) else { return }
+                guard let data else { self.report("复制失败，原历史已保留。"); return }
+                self.finishActivation(item, plainText: plainText, copyOnly: copyOnly, target: target, imageData: data)
+            }
+            return
+        }
+        cancelPendingClipboardActions()
+        finishActivation(item, plainText: plainText, copyOnly: copyOnly, target: target)
+    }
+    private func finishActivation(_ item: HistoryItem, plainText: Bool, copyOnly: Bool,
+                                  target: NSRunningApplication?, imageData: Data? = nil) {
+        let id = item.id, frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
         let eligible = frontPID == target?.processIdentifier || frontPID == ProcessInfo.processInfo.processIdentifier
-        guard let count = clipboard.write(item: item, plainText: plainText) else { report("复制失败，原历史已保留。"); return }
+        let written: Int?
+        if let imageData { written = clipboard.writeImage(imageData) }
+        else { written = clipboard.write(item: item, plainText: plainText) }
+        guard let count = written else { report("复制失败，原历史已保留。"); return }
         store.touch(id: id)
         hidePanel()
         guard !testMode, settings.autoPaste, !copyOnly, eligible, let target, !target.isTerminated else { return }
@@ -503,6 +554,7 @@ struct NativeQAProfile {
         else if action.hasPrefix("window:") { arrangeWindow(String(action.dropFirst(7))) }
     }
     func arrangeWindow(_ key: String) {
+        guard !shuttingDown, !permissionRepairBusy else { return }
         arrangementGeneration += 1; let generation = arrangementGeneration
         windows.cancel()
         let front = NSWorkspace.shared.frontmostApplication
@@ -512,6 +564,12 @@ struct NativeQAProfile {
                 report("请先选择要调整的窗口。"); return
             }
             _ = arrangeLocalWindow(window, key: key)
+            return
+        }
+        refreshAccessibilityPermission()
+        guard accessibilityTrusted else {
+            showSettings(section: "about")
+            report("窗口调整未获得辅助功能授权。开关已开启仍无法使用时，请点击「修复辅助功能」。")
             return
         }
         let target = frontPID == ProcessInfo.processInfo.processIdentifier ? previousApp : front
@@ -733,7 +791,7 @@ struct NativeQAProfile {
         if notification.object as? NSWindow === studioWindow { studio.setLibraryActive(false) }
     }
     func takeScreenshot(retryPermissionFailure: Bool = false) {
-        guard !shuttingDown, !screenshotBusy, let screenshotRunner else { return }
+        guard !shuttingDown, !permissionRepairBusy, !screenshotBusy, let screenshotRunner else { return }
         refreshScreenCapturePermission()
         // Preflight alone can lag a changed grant. Only an actual denial suppresses
         // automatic retries; an explicit settings action can still try the tool.
@@ -800,11 +858,52 @@ struct NativeQAProfile {
     func clearHistory() {
         if confirm("清空普通历史？", detail: "包括固定项；收藏中的独立副本会保留。") { store.clearHistory() }
     }
+    func repairPermission(_ permission: RepairPermission) {
+        guard !shuttingDown, !permissionRepairBusy, !screenshotBusy else { return }
+        guard confirm("修复\(permission.title)权限？", detail: "仅移除 Kaki Tools 的这项旧授权；随后需要在系统设置中重新允许。其他应用权限、账号和历史不变。") else { return }
+        Task { await performPermissionRepair(permission) }
+    }
+    // Called only after the user's explicit confirmation; injectable for isolated tests.
+    func performPermissionRepair(_ permission: RepairPermission) async {
+        guard !shuttingDown, !permissionRepairBusy, !screenshotBusy, let runner = permissionRepairRunner else { return }
+        guard qaProfile == nil else {
+            report("QA 版本不能重置安装版的权限，请在正式 Kaki Tools 中修复。")
+            return
+        }
+        guard testMode || Bundle.main.bundleIdentifier == "com.openclaw.kakitools" else {
+            report("请从应用程序打开正式的 Kaki Tools 后修复权限。")
+            return
+        }
+        permissionRepairBusy = true
+        defer { permissionRepairBusy = false }
+        permissionRepairMessage = "正在修复\(permission.title)权限…"
+        windows.cancel(); arrangementGeneration += 1
+        let success = await runner.reset(permission)
+        guard !shuttingDown else { return }
+        guard success else {
+            permissionRepairMessage = "修复未完成，请在系统设置中移除 Kaki Tools 后重新添加。"
+            log.write("权限修复未完成：\(permission.rawValue)")
+            return
+        }
+        if permission == .accessibility { refreshAccessibilityPermission() }
+        else {
+            screenCapturePermissionRequested = false
+            screenshotPermissionIssue = false
+            refreshScreenCapturePermission()
+        }
+        permissionRepairMessage = "旧授权已移除。请重新允许 Kaki Tools；完成后完全退出并重新打开。"
+        log.write("用户确认修复权限：\(permission.rawValue)")
+        if !testMode {
+            if permission == .accessibility { openAccessibilitySettings() }
+            else { openScreenCaptureSettings() }
+        }
+    }
     func refreshAccessibilityPermission() {
         let trusted = accessibilityPermissionCheck(false)
         if accessibilityTrusted != trusted { accessibilityTrusted = trusted }
     }
     func requestAccessibility() {
+        guard !shuttingDown, !permissionRepairBusy else { return }
         _ = accessibilityPermissionCheck(true)
         refreshAccessibilityPermission()
     }
@@ -818,7 +917,7 @@ struct NativeQAProfile {
         if newlyGranted { screenshotPermissionIssue = false }
     }
     func requestScreenCapturePermission() {
-        guard !shuttingDown, !screenshotBusy else { return }
+        guard !shuttingDown, !permissionRepairBusy, !screenshotBusy else { return }
         refreshScreenCapturePermission()
         guard !screenCaptureTrusted else { return }
         guard !screenCapturePermissionRequested else {
@@ -961,8 +1060,8 @@ struct NativeQAProfile {
         subscriptions.removeAll()
         presentationTickets.removeAll(); textPresentations.removeAll()
         messageClearGeneration += 1; messageClearTask?.cancel(); messageClearTask = nil
+        imageActivation?.cancel(); imageActivation = nil
         studio.shutdown()
-        dreamina.shutdown()
         classicCli.shutdown()
         clipboard.stop(); hotkeys.unregisterAll(); windows.cancel()
         screenshotGeneration += 1; screenshotRunner?.cancel(); screenshotBusy = false

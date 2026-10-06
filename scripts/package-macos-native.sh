@@ -28,7 +28,14 @@ verify_native() {
   if printf '%s\n' "$dependencies" | /usr/bin/grep -q '_AVKit_SwiftUI.framework/'; then
     printf '%s\n' "$dependencies" | /usr/bin/grep -q '/AVKit.framework/' || fail '视频预览缺少 AVKit 链接；安装包已停止生成。'
   fi
-  /usr/bin/codesign --verify --deep --strict "$app"
+  # Distribution must retain the pinned identity. A certificate migration is an
+  # explicit release decision, never an accidental side effect of a rebuild.
+  local pin="$project_root/macos/Signing/local-certificate.sha1" fingerprint requirement
+  [ -f "$pin" ] || fail '缺少固定签名指纹。'
+  fingerprint=$(tr -d '[:space:]' < "$pin")
+  [[ "$fingerprint" =~ ^[A-Fa-f0-9]{40}$ ]] || fail '固定签名指纹无效。'
+  requirement="identifier \"com.openclaw.kakitools\" and certificate root = H\"$fingerprint\""
+  /usr/bin/codesign --verify --deep --strict -R "=$requirement" "$app" || fail '签名身份与固定配置不同，已停止打包以避免意外丢失授权。'
   if /usr/bin/codesign -d --verbose=4 "$app" 2>&1 | /usr/bin/grep -q 'Signature=adhoc'; then
     fail '安装包要求固定证书签名。临时签名应用只可用于隔离开发测试。'
   fi
@@ -90,23 +97,6 @@ mkdir "$stage/payload"
 ln -s /Applications "$stage/payload/Applications"
 [ ! -f "$project_root/macos/README.md" ] || cp "$project_root/macos/README.md" "$stage/payload/README.md"
 [ ! -f "$project_root/macos/INSTALL.txt" ] || cp "$project_root/macos/INSTALL.txt" "$stage/payload/安装说明.txt"
-for authorization_template in REAUTHORIZE.command.in REAUTHORIZE-SCREEN.command.in; do
-  [ -f "$project_root/macos/$authorization_template" ] || continue
-  case "$authorization_template" in
-    REAUTHORIZE.command.in) authorization_name='重新授权.command' ;;
-    REAUTHORIZE-SCREEN.command.in) authorization_name='修复截图权限.command' ;;
-  esac
-  python3 - "$project_root/macos/$authorization_template" "$app_input" "$stage/payload/$authorization_name" <<'PYTHON'
-import pathlib,re,shlex,subprocess,sys
-template,app,output=map(pathlib.Path,sys.argv[1:])
-result=subprocess.run(['/usr/bin/codesign','-d','-r-',str(app)],check=True,capture_output=True,text=True)
-match=re.search(r'designated => (.+)',result.stdout+result.stderr)
-if match is None or 'cdhash' in match.group(1): raise SystemExit('Signing identity must be certificate-based')
-output.write_text(template.read_text().replace('__KAKI_SIGNING_REQUIREMENT__',shlex.quote(match.group(1))))
-output.chmod(0o755)
-PYTHON
-  bash -n "$stage/payload/$authorization_name"
-done
 [ ! -f "$project_root/LICENSE" ] || cp "$project_root/LICENSE" "$stage/payload/LICENSE"
 verify_native "$stage/payload/Kaki Tools.app"
 python3 "$stage/app-manifest.py" "$stage/payload/Kaki Tools.app" > "$stage/staged-manifest.json"
@@ -133,13 +123,6 @@ cmp "$stage/source-manifest.json" "$stage/mounted-manifest.json"
 if [ -f "$stage/payload/安装说明.txt" ]; then
   cmp "$stage/payload/安装说明.txt" "$mount_point/安装说明.txt"
 fi
-for authorization_name in '重新授权.command' '修复截图权限.command'; do
-  [ -f "$stage/payload/$authorization_name" ] || continue
-  cmp "$stage/payload/$authorization_name" "$mount_point/$authorization_name"
-  [ -x "$mount_point/$authorization_name" ] || fail "$authorization_name 缺少执行权限。"
-  bash -n "$mount_point/$authorization_name"
-  /usr/bin/grep -q '__KAKI_SIGNING_REQUIREMENT__' "$mount_point/$authorization_name" && fail "$authorization_name 尚未填入签名身份。"
-done
 /usr/bin/hdiutil detach "$mount_device"
 mount_device=''
 final="$output/$(basename "$image")"

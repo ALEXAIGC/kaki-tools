@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import Darwin
 
 // Studio remains the identity and permission authority. Tools never creates a second user database.
 enum StudioEnvironment: String, CaseIterable, Identifiable {
@@ -90,7 +91,7 @@ enum StudioError: Error, LocalizedError {
         case .invalidResponse: return "Studio 返回的数据不完整，请稍后重试。"
         case .invalidURL: return "此素材地址无法安全访问。"
         case .tooLarge: return "此素材超过当前下载大小限制。"
-        case .credentials: return "无法访问 macOS 钥匙串，请解锁钥匙串后重试。"
+        case .credentials: return "无法读取或保存本地登录状态，请检查应用数据目录权限。"
         case .missingSession: return "请先登录 Studio 账号。"
         case .previewUnavailable: return "此视频暂时无法预览，可下载后播放。"
         }
@@ -102,36 +103,76 @@ enum StudioError: Error, LocalizedError {
     func write(_ session: StudioSession, environment: StudioEnvironment) throws
     func remove(environment: StudioEnvironment) throws
 }
-@MainActor final class StudioKeychain: StudioCredentialStore {
-    nonisolated static let defaultService = "com.openclaw.kakitools.studio-session"
-    let service: String
-    init(service: String = StudioKeychain.defaultService) { self.service = service }
-    private func query(_ environment: StudioEnvironment) -> [String: Any] {
-        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: environment.baseURL.host!, kSecAttrSynchronizable as String: false]
+// Only the short-lived Studio session is persisted, never the account password.
+// POSIX directory-relative operations reject symlinks and keep all files owner-only.
+@MainActor final class StudioLocalCredentials: StudioCredentialStore {
+    nonisolated static let defaultNamespace = "installed"
+    let directory: URL
+    init(directory: URL, namespace: String = StudioLocalCredentials.defaultNamespace) {
+        precondition(!namespace.isEmpty && namespace.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "." || $0 == "-") })
+        self.directory = directory.appendingPathComponent("studio-session-" + namespace, isDirectory: true)
     }
+    private func folder(create: Bool) throws -> Int32? {
+        var info = stat()
+        if lstat(directory.path, &info) != 0 {
+            guard errno == ENOENT else { throw StudioError.credentials(-1) }
+            if !create { return nil }
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        }
+        let fd = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw StudioError.credentials(-1) }
+        guard fstat(fd, &info) == 0, info.st_uid == getuid(), fchmod(fd, 0o700) == 0 else {
+            close(fd); throw StudioError.credentials(-1)
+        }
+        return fd
+    }
+    private func name(_ environment: StudioEnvironment) -> String { environment.rawValue + ".json" }
     func read(environment: StudioEnvironment) throws -> StudioSession? {
-        var q = query(environment); q[kSecReturnData as String] = true; q[kSecMatchLimit as String] = kSecMatchLimitOne
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(q as CFDictionary, &result)
-        if status == errSecItemNotFound { return nil }
-        guard status == errSecSuccess, let data = result as? Data else { throw StudioError.credentials(status) }
-        guard let session = try? JSONDecoder().decode(StudioSession.self, from: data), session.valid else { try remove(environment: environment); return nil }
+        guard let folder = try folder(create: false) else { return nil }
+        defer { close(folder) }
+        let fd = openat(folder, name(environment), O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        if fd < 0 { if errno == ENOENT { return nil }; throw StudioError.credentials(-1) }
+        defer { close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_uid == getuid(), (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_nlink == 1, info.st_size > 0, info.st_size <= 16_384, fchmod(fd, 0o600) == 0 else { throw StudioError.credentials(-1) }
+        var bytes = [UInt8](repeating: 0, count: 16_385), offset = 0
+        while offset < bytes.count {
+            let count = bytes.withUnsafeMutableBytes { buffer in Darwin.read(fd, buffer.baseAddress!.advanced(by: offset), buffer.count - offset) }
+            if count == 0 { break }
+            if count < 0 { if errno == EINTR { continue }; throw StudioError.credentials(-1) }
+            offset += count
+        }
+        guard offset <= 16_384, let session = try? JSONDecoder().decode(StudioSession.self, from: Data(bytes.prefix(offset))) else { throw StudioError.credentials(-1) }
+        if !session.valid { try remove(environment: environment); return nil }
         return session
     }
     func write(_ session: StudioSession, environment: StudioEnvironment) throws {
+        guard session.valid else { throw StudioError.credentials(-1) }
         let data = try JSONEncoder().encode(session)
-        var q = query(environment)
-        let updates = [kSecValueData as String: data]
-        var status = SecItemUpdate(q as CFDictionary, updates as CFDictionary)
-        if status == errSecItemNotFound {
-            q[kSecValueData as String] = data; q[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-            status = SecItemAdd(q as CFDictionary, nil)
+        guard data.count <= 16_384, let folder = try folder(create: true) else { throw StudioError.credentials(-1) }
+        defer { close(folder) }
+        let temporary = ".session-" + UUID().uuidString
+        let fd = openat(folder, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw StudioError.credentials(-1) }
+        defer { close(fd); unlinkat(folder, temporary, 0) }
+        var offset = 0
+        while offset < data.count {
+            let count = data.withUnsafeBytes { buffer in Darwin.write(fd, buffer.baseAddress!.advanced(by: offset), buffer.count - offset) }
+            if count < 0 && errno == EINTR { continue }
+            guard count > 0 else { throw StudioError.credentials(-1) }
+            offset += count
         }
-        guard status == errSecSuccess else { throw StudioError.credentials(status) }
+        var target = stat()
+        let exists = fstatat(folder, name(environment), &target, AT_SYMLINK_NOFOLLOW)
+        guard exists == 0 || errno == ENOENT else { throw StudioError.credentials(-1) }
+        if exists == 0 { guard target.st_uid == getuid(), (target.st_mode & S_IFMT) == S_IFREG, target.st_nlink == 1 else { throw StudioError.credentials(-1) } }
+        guard fchmod(fd, 0o600) == 0, fsync(fd) == 0, renameat(folder, temporary, folder, name(environment)) == 0 else { throw StudioError.credentials(-1) }
     }
     func remove(environment: StudioEnvironment) throws {
-        let status = SecItemDelete(query(environment) as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else { throw StudioError.credentials(status) }
+        guard let folder = try folder(create: false) else { return }
+        defer { close(folder) }
+        guard unlinkat(folder, name(environment), 0) == 0 || errno == ENOENT else { throw StudioError.credentials(-1) }
     }
 }
 @MainActor final class StudioMemoryCredentials: StudioCredentialStore {

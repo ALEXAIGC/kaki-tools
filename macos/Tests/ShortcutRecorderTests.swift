@@ -38,8 +38,8 @@ import AppKit
     }
 
     try check(!window.isVisible && !otherWindow.isVisible, "recorder fixtures never display windows or target other applications")
-    try check(field.stringValue == "点击设置" && field.intrinsicContentSize.height == 40 && field.font?.pointSize == 18,
-              "empty shortcut has a readable action and native forty-point height")
+    try check(field.stringValue == "点击设置" && field.intrinsicContentSize.height >= 36 && (field.font?.pointSize ?? 0) >= 16,
+              "empty shortcut has a readable action and an accessible native control size")
     field.accelerator = "CommandOrControl+Shift+V"
     try check(field.stringValue == "⇧ ⌘ V", "modifier symbols and main key have readable separation")
     try check(field.accessibilityRole() == .button && field.accessibilityHelp()?.contains("按下组合键") == true,

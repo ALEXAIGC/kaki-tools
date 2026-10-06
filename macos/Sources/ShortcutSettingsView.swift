@@ -16,15 +16,7 @@ import AppKit
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 8) {
-                modifier("⌘", "Command")
-                modifier("⌥", "Option")
-                modifier("⌃", "Control")
-                modifier("⇧", "Shift")
-                Spacer(minLength: 0)
-            }.accessibilityElement(children: .combine)
-
-            SettingsCard("常用操作") {
+            SettingsCard("常规操作") {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 184), spacing: 10)], spacing: 10) {
                     tile("剪贴板", icon: "clipboard", action: "panel", value: $settings.hotkey)
                     tile("素材库", icon: "photo.on.rectangle.angled", action: "studio", value: $settings.studioHotkey)
@@ -35,10 +27,7 @@ import AppKit
             SettingsCard {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack(spacing: 12) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("窗口调整").font(.system(size: 14, weight: .semibold))
-                            Text("作用于当前窗口 · 需要辅助功能权限").font(.system(size: 11)).foregroundStyle(.secondary)
-                        }
+                        Text("窗口调整").font(.system(size: 13, weight: .semibold))
                         Spacer(minLength: 0)
                         Toggle("窗口调整", isOn: Binding(get: { settings.windowManagerEnabled }, set: {
                             finishRecording(); settings.windowManagerEnabled = $0
@@ -51,7 +40,7 @@ import AppKit
                         ForEach(WindowLayout.Group.allCases) { item in
                             Text(groupTitle(item) + (groupHasIssue(item) ? " !" : "")).tag(item)
                         }
-                    }.pickerStyle(.segmented).labelsHidden().controlSize(.large)
+                    }.pickerStyle(.segmented).labelsHidden().controlSize(.regular)
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 210), spacing: 10)], spacing: 10) {
                         ForEach(WindowManager.layouts(in: group)) { layout in
                             ShortcutSettingTile(title: layout.settingsLabel, issue: issues["window:" + layout.id],
@@ -62,9 +51,6 @@ import AppKit
                             }
                         }
                     }.disabled(!settings.windowManagerEnabled)
-                    if !settings.windowManagerEnabled {
-                        Text("保存后停用窗口快捷键。").font(.system(size: 11)).foregroundStyle(.secondary)
-                    }
                 }
             }
         }
@@ -76,14 +62,6 @@ import AppKit
     }
     private func groupHasIssue(_ value: WindowLayout.Group) -> Bool {
         WindowManager.layouts(in: value).contains { issues["window:" + $0.id] != nil }
-    }
-    private func modifier(_ glyph: String, _ title: String) -> some View {
-        HStack(spacing: 5) {
-            Text(glyph).font(.system(size: 16, weight: .medium))
-            Text(title).font(.system(size: 11))
-        }.foregroundStyle(.secondary).padding(.horizontal, 8).padding(.vertical, 5)
-            .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 6))
-            .accessibilityLabel(glyph + "，" + title)
     }
     private func tile(_ title: String, icon: String, action: String, value: Binding<String>) -> some View {
         ShortcutSettingTile(title: title, issue: issues[action], value: value, onRecordingChanged: onRecordingChanged) {
@@ -114,7 +92,7 @@ private struct ShortcutSettingTile<Icon: View>: View {
             ShortcutRecorder(value: $value) {
                 recording = $0; onRecordingChanged($0)
             }
-                .frame(height: 42).accessibilityLabel(title + "快捷键")
+                .frame(height: 38).accessibilityLabel(title + "快捷键")
             if let issue {
                 Label(issue, systemImage: "exclamationmark.circle")
                     .font(.system(size: 11)).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)

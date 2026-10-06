@@ -1,6 +1,6 @@
 # Kaki Tools
 
-原生 macOS 效率工具，使用 Swift、AppKit 和 SwiftUI。最低 macOS 13；当前版本 1.5.1。默认应用不包含 Electron、Node.js、WebView、Qt 或第三方 Swift 包。剪贴板普通历史最多100条，固定与收藏独立保留；窗口调整和区域截图使用系统接口。Studio 账号与素材库复用现有用户身份和工作区权限，支持搜索、多选复制引用、单项复制真实素材及批量下载。
+原生 macOS 效率工具，使用 Swift、AppKit 和 SwiftUI。最低 macOS 13；当前源码版本 1.5.9。默认应用不包含 Electron、Node.js、WebView、Qt 或第三方 Swift 包。剪贴板普通历史最多100条，固定与收藏独立保留；窗口调整和区域截图使用系统接口。Studio 账号与素材库复用现有用户身份和工作区权限，支持搜索、多选复制引用、单项复制真实素材及批量下载。
 
 安装包见 [最新发布](https://github.com/ALEXAIGC/kaki-tools/releases/latest)。当前发布为 Apple Silicon、macOS 13 或更高版本。
 
@@ -16,7 +16,7 @@ bash scripts/package-macos-native.sh
 bash scripts/run-macos-native.sh
 ```
 
-若本机已有 npm，`npm start`、`npm run build`、`npm run pack`、`npm run dist`、`npm test` 都指向原生流程。根目录 package.json 仅提供命令别名，没有依赖。
+若本机已有 npm，`npm start`、`npm run build`、`npm run pack`、`npm run dist`、`npm test` 都指向原生流程。根目录 package.json 提供命令别名和统一版本号，没有依赖。构建自动从该版本号生成应用版本和构建编号。
 
 默认输出在 `dist/native-<架构>/`。可用 `KAKI_NATIVE_OUTPUT_DIR` 指定构建输出目录。测试使用临时目录、私有剪贴板，不调整真实窗口。打包不会安装或替换当前应用。
 
@@ -34,7 +34,7 @@ bash scripts/run-macos-native.sh
 
 素材库支持图片、视频和音频，视频使用原生预览。设置中可选择下载位置、缓存磁盘、容量和未使用清理天数；原素材按需读取，缓存复用前重新检查访问权限。CDN 错误不会误退出 Studio；退出清理失败时阻止旧会话自动恢复；迟到的失败响应不会删除并发下载的新缓存。
 
-设置 → 账号与连接提供 Studio 与即梦品牌卡片，在本页登录或管理。1.5.1接入经典即梦 CLI 的安装、检测、登录与当前 Studio 工作区关联，支持文生视频、单图、首尾帧、多帧故事和全能参考。CLI 独立安装，不包含在应用内；已有 CLI 不覆盖，仅接受已验证的新版五方式合同，旧CLI需更新后重新关联。每次生成在 Tools 确认使用本人即梦额度，完成后向同环境 Studio 私有上传并回填原任务。素材准备失败不提交，提交结果不明时仅恢复原任务，不自动重发。原 dreamina-canvas 登录、刷新、解除关联和模型检查保持独立。
+设置 → 账号与连接提供 Studio 与即梦品牌卡片。即梦入口统一使用常规 `dreamina` CLI，提供安装、显式更新、登录、检测和连接 Studio 工作区；按运行时五种视频方式验证兼容性，不固定到某个旧版本。CLI 独立安装，不包含在应用内。Tools 登录本人 KAKI 账号，再由本人授权本机即梦登录并连接目标 Studio 工作区；切换站点、账号或工作区后须重新连接。画布 CLI 的授权不用于此生成通道，账号页不再展示两套入口。
 
 “复制代码”需要 Studio 接收端适配，部署边界见 [Studio 集成说明](macos/STUDIO-INTEGRATION.md)。源码同步到 GitHub 不会自动部署 Studio 网站。1.5.0候选通过1303项原生断言，使用模拟传输、临时数据、真实解码小样与私有剪贴板；官方 CLI 在隔离目录安装验证通过。1.5.1更新检测截止时间与新版Device Flow登录，授权码只在当前会话显示，取消与失败可重试。真实 Studio 登录、CLI 关联及五方式付费出片仍待实机验收。另一台 Mac 的实际屏幕授权仍需在目标机器验证；设置 → 权限与关于可复制截图诊断。
 

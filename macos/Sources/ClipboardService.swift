@@ -20,6 +20,7 @@ final class ClipboardService {
         let timer = Timer(timeInterval: max(0.08, interval), repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.captureNow() }
         }
+        timer.tolerance = max(0.08, interval) * 0.2
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
     }
@@ -88,6 +89,7 @@ final class ClipboardService {
         lastChangeCount = count
         return count
     }
+    var changeCount: Int { pasteboard.changeCount }
     func matchesWrite(_ count: Int) -> Bool {
         pasteboard.changeCount == count && pasteboard.string(forType: sourceType) == sourceMarker
     }

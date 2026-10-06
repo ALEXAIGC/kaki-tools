@@ -78,10 +78,10 @@ private struct BrokenInspectionRunner:DreaminaRunning {
     try check(connection.targetDescription.contains("正式站 · kakiai.xin") && !connection.targetDescription.contains("test.kakiai.xin"), "production target never displays the old test origin")
     await inspector.configure(hang:false)
     connection.detect();try await until {!connection.busy}
-    try check(connection.status == "已安装 · 请登录即梦","real not logged in outcome without swallowing network errors")
+    try check(connection.status == "已安装 · 请登录即梦" && connection.loginChecked && !connection.loggedIn,"real not logged in outcome without swallowing network errors")
     await runner.configure(network:true)
     connection.detect();try await until {!connection.busy}
-    try check(connection.status.contains("登录状态尚未确认"),"network error does not become a logout result")
+    try check(connection.status.contains("登录状态尚未确认") && !connection.loginChecked,"network error does not become a logout result")
     await runner.configure()
     try await until {!connection.busy};connection.login();try await until {!connection.authorizationUserCode.isEmpty}
     try check(connection.busy && opens == 1 && connection.authorizationURL?.host == "jimeng.jianying.com" && !connection.connected,"headless code visible while polling, URL opened once, login is not association")
@@ -99,7 +99,7 @@ private struct BrokenInspectionRunner:DreaminaRunning {
     try await until {!connection.busy};connection.login();try await until {!connection.authorizationUserCode.isEmpty};try await until {!connection.busy}
     try check(connection.authorizationUserCode.isEmpty && connection.authorizationURL == nil && connection.status.contains("超时"),"whole login deadline clears codes and restores retry")
     try await until {!connection.busy};connection.login();try await until {!connection.authorizationUserCode.isEmpty};await runner.configure(done:true);try await until {!connection.busy}
-    try check(connection.status.contains("即梦已登录") && !connection.connected && connection.authorizationUserCode.isEmpty,"successful login stays unassociated and clears ephemeral authorization")
+    try check(connection.status.contains("即梦已登录") && connection.loginChecked && connection.loggedIn && !connection.connected && connection.authorizationUserCode.isEmpty,"successful login stays unassociated and clears ephemeral authorization")
     let pollCalls=await runner.calls();try check(pollCalls > 0,"login used actual nested checklogin fixed argv")
     let actualShapeCode=String(repeating:"a",count:32)
     func wrapped(_ inner:String,extra:String="") -> String {
