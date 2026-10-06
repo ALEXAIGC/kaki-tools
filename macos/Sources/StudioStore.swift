@@ -87,6 +87,10 @@ import ImageIO
         logoutCleanupPending = pending
     }
     private var client: StudioClient { StudioClient(environment: environment, transport: transport) }
+    func classicCliContext() -> (client: StudioClient, session: StudioSession, workspace: String)? {
+        guard user != nil, let session, session.valid, !workspaceID.isEmpty else { return nil }
+        return (client, session, workspaceID)
+    }
     var visibleAssets: [StudioAsset] { assets.filter { kind == "all" || $0.kind == kind } }
     func setLibraryActive(_ value: Bool) { libraryActive = value }
     var syncStatus: String {

@@ -10,11 +10,17 @@ import CryptoKit
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         let testing = environment["KAKI_NATIVE_TEST"] == "1"
+        let productionDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Kaki Tools", isDirectory: true)
+        let qaProfile: NativeQAProfile?
+        do {
+            qaProfile = try NativeQAProfile.resolve(arguments: CommandLine.arguments, bundleIdentifier: Bundle.main.bundleIdentifier ?? "com.openclaw.kakitools", productionDirectory: productionDirectory, bundleDataDirectory: Bundle.main.object(forInfoDictionaryKey: "KakiQADataDirectory") as? String)
+            if testing && qaProfile != nil { throw NSError(domain: "KakiToolsQA", code: 3, userInfo: [NSLocalizedDescriptionKey: "真实 QA 联调不能同时启用 KAKI_NATIVE_TEST"] ) }
+        } catch { showLaunchFailure(error.localizedDescription); return }
         if !testing && !permitExclusiveInstance() { NSApp.terminate(nil); return }
         let stylePreview = testing && ["style-screenshot", "style-wait"].contains(environment["KAKI_NATIVE_TEST_ACTION"] ?? "")
         let baseDirectory = testing
             ? URL(fileURLWithPath: environment["KAKI_NATIVE_TEST_DIR"] ?? (NSTemporaryDirectory() + "kaki-native-isolated-" + UUID().uuidString))
-            : FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Kaki Tools", isDirectory: true)
+            : qaProfile?.directory ?? productionDirectory
         // Each style preview gets new data even when the caller reuses its test directory.
         let directory = stylePreview ? baseDirectory.appendingPathComponent("style-preview-" + UUID().uuidString, isDirectory: true) : baseDirectory
         do {
@@ -23,11 +29,12 @@ import CryptoKit
             guard lockFD >= 0, flock(lockFD, LOCK_EX | LOCK_NB) == 0 else { NSApp.terminate(nil); return }
             if stylePreview { try prepareStylePreview(in: directory) }
         } catch { showLaunchFailure("无法打开数据目录：" + error.localizedDescription); return }
-        let app = AppController(directory: directory, testMode: testing)
+        let app = AppController(directory: directory, testMode: testing, qaProfile: qaProfile)
         if testing, let theme = environment["KAKI_NATIVE_TEST_THEME"], ["system", "light", "dark"].contains(theme) {
             app.settings.appearance = theme
         }
         controller = app; app.start()
+        if qaProfile != nil { app.showSettings(section: "studio") }
         for number in [SIGTERM, SIGINT] {
             signal(number, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: number, queue: .main)

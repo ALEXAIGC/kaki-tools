@@ -282,8 +282,8 @@ final class HistoryStore: ObservableObject {
         queue.async { [weak self] in
             do {
                 let removed = try Self.write(snapshot, to: file, images: images, deleting: deleting)
-                DispatchQueue.main.async { self?.deferredImageFiles.subtract(removed) }
-            } catch { DispatchQueue.main.async { self?.report(error) } }
+                DispatchQueue.main.async { [weak self] in self?.deferredImageFiles.subtract(removed) }
+            } catch { DispatchQueue.main.async { [weak self] in self?.report(error) } }
         }
     }
     func flush() {
@@ -348,7 +348,7 @@ final class HistoryStore: ObservableObject {
                     } catch { job.finish(.failure(error)) }
                 }
                 job.endProcessing()
-                DispatchQueue.main.async { self?.settleReservation(job); self?.complete(job) }
+                DispatchQueue.main.async { [weak self] in self?.settleReservation(job); self?.complete(job) }
             }
             return true
         } catch { report(error); return false }
@@ -468,7 +468,7 @@ final class HistoryStore: ObservableObject {
         let id = item.id, file = URL(fileURLWithPath: path)
         queue.async { [weak self] in
             let image = autoreleasepool { ImageCodec.thumbnail(file: file) }
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
                 guard let self, self.loadingThumbnails[id] == ticket else { return }
                 self.loadingThumbnails[id] = nil
                 if let image, let current = self.items.first(where: { $0.id == id }), ThumbnailSource(current) == source {

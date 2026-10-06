@@ -64,9 +64,11 @@ struct ScreenCaptureFailure: Equatable {
             let worker = queue
             process.terminationHandler = { [weak self] child in
                 child.terminationHandler = nil
-                worker.async {
-                    let result = Self.readResult(status: child.terminationStatus,
-                        terminatedNormally: child.terminationReason == .exit,
+                let status = child.terminationStatus
+                let terminatedNormally = child.terminationReason == .exit
+                worker.async { [weak self] in
+                    let result = Self.readResult(status: status,
+                        terminatedNormally: terminatedNormally,
                         image: image, stderr: stderr, directory: directory)
                     try? FileManager.default.removeItem(at: directory)
                     DispatchQueue.main.async { [weak self] in

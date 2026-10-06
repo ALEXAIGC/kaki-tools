@@ -34,6 +34,7 @@ private func studioLoginStep(delay: UInt64 = 0) -> StudioStubStep {
     StudioStubStep(path: "/api/auth/login", headers: ["Content-Type": "application/json", "Set-Cookie": "kaki_session=test-session-a; Max-Age=604800; Path=/; HttpOnly; Secure; SameSite=Lax"], json: "{\"user\":" + studioUserJSON + "}", delay: delay)
 }
 @MainActor func runStudioTests() async throws {
+    try runNativeQAProfileTests()
     try runStudioReferenceSelectionTests()
     try await runStudioExportTests()
     let suffixes = ["image/png":"png", "image/jpeg":"jpg", "image/webp":"webp", "image/gif":"gif", "image/heic":"heic", "image/avif":"avif", "video/mp4":"mp4", "video/quicktime":"mov", "video/webm":"webm", "audio/mpeg":"mp3", "audio/wav":"wav", "audio/x-wav":"wav", "audio/mp4":"m4a", "audio/ogg":"ogg"]
@@ -147,6 +148,58 @@ private func studioLoginStep(delay: UInt64 = 0) -> StudioStubStep {
     try await runStudioSyncTests(directory: dir)
     try await runStudioVideoStoreTests(directory: dir)
     print("Studio contract/auth tests passed (synthetic credentials, private transport, no server mutation)")
+}
+
+@MainActor func runNativeQAProfileTests() throws {
+    let fm = FileManager.default
+    let root = fm.temporaryDirectory.appendingPathComponent("kaki-qa-contract-" + UUID().uuidString, isDirectory: true)
+    try fm.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: root) }
+    let production = root.appendingPathComponent("installed", isDirectory: true)
+    try fm.createDirectory(at: production, withIntermediateDirectories: true)
+    let sentinel = production.appendingPathComponent("existing-history")
+    try Data("existing user data".utf8).write(to: sentinel)
+    let identity = "com.openclaw.kakitools.qa.contract"
+    let qa = root.appendingPathComponent("qa", isDirectory: true)
+    let profile = try NativeQAProfile.resolve(arguments: ["Kaki Tools", "--qa-data-dir", qa.path], bundleIdentifier: identity, productionDirectory: production)!
+    try check(profile.directory.path == qa.resolvingSymlinksInPath().path && profile.keychainService.hasPrefix(StudioKeychain.defaultService + ".qa."), "live QA has independent data and credential namespace")
+    try check(StudioKeychain().service == StudioKeychain.defaultService && StudioKeychain(service: profile.keychainService).service != StudioKeychain().service, "default keychain service is unchanged; QA never selects installed session service")
+    let normal = try NativeQAProfile.resolve(arguments: ["Kaki Tools"], bundleIdentifier: "com.openclaw.kakitools", productionDirectory: production)
+    try check(normal == nil, "installed startup stays unchanged without QA flags")
+    let plistProfile = try NativeQAProfile.resolve(arguments: ["Kaki Tools QA"], bundleIdentifier: identity, productionDirectory: production, bundleDataDirectory: qa.path)!
+    try check(plistProfile.directory == profile.directory && plistProfile.keychainService == profile.keychainService, "signed QA bundle directory uses identical validated isolation")
+    let normalWithQAField = try NativeQAProfile.resolve(arguments: ["Kaki Tools"], bundleIdentifier: "com.openclaw.kakitools", productionDirectory: production, bundleDataDirectory: qa.path)
+    try check(normalWithQAField == nil, "installed bundle ignores QA Info.plist field")
+    let explicitProfile = try NativeQAProfile.resolve(arguments: ["Kaki Tools QA", "--qa-data-dir", qa.path], bundleIdentifier: identity, productionDirectory: production, bundleDataDirectory: production.path)!
+    try check(explicitProfile.directory == profile.directory, "explicit QA argument takes precedence over bundle field")
+    for (args, field) in [(["QA"], production.path), (["QA"], "relative"), (["QA", "--qa-data-dir"], qa.path), (["QA", "--qa-data-dir", "relative"], qa.path)] {
+        do { _ = try NativeQAProfile.resolve(arguments: args, bundleIdentifier: identity, productionDirectory: production, bundleDataDirectory: field); throw NativeTestFailure(description: "unsafe QA field accepted") }
+        catch let error as NSError { try check(error.domain == "KakiToolsQA", "bundle field retains path validation and cannot rescue invalid explicit flags") }
+    }
+    for (bundle, args) in [
+        (identity, ["Kaki Tools"]),
+        ("com.openclaw.kakitools", ["Kaki Tools", "--qa-data-dir", qa.path]),
+        (identity, ["Kaki Tools", "--qa-data-dir", "relative"]),
+        (identity, ["Kaki Tools", "--qa-data-dir", production.path]),
+        (identity, ["Kaki Tools", "--qa-data-dir", production.appendingPathComponent("child").path]),
+        (identity, ["Kaki Tools", "--qa-data-dir", root.path]),
+        (identity, ["Kaki Tools", "--qa-data-dir", qa.path, "--qa-data-dir", qa.path]),
+    ] {
+        do { _ = try NativeQAProfile.resolve(arguments: args, bundleIdentifier: bundle, productionDirectory: production); throw NativeTestFailure(description: "unsafe QA profile accepted") }
+        catch let error as NSError { try check(error.domain == "KakiToolsQA", "missing/ambiguous flags and installed-directory overlap fail closed") }
+    }
+    let link = root.appendingPathComponent("installed-link")
+    try fm.createSymbolicLink(at: link, withDestinationURL: production)
+    do { _ = try NativeQAProfile.resolve(arguments: ["Kaki Tools", "--qa-data-dir", link.path], bundleIdentifier: identity, productionDirectory: production); throw NativeTestFailure(description: "production symlink accepted") }
+    catch let error as NSError { try check(error.domain == "KakiToolsQA", "production symlink cannot bypass independent profile") }
+    let other = try NativeQAProfile.resolve(arguments: ["Kaki Tools", "--qa-data-dir", root.appendingPathComponent("qa-other").path], bundleIdentifier: identity, productionDirectory: production)!
+    try check(other.keychainService != profile.keychainService, "separate QA profiles never share persisted login service")
+    try fm.createDirectory(at: qa, withIntermediateDirectories: true)
+    let app = AppController(directory: profile.directory, testMode: false, qaProfile: profile, studioTransport: StudioStubTransport([]), dreaminaRunner: DreaminaUnavailableRunner(), accessibilityPermissionCheck: { _ in false }, screenCapturePermissionCheck: { _ in false })
+    try check(!app.testMode && app.qaProfile?.directory == profile.directory && app.store.directory == profile.directory, "live QA keeps real CLI execution mode and isolated history instead of native-test mode")
+    let original = try Data(contentsOf: sentinel)
+    try check(original == Data("existing user data".utf8), "QA construction does not read or replace installed history")
+    app.shutdown()
 }
 
 @MainActor private func runStudioVideoStoreTests(directory: URL) async throws {
@@ -362,6 +415,8 @@ private func studioLoginStep(delay: UInt64 = 0) -> StudioStubStep {
     guard let copied else { throw NativeTestFailure(description: "Video file copy did not finish") }
     try check(copied.pathExtension == "mp4" && (try? Data(contentsOf: copied)) == video, "video clipboard retains original file after temporary HTTP file is removed")
     try check(board.string(forType: .fileURL) == copied.absoluteString && board.string(forType: .string) == nil, "actual media copy advertises a local file instead of remote URL or reference text")
+    let copiedVideoURLs = board.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]
+    try check(copiedVideoURLs == [copied] && copiedVideoURLs?.first.flatMap { try? Data(contentsOf: $0) } == video, "standard file pasteboard reads a real NSURL with original video bytes")
     clipboard.captureNow()
     try check(history.items.isEmpty, "own file copy does not create misleading text history")
     let prior = output.appendingPathComponent("片段.mp4")
@@ -377,6 +432,8 @@ private func studioLoginStep(delay: UInt64 = 0) -> StudioStubStep {
     store.copyMaterial(store.assets[2], consumeImage: { _ in false }, consumeFile: { file in copiedAudio = file; return clipboard.writeMaterialFile(file) != nil })
     for _ in 0..<200 { if !store.mediaBusy { break }; try await Task.sleep(nanoseconds: 10_000_000) }
     try check(copiedAudio?.pathExtension == "mp3" && !fm.fileExists(atPath: copied.path), "next successful file copy prunes prior owned file cache")
+    let copiedAudioURLs = board.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]
+    try check(copiedAudioURLs == copiedAudio.map { [$0] } && copiedAudioURLs?.first.flatMap { try? Data(contentsOf: $0) } == audio, "standard file pasteboard reads a real NSURL with original audio bytes")
     store.download(ids: ["video-a", "video-b", "audio-c"], to: output)
     for _ in 0..<200 { if !store.mediaBusy { break }; try await Task.sleep(nanoseconds: 10_000_000) }
     try check(store.message.contains("已下载 2 项，1 项失败") && fm.fileExists(atPath: output.appendingPathComponent("声音 (2).mp3").path), "failed batch item does not discard earlier files or prevent subsequent downloads")

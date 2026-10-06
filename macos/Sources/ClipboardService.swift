@@ -67,7 +67,7 @@ final class ClipboardService {
     func writeMaterialFile(_ file: URL) -> Int? {
         guard file.isFileURL, FileManager.default.fileExists(atPath: file.path) else { return nil }
         let entry = NSPasteboardItem()
-        entry.setString(file.absoluteString, forType: .fileURL)
+        guard entry.setString(file.absoluteString, forType: .fileURL) else { return nil }
         return commit(entry)
     }
     @discardableResult

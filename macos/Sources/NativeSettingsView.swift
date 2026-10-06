@@ -93,7 +93,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
         case .clipboard: clipboardPage
         case .shortcuts: shortcutsPage
         case .studio:
-            AccountConnectionsView(studio: controller.studio, connector: controller.dreamina, openLibrary: controller.showStudio)
+            AccountConnectionsView(studio: controller.studio, connector: controller.dreamina, classicCli: controller.classicCli, openLibrary: controller.showStudio)
         case .downloads: downloadsPage
         case .about: aboutPage
         }
@@ -325,6 +325,7 @@ struct SettingsFolderRow: View {
                 if !settings.studioCacheFolder.isEmpty { Button("恢复默认位置", action: restoreFolder).buttonStyle(.link).font(.system(size: 11)).disabled(unavailable) }
                 if !studio.cacheAvailable { SettingsFootnote("缓存盘不可用，暂时在线读取。") }
                 Divider()
+                Group {
                 SettingsRow("启用本地缓存") {
                     Toggle("启用本地缓存", isOn: Binding(get: { settings.studioCacheLimitMB > 0 }, set: { value in
                         if value { apply() } else { setPreferences(0, settings.studioCacheDays) }
@@ -355,6 +356,7 @@ struct SettingsFolderRow: View {
                 if !validation.isEmpty { SettingsFootnote(validation) }
                 else if !studio.cacheMessage.isEmpty { SettingsFootnote(studio.cacheMessage) }
                 SettingsFootnote("清理不影响已下载文件和剪贴板。")
+                }
             }
         }.task { loadDraft(); await studio.refreshCacheStats() }
             .onChange(of: settings.studioCacheLimitMB) { _ in loadDraft() }

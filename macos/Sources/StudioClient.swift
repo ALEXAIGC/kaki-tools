@@ -102,8 +102,11 @@ enum StudioError: Error, LocalizedError {
     func remove(environment: StudioEnvironment) throws
 }
 @MainActor final class StudioKeychain: StudioCredentialStore {
+    nonisolated static let defaultService = "com.openclaw.kakitools.studio-session"
+    let service: String
+    init(service: String = StudioKeychain.defaultService) { self.service = service }
     private func query(_ environment: StudioEnvironment) -> [String: Any] {
-        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "com.openclaw.kakitools.studio-session", kSecAttrAccount as String: environment.baseURL.host!, kSecAttrSynchronizable as String: false]
+        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: environment.baseURL.host!, kSecAttrSynchronizable as String: false]
     }
     func read(environment: StudioEnvironment) throws -> StudioSession? {
         var q = query(environment); q[kSecReturnData as String] = true; q[kSecMatchLimit as String] = kSecMatchLimitOne

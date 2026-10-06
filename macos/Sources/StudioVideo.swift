@@ -123,7 +123,7 @@ struct StudioVideoChunk {
 
 // AVFoundation's Objective-C delegate is not actor annotated. Its callbacks are
 // explicitly delivered on .main below, matching the isolated state here.
-@MainActor final class StudioVideoStream: NSObject, @preconcurrency AVAssetResourceLoaderDelegate {
+@MainActor final class StudioVideoStream: NSObject {
     let asset: AVURLAsset
     let reader: StudioVideoReader
     var onError: ((Error) -> Void)?
@@ -283,3 +283,9 @@ private final class StudioVideoPosterResult: @unchecked Sendable {
         stream = nil
     }
 }
+
+#if compiler(>=6.0)
+extension StudioVideoStream: @preconcurrency AVAssetResourceLoaderDelegate {}
+#else
+extension StudioVideoStream: AVAssetResourceLoaderDelegate {}
+#endif

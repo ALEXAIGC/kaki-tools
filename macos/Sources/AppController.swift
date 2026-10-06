@@ -6,6 +6,31 @@ import ServiceManagement
 import Security
 import CryptoKit
 
+struct NativeQAProfile {
+    let directory: URL
+    let keychainService: String
+    static func resolve(arguments: [String], bundleIdentifier: String, productionDirectory: URL, bundleDataDirectory: String? = nil) throws -> NativeQAProfile? {
+        let qaBundle = bundleIdentifier.hasPrefix("com.openclaw.kakitools.qa.")
+        let positions = arguments.indices.filter { arguments[$0] == "--qa-data-dir" }
+        if !qaBundle && positions.isEmpty { return nil }
+        let path: String?
+        if positions.isEmpty { path = qaBundle ? bundleDataDirectory : nil }
+        else if positions.count == 1, let index = positions.first, index + 1 < arguments.count { path = arguments[index + 1] }
+        else { path = nil }
+        guard qaBundle, let path, path.hasPrefix("/"), !path.hasPrefix("--") else {
+            throw NSError(domain: "KakiToolsQA", code: 1, userInfo: [NSLocalizedDescriptionKey: "QA 包须使用独立应用标识及 --qa-data-dir 绝对路径"])
+        }
+        let directory = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.resolvingSymlinksInPath()
+        let production = productionDirectory.standardizedFileURL.resolvingSymlinksInPath()
+        guard directory.path != "/", directory.path != production.path,
+              !directory.path.hasPrefix(production.path + "/"), !production.path.hasPrefix(directory.path + "/") else {
+            throw NSError(domain: "KakiToolsQA", code: 2, userInfo: [NSLocalizedDescriptionKey: "QA 数据目录不能使用安装版目录或其父子目录"])
+        }
+        let namespace = SHA256.hash(data: Data((bundleIdentifier + "|" + directory.path).utf8)).map { String(format: "%02x", $0) }.joined()
+        return NativeQAProfile(directory: directory, keychainService: StudioKeychain.defaultService + ".qa." + namespace)
+    }
+}
+
 @MainActor final class AppController: NSObject, ObservableObject, NSWindowDelegate {
     enum Filter: String, CaseIterable { case all = "全部", text = "文本", image = "图片", pinned = "固定" }
     let store: HistoryStore
@@ -16,7 +41,9 @@ import CryptoKit
     let log: NativeLog
     let studio: StudioStore
     let dreamina: DreaminaConnector
+    let classicCli: ClassicCliConnection
     let testMode: Bool
+    let qaProfile: NativeQAProfile?
     @Published var query = "" {
         didSet {
             guard query != oldValue else { return }
@@ -81,8 +108,9 @@ import CryptoKit
     private var shuttingDown = false
     private var shortcutRecording = false
 
-    init(directory: URL, testMode: Bool, messageLifetime: TimeInterval = 5, studioTransport: StudioTransport = StudioURLTransport(), dreaminaRunner: DreaminaRunning? = nil, accessibilityPermissionCheck: @escaping (Bool) -> Bool = { WindowManager.accessibilityTrusted(prompt: $0) }, screenCapturePermissionCheck: ((Bool) -> Bool)? = nil, screenshotRunner: ScreenCaptureRunning? = nil) {
+    init(directory: URL, testMode: Bool, qaProfile: NativeQAProfile? = nil, messageLifetime: TimeInterval = 5, studioTransport: StudioTransport = StudioURLTransport(), dreaminaRunner: DreaminaRunning? = nil, accessibilityPermissionCheck: @escaping (Bool) -> Bool = { WindowManager.accessibilityTrusted(prompt: $0) }, screenCapturePermissionCheck: ((Bool) -> Bool)? = nil, screenshotRunner: ScreenCaptureRunning? = nil) {
         self.testMode = testMode
+        self.qaProfile = qaProfile
         self.accessibilityPermissionCheck = accessibilityPermissionCheck
         self.screenCapturePermissionCheck = screenCapturePermissionCheck ?? (testMode ? { _ in false } : { prompt in
             prompt ? CGRequestScreenCaptureAccess() : CGPreflightScreenCaptureAccess()
@@ -93,8 +121,9 @@ import CryptoKit
         store = HistoryStore(directory: directory, limit: 100)
         clipboard = ClipboardService(store: store, pasteboard: testMode ? NSPasteboard(name: NSPasteboard.Name("kaki-native-test-" + UUID().uuidString)) : .general)
         log = NativeLog(directory: directory)
-        studio = StudioStore(directory: directory, credentials: testMode ? StudioMemoryCredentials() : StudioKeychain(), transport: studioTransport, cacheLimitMB: settings.studioCacheLimitMB, cacheDays: settings.studioCacheDays, cacheFolder: settings.studioCacheFolder, cacheVolumeUUID: settings.studioCacheVolumeUUID)
+        studio = StudioStore(directory: directory, credentials: testMode ? StudioMemoryCredentials() : StudioKeychain(service: qaProfile?.keychainService ?? StudioKeychain.defaultService), transport: studioTransport, cacheLimitMB: settings.studioCacheLimitMB, cacheDays: settings.studioCacheDays, cacheFolder: qaProfile == nil ? settings.studioCacheFolder : "", cacheVolumeUUID: qaProfile == nil ? settings.studioCacheVolumeUUID : "")
         dreamina = DreaminaConnector(directory: directory, runner: dreaminaRunner ?? (testMode ? DreaminaUnavailableRunner() : nil))
+        classicCli = ClassicCliConnection(studio: studio, directory: directory, enabled: !testMode)
         super.init()
         store.onError = { [weak self] text in self?.report(text) }
         windows.onError = { [weak self] text in self?.report(text) }
@@ -104,6 +133,9 @@ import CryptoKit
         }.store(in: &subscriptions)
         studio.$user.combineLatest(studio.$environment).sink { [weak self] user, environment in
             self?.dreamina.setOwner(user.map { KakiConnectionOwner(environment: environment.rawValue, userID: $0.id) })
+        }.store(in: &subscriptions)
+        studio.$user.combineLatest(studio.$environment, studio.$workspaceID).map { user, environment, workspace in environment.rawValue + "|" + (user?.id ?? "") + "|" + workspace }.removeDuplicates().dropFirst().sink { [weak self] _ in
+            self?.classicCli.identityChanged()
         }.store(in: &subscriptions)
         settings.$appearance.removeDuplicates().sink { [weak self] value in
             self?.applyAppearance(value)
@@ -130,7 +162,7 @@ import CryptoKit
             guard let self, self.panel?.isVisible == true, event.window == self.panel else { return event }
             return self.handleKey(event) ? nil : event
         }
-        if !testMode {
+        if !testMode && qaProfile == nil {
             clipboard.start(interval: settings.pollInterval)
             _ = registerShortcuts(allowFallback: true)
             if settings.showOnLaunch { showPanel() }
@@ -227,7 +259,7 @@ import CryptoKit
         presentationTickets[id] = ticket
         presentationQueue.async { [weak self] in
             let value = ClipboardTextPresentation(text)
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
                 guard let self, !self.shuttingDown, self.presentationTickets[id] == ticket else { return }
                 self.presentationTickets[id] = nil
                 guard self.store.items.contains(where: { $0.id == id && $0.text == text }) else { return }
@@ -931,6 +963,7 @@ import CryptoKit
         messageClearGeneration += 1; messageClearTask?.cancel(); messageClearTask = nil
         studio.shutdown()
         dreamina.shutdown()
+        classicCli.shutdown()
         clipboard.stop(); hotkeys.unregisterAll(); windows.cancel()
         screenshotGeneration += 1; screenshotRunner?.cancel(); screenshotBusy = false
         if let monitor = eventMonitor { NSEvent.removeMonitor(monitor) }
