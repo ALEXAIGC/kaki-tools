@@ -12,7 +12,7 @@ actor ClassicFixtureRunner: DreaminaRunning {
         calls.append(arguments)
         if arguments == ["text2video", "--help"] { return DreaminaOutput(status: 0, data: Data("--prompt --duration --ratio --video_resolution --model_version --poll seedance2.0 seedance2.0fast 720p 4-15 21:9".utf8)) }
         if arguments.count == 2, arguments[1] == "--help", ["image2video", "frames2video", "multiframe2video", "multimodal2video"].contains(arguments[0]) {
-            return DreaminaOutput(status: 0, data: Data("--image --first --last --images --video --audio --prompt --duration --video_resolution --model_version --poll --transition-prompt --transition-duration --ratio".utf8))
+            return DreaminaOutput(status: 0, data: Data("--image --first --last --images --video --audio --prompt --duration --video_resolution --model_version --poll --transition-prompt --transition-duration --ratio 720p 1080p".utf8))
         }
         if arguments == ["query_result", "--help"] { return DreaminaOutput(status: 0, data: Data("--submit_id --download_dir".utf8)) }
         if arguments == ["user_credit"] { return DreaminaOutput(status: creditValid ? 0 : 1, data: Data("{\"total_credit\":42}".utf8)) }
@@ -55,7 +55,7 @@ struct ClassicMalformedBridge: ClassicCliBridge {
 func runClassicCliTests() async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("kaki-classic-tests-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }
-    let snapshot = ClassicVideoSnapshot(prompt: "literal $(touch /never) ; `echo x`", model: "seedance2.0fast", duration: 5, aspect: "16:9", resolution: "720p")
+    let snapshot = ClassicVideoSnapshot(prompt: "literal $(touch /never) ; `echo x`", model: "seedance2.0fast", duration: 5, aspect: "16:9", resolution: "720p",mode:"text",profile:"resolution-five")
     func task(_ id: String, stage: String = "awaiting-confirmation", submit: String? = nil) -> ClassicVideoTask { ClassicVideoTask(id: id, projectId: "project", nodeId: "node", payloadHash: String(repeating: "a", count: 64), snapshot: snapshot, stage: stage, submitId: submit) }
     let videoValidator: @Sendable (URL) async throws -> Void = { url in guard try Data(contentsOf: url) == Data("validated-fixture-video".utf8) else { throw DreaminaError.invalidResponse } }
     let runner = ClassicFixtureRunner(), bridge = ClassicFixtureBridge(), cli = ClassicDreaminaCLI(runner: runner)

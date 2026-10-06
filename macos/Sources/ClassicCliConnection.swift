@@ -46,8 +46,16 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
     @Published private(set) var status = "未连接"
     @Published private(set) var connected = false
     @Published private(set) var busy = false
-    @Published private(set) var installed = ClassicDreaminaCLI.locate() != nil
+    @Published private(set) var installed = false
     @Published private(set) var version = ""
+    @Published private(set) var needsUpgrade = false
+    @Published private(set) var authorizationUserCode=""
+    @Published private(set) var authorizationURL:URL?
+    private let openAuthorization: @MainActor (URL) -> Bool
+    private let loginTimeout:TimeInterval
+    private let pollInterval:UInt64
+    private var executor: ClassicCliExecutor?
+    private var claimed = false
     private weak var studio: StudioStore?
     private let directory: URL
     private let enabled: Bool
@@ -56,13 +64,24 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
     private var operation: Task<Void, Never>?
     private var bridge: ClassicStudioBridge?
     private var generation = UUID()
+    private var operationID=UUID()
+    private let locator: @Sendable () -> URL?
+    private let inspector: @Sendable (URL) async throws -> ClassicCliInstallation
+    private let runnerFactory: @Sendable (URL) -> DreaminaRunning
+    private let detectionTimeout:TimeInterval
     private struct Authorization: Codable { let owner: String; let fingerprint: String; let device: ClassicCliDevice; var profile: String? = nil }
-    init(studio: StudioStore, directory: URL, enabled: Bool) { self.studio = studio; self.directory = directory.appendingPathComponent("classic-cli", isDirectory: true); self.enabled = enabled }
+    init(studio: StudioStore, directory: URL, enabled: Bool, locator: @escaping @Sendable () -> URL? = {ClassicDreaminaCLI.locate()}, inspector: @escaping @Sendable (URL) async throws -> ClassicCliInstallation = {try await ClassicCliInstaller.inspect($0)}, runnerFactory: @escaping @Sendable (URL) -> DreaminaRunning = {DreaminaProcessRunner(executable:$0)}, detectionTimeout:TimeInterval = 30,loginTimeout:TimeInterval = 180,pollInterval:UInt64 = 2_000_000_000,openAuthorization:@escaping @MainActor (URL)->Bool = {NSWorkspace.shared.open($0)}) {
+        self.studio=studio;self.directory=directory.appendingPathComponent("classic-cli",isDirectory:true);self.enabled=enabled
+        self.locator=locator;self.inspector=inspector;self.runnerFactory=runnerFactory;self.detectionTimeout=detectionTimeout;self.loginTimeout=loginTimeout;self.pollInterval=pollInterval;self.openAuthorization=openAuthorization;self.installed=locator() != nil
+    }
+    func cancelOperation() {clearAuthorization();operationID=UUID();operation?.cancel();operation=nil;busy=false;status="操作已取消，请重试"}
+
     private var owner: String? {
         guard let studio, let user = studio.user, !studio.workspaceID.isEmpty else { return nil }
         return studio.environment.baseURL.absoluteString + "|" + user.id + "|" + studio.workspaceID
     }
     func identityChanged() {
+        clearAuthorization()
         generation = UUID(); loop?.cancel(); heartbeat?.stop(); operation?.cancel(); loop = nil; heartbeat = nil; operation = nil
         let previous = bridge; bridge = nil; connected = false; busy = false; status = "请为当前账号连接"
         if let previous {
@@ -77,71 +96,121 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
     }
     func detect() {
         guard !busy else {return}
-        guard let executable = ClassicDreaminaCLI.locate() else {installed = false; status = "未安装即梦 CLI"; return}
-        busy = true; status = "检测即梦 CLI…"
-        let ticket = generation
+        guard let executable = locator() else {installed = false; status = "未安装即梦 CLI"; return}
+        busy = true; status = "检查 CLI 与五种视频方式…"
+        let ticket = generation, op=UUID();operationID=op
         operation = Task { [weak self] in
             guard let self else {return}
-            defer {if self.generation == ticket {self.busy = false}}
+            defer {if self.generation == ticket && self.operationID == op {self.busy = false}}
             do {
-                let receipt = try await ClassicCliInstaller.inspect(executable)
-                guard self.generation == ticket else {return}
+                let checked = try await classicCliDeadline(seconds:self.detectionTimeout) {
+                    let receipt=try await self.inspector(executable)
+                    await self.checkingLogin(ticket,op:op)
+                    let loggedIn=try await ClassicDreaminaCLI(runner:self.runnerFactory(executable)).loginState()
+                    return (receipt,loggedIn)
+                }
+                let receipt=checked.0
+                guard self.generation == ticket && self.operationID == op else {return}
                 self.installed = true
+                self.needsUpgrade = false
                 let object = try? JSONSerialization.jsonObject(with: Data(receipt.version.utf8)) as? [String: Any]
                 self.version = (object?["version"] as? String) ?? receipt.version.prefix(100).description
-                let cli = ClassicDreaminaCLI(runner: DreaminaProcessRunner(executable: executable))
-                let loggedIn = (try? await cli.verify()) != nil
-                guard self.generation == ticket else {return}
+                let loggedIn=checked.1
+                guard self.generation == ticket && self.operationID == op else {return}
                 self.status = self.connected ? "已连接 · 使用本机即梦登录" : loggedIn ? "已安装 · 即梦已登录 · 未连接" : "已安装 · 请登录即梦"
-            } catch {if self.generation == ticket {self.status = "CLI 检测失败，请核对安装或重新检测"}}
+            } catch ClassicCliUpgradeError.required {if self.generation == ticket && self.operationID == op {self.installed=true;self.needsUpgrade=true;self.status="请更新即梦 CLI 以使用五种视频方式"}} catch {if self.generation == ticket && self.operationID == op {self.status = "CLI 检测失败或超时，请重试；登录状态尚未确认"}}
         }
     }
     func install() {
         guard !busy else {return}
-        if ClassicDreaminaCLI.locate() != nil {detect(); return}
+        if locator() != nil {detect(); return}
         busy = true; status = "正在下载安装即梦 CLI…"
-        let ticket = generation
+        let ticket = generation, op=UUID();operationID=op
         operation = Task { [weak self] in
             guard let self else {return}
-            defer {if self.generation == ticket {self.busy = false}}
+            defer {if self.generation == ticket && self.operationID == op {self.busy = false}}
             do {
-                let receipt = try await ClassicCliInstaller().install()
-                guard self.generation == ticket else {return}
-                self.installed = true
+                let receipt = try await ClassicCliInstaller().install(canReplace:{[self] in await self.canUpgrade(ticket,op:op)})
+                guard self.generation == ticket && self.operationID == op else {return}
+                self.installed = true; self.needsUpgrade = false
                 self.version = receipt.version.prefix(100).description
                 self.status = "已安装 · 请登录即梦后连接"
-            } catch {if self.generation == ticket {self.status = "安装失败，可重新检测或重试安装"}}
+            } catch {if self.generation == ticket && self.operationID == op {self.status = "安装失败，可重新检测或重试安装"}}
         }
     }
-    func login() {
-        guard !busy, let executable = ClassicDreaminaCLI.locate() else {return}
-        busy = true; status = "请在即梦登录页面完成授权…"
-        let ticket = generation
-        operation = Task { [weak self] in
+    func upgrade() {
+        guard !busy, !claimed, !connected, let executable=locator() else {status="请先断开连接并等待本机任务结束";return}
+        busy=true;status="正在验证并更新即梦 CLI…"
+        let ticket=generation, op=UUID();operationID=op
+        operation=Task { [weak self] in
             guard let self else {return}
-            defer {if self.generation == ticket {self.busy = false}}
+            defer {if self.generation == ticket && self.operationID == op {self.busy=false}}
             do {
-                let output = try await DreaminaProcessRunner(executable: executable).run(["login"], timeout: 180)
-                guard output.status == 0 else {throw DreaminaError.notLinked}
-                _ = try await ClassicDreaminaCLI(runner: DreaminaProcessRunner(executable: executable)).verify()
-                guard self.generation == ticket else {return}
-                self.status = "即梦已登录 · 可连接当前 Studio 工作区"
-            } catch {if self.generation == ticket {self.status = "即梦登录未完成，请重新登录"}}
+                _ = try await ClassicCliInstaller().install(upgrading:executable,canReplace:{[self] in
+                    guard await self.canUpgrade(ticket,op:op) else {return false}
+                    return await self.executor?.isIdle() ?? true
+                })
+                guard self.generation == ticket && self.operationID == op else {return}
+                self.installed=true;self.needsUpgrade=false;self.version=""
+                self.status="CLI 已更新，请重新检测、登录并关联工作区"
+            } catch {if self.generation == ticket && self.operationID == op {self.status="CLI 更新未完成，原登录与任务记录保留"}}
+        }
+    }
+    private func canUpgrade(_ ticket:UUID,op:UUID) -> Bool {generation == ticket && operationID == op && !Task.isCancelled && !claimed && !connected}
+    private func checkingLogin(_ ticket:UUID,op:UUID) {if generation == ticket && operationID == op {status="检查即梦登录…"}}
+    private func clearAuthorization() {authorizationUserCode="";authorizationURL=nil}
+    private func showAuthorization(_ value:ClassicCliAuthorization,ticket:UUID,op:UUID) -> Bool {
+        guard generation == ticket && operationID == op && !Task.isCancelled else {return false}
+        authorizationUserCode=value.userCode;authorizationURL=value.url;status="等待即梦授权，请在官方页面输入授权码"
+        _ = openAuthorization(value.url) // Once for this session; the visible button allows an explicit retry.
+        return true
+    }
+    func openAuthorizationPage() {if let url=authorizationURL {_ = openAuthorization(url)}}
+    func copyAuthorizationCode(to board:NSPasteboard = .general) {
+        guard !authorizationUserCode.isEmpty else {return}
+        board.clearContents();board.setString(authorizationUserCode,forType:.string)
+        board.setData(Data(),forType:.init("org.nspasteboard.TransientType"))
+    }
+    func login() {
+        guard !busy,!needsUpgrade,let executable=locator() else {return}
+        busy=true;clearAuthorization();status="检查即梦登录…"
+        let ticket=generation,op=UUID();operationID=op
+        operation=Task { [weak self] in
+            guard let self else {return}
+            defer {if self.generation == ticket && self.operationID == op {self.busy=false;self.clearAuthorization()}}
+            do {
+                let runner=self.runnerFactory(executable)
+                try await classicCliDeadline(seconds:self.loginTimeout) {
+                    if try await ClassicDreaminaCLI(runner:runner).loginState() {return}
+                    let authorization=try await ClassicCliAuthorization.begin(runner)
+                    guard await self.showAuthorization(authorization,ticket:ticket,op:op) else {throw CancellationError()}
+                    while true {
+                        try Task.checkCancellation()
+                        if try await authorization.poll(runner) {
+                            guard try await ClassicDreaminaCLI(runner:runner).loginState() else {throw DreaminaError.invalidResponse}
+                            return
+                        }
+                        try await Task.sleep(nanoseconds:self.pollInterval)
+                    }
+                }
+                guard self.generation == ticket && self.operationID == op else {return}
+                self.status="即梦已登录 · 可连接当前 Studio 工作区"
+            } catch {if self.generation == ticket && self.operationID == op {self.status="即梦登录取消、超时或未完成，请重试"}}
         }
     }
     func connect() {
-        guard enabled, !busy, let studio, let owner, let context = studio.classicCliContext(), let executable = ClassicDreaminaCLI.locate() else { status = "请先登录 Studio，并安装经典即梦 CLI"; return }
+        guard enabled, !busy, let studio, let owner, let context = studio.classicCliContext(), let executable = locator() else { status = "请先登录 Studio，并安装经典即梦 CLI"; return }
         busy = true; status = "检查本机登录…"
-        let ticket = generation
+        let ticket = generation, op=UUID();operationID=op
         operation = Task { [weak self] in
             guard let self else { return }
-            defer { if self.generation == ticket { self.busy = false } }
+            defer { if self.generation == ticket && self.operationID == op && !Task.isCancelled { self.busy = false } }
             do {
                 let fingerprint = try await Task.detached { try ClassicDreaminaCLI.fingerprint(executable) }.value
-                let cli = ClassicDreaminaCLI(runner: DreaminaProcessRunner(executable: executable))
-                let models = try await cli.verify()
-                let profile = try await cli.detectedProfile()
-                guard self.owner == owner, self.generation == ticket else { return }
+                let cli = ClassicDreaminaCLI(runner: self.runnerFactory(executable))
+                let models = try await classicCliDeadline(seconds:self.detectionTimeout) {try await cli.verify()}
+                let profile = "resolution-five"
+                guard self.owner == owner, self.generation == ticket && self.operationID == op && !Task.isCancelled else { return }
                 let file = try self.location(owner)
                 let saved = try? JSONDecoder().decode(Authorization.self, from: Data(contentsOf: file))
                 let current: @Sendable () async -> Bool = { [self] in
@@ -151,27 +220,28 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
                 var candidate: ClassicStudioBridge?
                 if let saved, saved.owner == owner, saved.fingerprint == fingerprint, saved.profile == profile {
                     let restored = ClassicStudioBridge(client: context.client, session: context.session, workspace: context.workspace, device: saved.device, current: current)
-                    do { _ = try await restored.client.json(restored.request("devices/resume")); candidate = restored } catch { /* explicit consent required before replacement */ }
+                    do {try Task.checkCancellation(); _ = try await restored.client.json(restored.request("devices/resume")); candidate = restored } catch { /* explicit consent required before replacement */ }
                 }
-                guard self.owner == owner, self.generation == ticket else { return }
+                guard self.owner == owner, self.generation == ticket && self.operationID == op && !Task.isCancelled else { return }
                 if candidate == nil {
                     let alert = NSAlert(); alert.messageText = "关联本机即梦登录？"
                     alert.informativeText = "使用本机即梦登录，经典 CLI 无法核验即梦账号 ID。关联当前 Studio 账号与工作区；每个视频将在本机再次确认，使用本人即梦额度。"
                     alert.addButton(withTitle: "关联"); alert.addButton(withTitle: "取消")
                     guard alert.runModal() == .alertFirstButtonReturn else { self.status = "未连接"; return }
-                    guard await current() else { return }
+                    guard await current(),self.operationID == op,!Task.isCancelled else { return }
                     let body = try JSONSerialization.data(withJSONObject: ["origin": context.client.environment.baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")), "models": models, "profile": profile] as [String: Any])
                     let (data, _) = try await context.client.json(context.client.request(path: "api/local-cli/devices/register", method: "POST", session: context.session, workspace: context.workspace, body: body))
+                    guard await current(),self.operationID == op,!Task.isCancelled else {return}
                     let device = try JSONDecoder().decode(ClassicCliDevice.self, from: data)
                     let authorization = Authorization(owner: owner, fingerprint: fingerprint, device: device, profile: profile)
                     try JSONEncoder().encode(authorization).write(to: file, options: .atomic)
                     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
                     candidate = ClassicStudioBridge(client: context.client, session: context.session, workspace: context.workspace, device: device, current: current)
                 }
-                guard let candidate, await current() else { return }
+                guard let candidate, await current(),self.operationID == op,!Task.isCancelled else { return }
                 self.bridge = candidate; self.connected = true; self.status = "已连接 · 使用本机即梦登录"
                 self.start(cli: cli, executable: executable, fingerprint: fingerprint, bridge: candidate, owner: owner, ticket: ticket)
-            } catch { if self.generation == ticket { self.status = "连接失败，请检查 Studio 与本机即梦登录" } }
+            } catch ClassicCliUpgradeError.required {if self.generation == ticket && self.operationID == op && !Task.isCancelled {self.needsUpgrade=true;self.status="请更新即梦 CLI 后重新关联"}} catch { if self.generation == ticket && self.operationID == op && !Task.isCancelled { self.status = "连接失败，请检查 Studio 与本机即梦登录" } }
         }
     }
     private func start(cli: ClassicDreaminaCLI, executable: URL, fingerprint: String, bridge: ClassicStudioBridge, owner: String, ticket: UUID) {
@@ -179,7 +249,7 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
         // Keep presence alive independently of confirmation, submission, and slow result downloads.
         // The copied bridge binds the original session/workspace; identityChanged cancels this task.
         heartbeat = ClassicCliHeartbeat { _ = try await bridge.client.json(bridge.request("devices/heartbeat")) }
-        let executor = ClassicCliExecutor(cli: cli, directory: directory.appendingPathComponent("journal", isDirectory: true))
+        let executor = ClassicCliExecutor(cli: cli, directory: directory.appendingPathComponent("journal", isDirectory: true)); self.executor=executor
         loop = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self, self.owner == owner, self.generation == ticket else { return }
@@ -190,6 +260,8 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
                     let (data, _) = try await bridge.client.json(bridge.request("devices/claim"))
                     struct Claim: Decodable { let task: ClassicVideoTask? }
                     if let task = try JSONDecoder().decode(Claim.self, from: data).task {
+                        self.claimed=true
+                        defer {self.claimed=false}
                         self.status = task.submitId == nil && task.stage != "awaiting-confirmation" ? "提交结果待核对，请勿重新生成" : "本机视频处理中"
                         try await executor.step(task: task, owner: owner, bridge: bridge, authorize: {
                             await MainActor.run {
@@ -242,5 +314,16 @@ enum ClassicCliConfirmation {
             }.joined(separator:"\n")
         } else { preview = String(snapshot.prompt.prefix(500)) }
         return "\(title) · \(snapshot.model) · \(String(format:"%g",snapshot.duration))秒 · \(snapshot.aspect == "source" ? "随源图比例" : snapshot.aspect) · \(snapshot.resolution == "default" ? "CLI 默认清晰度" : snapshot.resolution)\n引用：\(order.isEmpty ? "无" : order)\n\(preview)\n使用当前本机即梦登录；确认后只提交一次。"
+    }
+}
+
+/** A single operation deadline cancels its child; the process runner then kills/reaps its own group. */
+func classicCliDeadline<T:Sendable>(seconds:TimeInterval, operation:@escaping @Sendable () async throws -> T) async throws -> T {
+    try await withThrowingTaskGroup(of:T.self) {group in
+        group.addTask {try await operation()}
+        group.addTask {try await Task.sleep(nanoseconds:UInt64(max(0.01,seconds)*1_000_000_000));throw DreaminaError.timedOut}
+        defer {group.cancelAll()}
+        guard let value=try await group.next() else {throw DreaminaError.invalidResponse}
+        return value
     }
 }

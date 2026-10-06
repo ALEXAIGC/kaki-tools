@@ -32,6 +32,7 @@ func check(_ condition: @autoclosure () -> Bool, _ message: String, file: Static
             try await runDreaminaTests()
             try await runClassicCliTests()
             try await runClassicFiveModesTests()
+            try await runClassicModernTests()
             print("NATIVE_TESTS_PASSED \(checkCount) assertions")
         } catch { fputs("NATIVE_TESTS_FAILED \(error)\n", stderr); exit(1) }
     }

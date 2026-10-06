@@ -30,6 +30,37 @@ struct ClassicVideoSnapshot: Codable, Equatable, Sendable {
               ["text", "image", "firstlast", "imageref", "omni"].contains(effectiveMode),
               refs.count <= 20, Set(refs.map {$0.kind + ":" + $0.nodeId}).count == refs.count,
               refs.allSatisfy({["image", "video", "audio"].contains($0.kind) && $0.bytes > 0 && $0.bytes <= ($0.kind == "video" ? 100 : 30) * 1024 * 1024 && $0.sha256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil && $0.source.range(of: "^/api/private-files/[a-f0-9-]{36}\\.[a-z0-9]{1,5}$", options: .regularExpression) != nil}) else { throw DreaminaError.invalidResponse }
+        guard profile == "resolution-five" else {throw ClassicCliUpgradeError.required}
+        if effectiveMode == "imageref" {
+            let segments = transitions ?? [], min = 1.0
+            guard model == "dreamina-multiframe", aspect == "source", images.count >= 2, images.count == refs.count,
+                  segments.count == images.count - 1, segments.allSatisfy({!$0.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.prompt.count <= 10000 && $0.duration.isFinite && $0.duration >= min && $0.duration <= 8}),
+                  duration >= 2, abs(segments.reduce(0) {$0 + $1.duration} - duration) < 0.000001,
+                  ["720p", "1080p"].contains(resolution) else {throw DreaminaError.invalidResponse}
+            return
+        }
+        guard ["seedance2.0", "seedance2.0fast"].contains(model), duration.rounded() == duration, (4...15).contains(duration), resolution == "720p", transitions?.isEmpty != false else {throw DreaminaError.invalidResponse}
+        switch effectiveMode {
+        case "text": guard refs.isEmpty else {throw DreaminaError.invalidResponse}
+        case "image": guard images.count == 1, refs.count == 1, aspect == "source" else {throw DreaminaError.invalidResponse}
+        case "firstlast": guard images.count == 2, refs.count == 2, aspect == "source" else {throw DreaminaError.invalidResponse}
+        case "omni":
+            guard images.count + videos.count > 0, images.count <= 9, videos.count <= 3, audios.count <= 3, refs.count <= 12 else {throw DreaminaError.invalidResponse}
+            for kind in ["video", "audio"] {
+                let media = refs.filter {$0.kind == kind}
+                guard media.allSatisfy({$0.duration?.isFinite == true && $0.duration! >= 2 && $0.duration! <= 15}), media.reduce(0, {$0 + ($1.duration ?? 0)}) <= 15 else {throw DreaminaError.invalidResponse}
+            }
+        default: throw DreaminaError.invalidResponse
+        }
+        if ["text", "omni"].contains(effectiveMode) { guard ["1:1", "3:4", "16:9", "4:3", "9:16", "21:9"].contains(aspect) else {throw DreaminaError.invalidResponse} }
+    }
+    // Signed original receipts only; this validator is never used to build paid argv.
+    func validateRecovery() throws {
+        let refs = references ?? [], images = refs.filter {$0.kind == "image"}, videos = refs.filter {$0.kind == "video"}, audios = refs.filter {$0.kind == "audio"}
+        guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, prompt.count <= 10000,
+              ["text", "image", "firstlast", "imageref", "omni"].contains(effectiveMode),
+              refs.count <= 20, Set(refs.map {$0.kind + ":" + $0.nodeId}).count == refs.count,
+              refs.allSatisfy({["image", "video", "audio"].contains($0.kind) && $0.bytes > 0 && $0.bytes <= ($0.kind == "video" ? 100 : 30) * 1024 * 1024 && $0.sha256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil && $0.source.range(of: "^/api/private-files/[a-f0-9-]{36}\\.[a-z0-9]{1,5}$", options: .regularExpression) != nil}) else { throw DreaminaError.invalidResponse }
         if effectiveMode != "text" { guard ["legacy-five", "resolution-five"].contains(profile ?? "") else {throw DreaminaError.unsupportedCLI} }
         if effectiveMode == "imageref" {
             let segments = transitions ?? [], min = profile == "resolution-five" ? 1.0 : 0.5
@@ -102,25 +133,34 @@ struct ClassicDreaminaCLI: Sendable {
             ("text2video", ["--prompt", "--duration", "--ratio", "--video_resolution", "--model_version", "--poll", "seedance2.0", "seedance2.0fast", "720p", "21:9"]),
             ("image2video", ["--image", "--prompt", "--duration", "--video_resolution", "--model_version", "--poll"]),
             ("frames2video", ["--first", "--last", "--prompt", "--duration", "--video_resolution", "--model_version", "--poll"]),
-            ("multiframe2video", ["--images", "--transition-prompt", "--transition-duration", "--poll"]),
+            ("multiframe2video", ["--images", "--transition-prompt", "--transition-duration", "--poll", "--video_resolution", "720p", "1080p"]),
             ("multimodal2video", ["--image", "--video", "--audio", "--prompt", "--duration", "--ratio", "--video_resolution", "--model_version", "--poll"]),
             ("query_result", ["--submit_id", "--download_dir"])
         ]
-        var profile = "legacy-five"
+        let profile = "resolution-five"
         for (command, flags) in contracts {
             let output = try await runner.run([command, "--help"], timeout: 15)
             let text = String(decoding: output.data, as: UTF8.self)
-            guard output.status == 0, output.data.count < 128000, flags.allSatisfy(text.contains) else {throw DreaminaError.unsupportedCLI}
-            if command == "multiframe2video", text.contains("--video_resolution") { profile = "resolution-five" }
+            guard output.status == 0, output.data.count < 128000, flags.allSatisfy(text.contains) else {throw ClassicCliUpgradeError.required}
+
         }
         return profile
     }
     func verify() async throws -> [String] {
         _ = try await detectedProfile()
-        let credit = try await runner.run(["user_credit"], timeout: 20)
-        let object = try Self.object(credit)
-        guard let credit = object["total_credit"] as? NSNumber, credit.doubleValue.isFinite, credit.doubleValue >= 0 else { throw DreaminaError.notLinked }
+        guard try await loginState() else {throw DreaminaError.notLinked}
         return ["seedance2.0", "seedance2.0fast", "dreamina-multiframe"]
+    }
+    func loginState() async throws -> Bool {
+        let output=try await runner.run(["user_credit"],timeout:15)
+        if output.status != 0 {
+            let text=String(decoding:output.data,as:UTF8.self)
+            if text.contains("未检测到有效登录态") || text.contains("请先执行 dreamina login") {return false}
+            throw DreaminaError.invalidResponse
+        }
+        let object=try Self.object(output)
+        guard let credit=object["total_credit"] as? NSNumber, credit.doubleValue.isFinite, credit.doubleValue >= 0 else {throw DreaminaError.invalidResponse}
+        return true
     }
     static func object(_ output: DreaminaOutput) throws -> [String: Any] {
         guard output.status == 0, output.data.count <= 2 * 1024 * 1024,
@@ -140,7 +180,7 @@ struct ClassicDreaminaCLI: Sendable {
         case "firstlast": args = ["frames2video", "--first", files[0].path, "--last", files[1].path]
         case "imageref":
             args = ["multiframe2video", "--images", files.map(\.path).joined(separator: ",")]
-            if snapshot.profile == "resolution-five" {args += ["--video_resolution", snapshot.resolution]}
+            args += ["--video_resolution", snapshot.resolution]
             if files.count == 2 {
                 args += ["--prompt", snapshot.transitions![0].prompt, "--duration", seconds(snapshot.transitions![0].duration)]
             } else {
@@ -181,6 +221,7 @@ actor ClassicCliExecutor {
     let cli: ClassicDreaminaCLI
     let directory: URL
     private var busy = false
+    func isIdle() -> Bool { !busy }
     init(cli: ClassicDreaminaCLI, directory: URL) { self.cli = cli; self.directory = directory }
     private func location(_ task: ClassicVideoTask) throws -> URL {
         guard ClassicDreaminaCLI.validID(task.id) else { throw DreaminaError.invalidResponse }
@@ -203,7 +244,7 @@ actor ClassicCliExecutor {
               isCurrent: @Sendable () async -> Bool,
               validateVideo: @Sendable (URL) async throws -> Void) async throws {
         if busy { return }; busy = true; defer { busy = false }
-        try task.snapshot.validate()
+        try task.snapshot.validateRecovery()
         let path = try location(task)
         // A crash can leave prepared inputs, never a reason to re-submit. Delete
         // only this validated task's private input directories on reentry.
@@ -227,6 +268,11 @@ actor ClassicCliExecutor {
             try await bridge.event(task: task, event: journal.stage, submitId: journal.submitId); return
         }
         if journal.stage == "awaiting-confirmation" {
+            guard task.snapshot.profile == "resolution-five" else {
+                journal.stage = "preparation-failed"; try save(journal)
+                try await bridge.event(task:task,event:"preparation-failed",submitId:nil)
+                return
+            }
             let inputs = directory.appendingPathComponent(task.id + "-input-" + UUID().uuidString, isDirectory: true)
             try FileManager.default.createDirectory(at: inputs, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
             defer {try? FileManager.default.removeItem(at: inputs)}

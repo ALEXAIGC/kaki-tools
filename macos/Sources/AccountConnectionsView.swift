@@ -200,7 +200,7 @@ private struct WebsiteIllustration: View {
     }
 }
 
-@MainActor private struct ClassicCliConnectionView: View {
+@MainActor struct ClassicCliConnectionView: View {
     @ObservedObject var connection: ClassicCliConnection
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -208,11 +208,18 @@ private struct WebsiteIllustration: View {
             Text(connection.status).font(.system(size: 13, weight: .medium))
             Text("使用本机即梦登录 · 每次生成需确认本人即梦额度").font(.system(size: 11)).foregroundStyle(.secondary)
             if !connection.version.isEmpty {Text(connection.version).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)}
+            if let url=connection.authorizationURL {
+                Text("本次授权码：" + connection.authorizationUserCode).font(.system(size:15,weight:.semibold,design:.monospaced)).textSelection(.enabled)
+                Text(url.absoluteString).font(.system(size:11)).foregroundStyle(.secondary).textSelection(.enabled)
+                HStack {Button("复制授权码") {connection.copyAuthorizationCode()};Button("打开授权页面") {connection.openAuthorizationPage()}}
+            }
             HStack {
+                if connection.busy {Button("取消操作") {connection.cancelOperation()}}
                 if !connection.installed {Button("安装即梦 CLI") {connection.install()}.disabled(connection.busy)}
+                if connection.needsUpgrade {Button("更新即梦 CLI") {connection.upgrade()}.disabled(connection.busy || connection.connected)}
                 Button("重新检测") {connection.detect()}.disabled(connection.busy)
                 if connection.installed {Button("登录即梦") {connection.login()}.disabled(connection.busy)}
-                Button(connection.connected ? "重新检查" : "连接本机 CLI") { connection.connect() }.disabled(connection.busy || !connection.installed)
+                Button(connection.connected ? "重新检查" : "连接本机 CLI") { connection.connect() }.disabled(connection.busy || !connection.installed || connection.needsUpgrade)
                 if connection.connected { Button("断开") { connection.disconnect() } }
             }
         }.onAppear {connection.detect()}

@@ -1,5 +1,8 @@
 import Foundation
 import CryptoKit
+import Darwin
+
+enum ClassicCliUpgradeError: Error { case required, active, changed }
 
 struct ClassicCliInstallation: Sendable {
     let executable: URL
@@ -23,21 +26,27 @@ struct ClassicCliInstaller: @unchecked Sendable {
     }
     static func inspect(_ executable: URL) async throws -> ClassicCliInstallation {
         guard FileManager.default.isExecutableFile(atPath: executable.path) else { throw DreaminaError.unsupportedCLI }
-        let runner = DreaminaProcessRunner(executable: executable)
+        return try await inspect(executable, runner:DreaminaProcessRunner(executable:executable))
+    }
+    static func inspect(_ executable:URL, runner:DreaminaRunning) async throws -> ClassicCliInstallation {
         let version = try await runner.run(["--version"], timeout: 15)
         guard version.status == 0, version.data.count < 16_384 else { throw DreaminaError.unsupportedCLI }
-        for mode in ["text2video", "image2video", "frames2video", "multiframe2video", "multimodal2video", "query_result"] {
-            let help = try await runner.run([mode, "--help"], timeout: 15)
-            guard help.status == 0, help.data.count < 128_000, String(decoding: help.data, as: UTF8.self).contains(mode) else { throw DreaminaError.unsupportedCLI }
-        }
-        let bytes = try Data(contentsOf: executable, options: .mappedIfSafe)
-        return ClassicCliInstallation(executable: executable, version: String(decoding: version.data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines), sha256: SHA256.hash(data: bytes).map {String(format: "%02x", $0)}.joined())
+        _ = try await ClassicDreaminaCLI(runner:runner).detectedProfile()
+        let hash = try await Task.detached {try ClassicDreaminaCLI.fingerprint(executable).split(separator:":").last.map(String.init)!}.value
+        return ClassicCliInstallation(executable: executable, version: String(decoding: version.data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines), sha256: hash)
     }
-    func install() async throws -> ClassicCliInstallation {
-        let fm = FileManager.default, target = directory.appendingPathComponent("dreamina")
-        if fm.fileExists(atPath: target.path) { return try await Self.inspect(target) }
+    static func processesIdle(_ executable:URL) async throws -> Bool {
+        let result=try await DreaminaProcessRunner(executable:URL(fileURLWithPath:"/usr/bin/pgrep")).run(["-x",executable.lastPathComponent],timeout:3)
+        guard [0,1].contains(result.status) else {throw ClassicCliUpgradeError.active}
+        return result.status == 1
+    }
+    func install(upgrading executable:URL? = nil, canReplace: @Sendable () async -> Bool = {true}) async throws -> ClassicCliInstallation {
+        let fm = FileManager.default, target = executable ?? directory.appendingPathComponent("dreamina")
+        let original = fm.fileExists(atPath:target.path) ? try ClassicDreaminaCLI.fingerprint(target) : nil
+        if executable == nil, original != nil {return try await Self.inspect(target)}
+        guard await canReplace(), try await Self.processesIdle(target) else {throw ClassicCliUpgradeError.active}
         try fm.createDirectory(at: directory, withIntermediateDirectories: true)
-        let staging = directory.appendingPathComponent(".dreamina-install-" + UUID().uuidString, isDirectory: true)
+        let staging = target.deletingLastPathComponent().appendingPathComponent(".dreamina-install-" + UUID().uuidString, isDirectory: true)
         try fm.createDirectory(at: staging, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         defer { try? fm.removeItem(at: staging) }
         let request = URLRequest(url: URL(string: Self.base + Self.binaryName)!)
@@ -57,9 +66,17 @@ struct ClassicCliInstaller: @unchecked Sendable {
         try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: candidate.path)
         let inspection = try await Self.inspect(candidate)
         try Task.checkCancellation()
-        // Move never replaces a concurrently installed CLI. No shell/PATH/profile
-        // edits, quarantine removal, or modification of existing login state.
-        try fm.moveItem(at: candidate, to: target)
+        guard await canReplace(), try await Self.processesIdle(target) else {throw ClassicCliUpgradeError.active}
+        if let original {
+            guard (try target.resourceValues(forKeys:[.isSymbolicLinkKey])).isSymbolicLink != true, try ClassicDreaminaCLI.fingerprint(target) == original else {throw ClassicCliUpgradeError.changed}
+            // Keep a non-executable recovery copy. POSIX rename atomically replaces only the rechecked binary.
+            let backup=target.deletingLastPathComponent().appendingPathComponent(".dreamina-backup-" + UUID().uuidString)
+            try fm.copyItem(at:target,to:backup)
+            try fm.setAttributes([.posixPermissions:0o600],ofItemAtPath:backup.path)
+            guard await canReplace(), try ClassicDreaminaCLI.fingerprint(target) == original else {throw ClassicCliUpgradeError.changed}
+            try Task.checkCancellation()
+            guard rename(candidate.path,target.path) == 0 else {throw POSIXError(POSIXErrorCode(rawValue:errno) ?? .EIO)}
+        } else {try fm.moveItem(at: candidate, to: target)}
         return ClassicCliInstallation(executable: target, version: inspection.version, sha256: inspection.sha256)
     }
 }

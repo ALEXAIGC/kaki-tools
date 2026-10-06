@@ -32,6 +32,7 @@ private actor PreparationBridgeFixture: ClassicCliBridge {
     func event(task: ClassicVideoTask, event: String, submitId: String?) async throws {events.append(event)}
     func upload(task: ClassicVideoTask, submitId: String, file: URL) async throws {}
 }
+private actor UpgradeGateFixture {var calls=0;func approve()->Bool {calls += 1;return calls == 1}}
 private actor ConfirmationFixture {var count = 0; func approve() -> Bool {count += 1; return true}; func value() -> Int {count}}
 
 func runClassicFiveModesTests() async throws {
@@ -57,10 +58,7 @@ func runClassicFiveModesTests() async throws {
             try check(!args.contains("--model_version") && args.contains("1080p"),"new multiframe real resolution/fixed model")
             try check(args.filter {$0 == "--transition-prompt"}.count == 2 && args.contains("first → second") && args.contains("second → third"),"N-1 descriptions retained")
             var old = snapshot; old.profile = "legacy-five"
-            // Construct the old fixed-resolution contract explicitly.
-            old = ClassicVideoSnapshot(prompt:old.prompt,model:old.model,duration:old.duration,aspect:old.aspect,resolution:"default",mode:old.mode,profile:old.profile,references:old.references,transitions:old.transitions)
-            let oldArgs = try ClassicDreaminaCLI.arguments(old,files:files)
-            try check(!oldArgs.contains("--video_resolution"),"old multiframe has no unsupported resolution flag")
+            do {_ = try ClassicDreaminaCLI.arguments(old,files:files);throw NativeTestFailure(description:"old contracts must never produce paid argv")} catch ClassicCliUpgradeError.required {}
         }
         let runner = ClassicFixtureRunner(), cli = ClassicDreaminaCLI(runner:runner)
         let task = ClassicVideoTask(id:mode,projectId:"project",nodeId:"target",payloadHash:String(repeating:"a",count:64),snapshot:snapshot,stage:"awaiting-confirmation",submitId:nil)
@@ -82,6 +80,19 @@ func runClassicFiveModesTests() async throws {
     try check(events == ["preparation-failed","preparation-failed"],"terminal preparation failure retries only its receipt")
     let remains = try FileManager.default.contentsOfDirectory(atPath:root.appendingPathComponent("prepare").path)
     try check(!remains.contains {$0.contains("-input-")},"failed preparation removes private inputs")
+    // Historical receipts remain queryable, while none of the old profiles can submit again.
+    for profile in [nil,"text-only","legacy-five"] as [String?] {
+        let oldSnapshot=ClassicVideoSnapshot(prompt:"historical",model:"seedance2.0fast",duration:5,aspect:"16:9",resolution:"720p",mode:"text",profile:profile)
+        let oldRunner=ClassicFixtureRunner(), oldBridge=ClassicFixtureBridge()
+        let oldExecutor=ClassicCliExecutor(cli:ClassicDreaminaCLI(runner:oldRunner),directory:root.appendingPathComponent("history-" + (profile ?? "missing")))
+        for stage in ["awaiting-confirmation","unknown","submitted"] {
+            let oldTask=ClassicVideoTask(id:stage,projectId:"project",nodeId:"node",payloadHash:String(repeating:"c",count:64),snapshot:oldSnapshot,stage:stage,submitId:stage == "submitted" ? "real-fixture-id" : nil)
+            try await oldExecutor.step(task:oldTask,owner:"original-owner",bridge:oldBridge,authorize:{throw NativeTestFailure(description:"historical task never asks to submit")},isCurrent:{true},validateVideo:{_ in})
+        }
+        let oldCalls=await oldRunner.allCalls(), values=await oldBridge.values()
+        try check(oldCalls.count == 1 && oldCalls[0][0...2] == ["query_result","--submit_id","real-fixture-id"] && values.1 == 1,"old signed snapshot only queries/uploads original submit ID, never paid CLI")
+        try check(values.0.prefix(2) == ["preparation-failed","unknown"],"old unsubmitted and UNKNOWN receipts are safe terminal/manual recovery")
+    }
     let transport = ReferenceTransportFixture(bytes:image)
     let bridge = ClassicStudioBridge(client:StudioClient(environment:.test,transport:transport),session:StudioSession(value:"fixture",expiresAt:Date().addingTimeInterval(600)),workspace:"fixture-workspace",device:ClassicCliDevice(id:"fixture-device",epoch:"fixture-epoch",secret:"fixture-secret"),current:{true})
     let inputs = root.appendingPathComponent("download")
@@ -110,6 +121,35 @@ func runClassicFiveModesTests() async throws {
     let failureTransport = ReferenceTransportFixture(bytes:Data("not a binary".utf8))
     do {_ = try await ClassicCliInstaller(directory:root.appendingPathComponent("install-failed"),transport:failureTransport).install();throw NativeTestFailure(description:"invalid installer must fail")} catch DreaminaError.invalidResponse {}
     try check(!FileManager.default.fileExists(atPath:root.appendingPathComponent("install-failed/dreamina").path),"failed install creates no executable")
+    if let path = ProcessInfo.processInfo.environment["KAKI_CLI_UPGRADE_TEST_BINARY"] {
+        let officialBytes=try Data(contentsOf:URL(fileURLWithPath:path)), upgradeRoot=root.appendingPathComponent("upgrade")
+        try FileManager.default.createDirectory(at:upgradeRoot,withIntermediateDirectories:false)
+        let target=upgradeRoot.appendingPathComponent("dreamina-" + UUID().uuidString)
+        let original=Data("#!/bin/sh\necho isolated-original\n".utf8)
+        try original.write(to:target);try FileManager.default.setAttributes([.posixPermissions:0o700],ofItemAtPath:target.path)
+        let upgradeTransport=ReferenceTransportFixture(bytes:officialBytes)
+        let installer=ClassicCliInstaller(directory:upgradeRoot,transport:upgradeTransport)
+        do {_ = try await installer.install(upgrading:target,canReplace:{false});throw NativeTestFailure(description:"active operation must refuse upgrade")} catch ClassicCliUpgradeError.active {}
+        let blockedRequests=await upgradeTransport.recorded()
+        let blockedBytes=try Data(contentsOf:target)
+        try check(blockedRequests.isEmpty && blockedBytes == original,"active/stale operation cannot even download or replace")
+        do {_ = try await ClassicCliInstaller(directory:upgradeRoot,transport:failureTransport).install(upgrading:target);throw NativeTestFailure(description:"bad upgrade must fail")} catch DreaminaError.invalidResponse {}
+        let failedBytes=try Data(contentsOf:target)
+        try check(failedBytes == original,"failed candidate leaves original executable unchanged")
+        let gate=UpgradeGateFixture()
+        do {_ = try await installer.install(upgrading:target,canReplace:{await gate.approve()});throw NativeTestFailure(description:"cancelled upgrade cannot replace")} catch ClassicCliUpgradeError.active {}
+        let cancelledBytes=try Data(contentsOf:target)
+        try check(cancelledBytes == original,"operation invalidated after download cannot replace executable")
+        let installation=try await installer.install(upgrading:target)
+        let upgradedBytes=try Data(contentsOf:target)
+        try check(upgradedBytes == officialBytes && installation.sha256.count == 64,"isolated upgrade atomically installs inspected official bytes")
+        let backups=try FileManager.default.contentsOfDirectory(at:upgradeRoot,includingPropertiesForKeys:nil).filter {$0.lastPathComponent.hasPrefix(".dreamina-backup-")}
+        try check(backups.count == 1,"exactly one recovery backup retained")
+        let permissions=try FileManager.default.attributesOfItem(atPath:backups[0].path)[.posixPermissions] as? NSNumber
+        let backupBytes=try Data(contentsOf:backups[0]), remaining=try FileManager.default.contentsOfDirectory(atPath:upgradeRoot.path)
+        try check(backupBytes == original && permissions?.intValue == 0o600,"upgrade retains non-executable private original backup")
+        try check(!remaining.contains {$0.hasPrefix(".dreamina-install-")},"upgrade always cleans isolated staging directories")
+    }
     if let path = ProcessInfo.processInfo.environment["KAKI_CLI_INSTALL_QA_DIR"] {
         let installation = try await ClassicCliInstaller(directory:URL(fileURLWithPath:path)).install()
         let receipt: [String: String] = ["executable":installation.executable.path,"version":installation.version,"contentSha256":installation.sha256,"authenticity":"fixed official HTTPS; vendor checksum absent"]
