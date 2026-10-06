@@ -6,6 +6,7 @@ enum StudioEnvironment: String, CaseIterable, Identifiable {
     case test, production
     var id: String { rawValue }
     var label: String { self == .test ? "测试环境" : "正式环境" }
+    var siteLabel: String { self == .test ? "测试站" : "正式站" }
     var baseURL: URL { URL(string: self == .test ? "https://test.kakiai.xin" : "https://kakiai.xin")! }
 }
 struct StudioUser: Codable, Equatable {

@@ -31,6 +31,7 @@ func check(_ condition: @autoclosure () -> Bool, _ message: String, file: Static
             try await runStudioCacheTests()
             try await runDreaminaTests()
             try await runClassicCliTests()
+            try await runClassicDiagnosticsTests()
             try await runClassicFiveModesTests()
             try await runClassicModernTests()
             print("NATIVE_TESTS_PASSED \(checkCount) assertions")

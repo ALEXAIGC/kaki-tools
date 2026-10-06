@@ -11,7 +11,7 @@ private actor ModernLoginRunner:DreaminaRunning {
     func run(_ arguments:[String],timeout:TimeInterval) async throws -> DreaminaOutput {
         if arguments == ["user_credit"] {
             if networkError {throw DreaminaError.timedOut}
-            return DreaminaOutput(status:done ? 0 : 1,data:Data((done ? "{\"total_credit\":42}" : "未检测到有效登录态，请先执行 dreamina login").utf8))
+            return DreaminaOutput(status:done ? 0 : 1,data:Data((done ? "{\"total_credit\":42,\"user_id\":\"fixture-account\"}" : "未检测到有效登录态，请先执行 dreamina login").utf8))
         }
         if arguments == ["login","--help"] {return DreaminaOutput(status:0,data:Data("--headless".utf8))}
         if arguments == ["login","--headless"] {return DreaminaOutput(status:0,data:Data("verification_uri: https://jimeng.jianying.com/ai-tool/cli-auth\nuser_code: TEST-1234\ndevice_code: synthetic-device-session\n".utf8))}
@@ -66,6 +66,16 @@ private struct BrokenInspectionRunner:DreaminaRunning {
     try await until {!connection.busy}
     let calls=await inspector.count()
     try check(calls == 1 && connection.status.contains("超时") && !connection.status.contains("请登录"),"one bounded detection, timeout distinct from not logged in, retry restored")
+    // Identity changes invalidate an in-flight inspection and its late callback.
+    connection.detect()
+    try await Task.sleep(nanoseconds:20_000_000)
+    connection.identityChanged()
+    try await Task.sleep(nanoseconds:150_000_000)
+    try check(!connection.connected && !connection.busy && connection.status.contains("重新连接"), "identity invalidation clears connection and prevents stale detection callback")
+    try check(connection.targetDescription.contains("测试站 · test.kakiai.xin") && connection.targetDescription.contains("未选择工作区"), "unassociated CLI names the exact current site and workspace")
+    await studio.changeEnvironment(.production)
+    connection.identityChanged()
+    try check(connection.targetDescription.contains("正式站 · kakiai.xin") && !connection.targetDescription.contains("test.kakiai.xin"), "production target never displays the old test origin")
     await inspector.configure(hang:false)
     connection.detect();try await until {!connection.busy}
     try check(connection.status == "已安装 · 请登录即梦","real not logged in outcome without swallowing network errors")

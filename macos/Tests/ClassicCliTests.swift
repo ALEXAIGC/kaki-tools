@@ -15,7 +15,7 @@ actor ClassicFixtureRunner: DreaminaRunning {
             return DreaminaOutput(status: 0, data: Data("--image --first --last --images --video --audio --prompt --duration --video_resolution --model_version --poll --transition-prompt --transition-duration --ratio 720p 1080p".utf8))
         }
         if arguments == ["query_result", "--help"] { return DreaminaOutput(status: 0, data: Data("--submit_id --download_dir".utf8)) }
-        if arguments == ["user_credit"] { return DreaminaOutput(status: creditValid ? 0 : 1, data: Data("{\"total_credit\":42}".utf8)) }
+        if arguments == ["user_credit"] { return DreaminaOutput(status: creditValid ? 0 : 1, data: Data("{\"total_credit\":42,\"user_id\":\"fixture-account\"}".utf8)) }
         if let command = arguments.first, ["text2video", "image2video", "frames2video", "multiframe2video", "multimodal2video"].contains(command) {
             if self.timeout { throw DreaminaError.timedOut }
             return DreaminaOutput(status: 0, data: Data("{\"submit_id\":\"real-fixture-id\"}".utf8))
@@ -130,14 +130,14 @@ func runClassicCliTests() async throws {
     let lostAck = task("intent-ack-lost")
     do { try await executor.step(task: lostAck, owner: "owner|ws", bridge: bridge, authorize: { true }, isCurrent: { true }, validateVideo: videoValidator) } catch DreaminaError.timedOut { }
     try await restarted.step(task: lostAck, owner: "owner|ws", bridge: bridge, authorize: { true }, isCurrent: { true }, validateVideo: videoValidator)
-    let callsAfterLostAck = await runner.allCalls(); try check(callsAfterLostAck == beforeSwitch, "intent acknowledgement loss never invokes paid command")
+    let callsAfterLostAck = await runner.allCalls(); try check(callsAfterLostAck.filter {$0 != ["user_credit"]} == beforeSwitch.filter {$0 != ["user_credit"]}, "intent acknowledgement loss never invokes paid command")
     await runner.configure()
     let invalidReceipts = [Data("<html>login</html>".utf8),Data("{}".utf8),Data("{\"accepted\":true,\"jobId\":\"wrong-task\"}".utf8)]
     for (index, data) in invalidReceipts.enumerated() {
         let before = await runner.allCalls()
         do { try await executor.step(task: task("bad-dispatch-" + String(index)), owner:"owner|ws",bridge:ClassicMalformedBridge(eventData:data,uploadData:data),authorize:{true},isCurrent:{true},validateVideo:videoValidator); throw NativeTestFailure(description:"malformed dispatch receipt accepted") } catch { }
         let after = await runner.allCalls()
-        try check(after == before, "200 HTML/empty/wrong-task dispatch receipt never spawns")
+        try check(after.filter {$0 != ["user_credit"]} == before.filter {$0 != ["user_credit"]}, "200 HTML/empty/wrong-task dispatch receipt never spawns")
         let uploading = task("bad-upload-" + String(index))
         do { try await executor.step(task: uploading,owner:"owner|ws",bridge:ClassicMalformedBridge(eventData:nil,uploadData:data),authorize:{true},isCurrent:{true},validateVideo:videoValidator) } catch { }
         let saved = try JSONDecoder().decode(ClassicCliJournal.self,from:Data(contentsOf:directory.appendingPathComponent(uploading.id + ".json")))

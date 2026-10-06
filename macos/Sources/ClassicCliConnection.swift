@@ -24,6 +24,13 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
         try ClassicCliReceipt.event(data, task: task, event: event, submitId: submitId)
         guard await current() else { throw DreaminaError.wrongOwner }
     }
+    func failure(task: ClassicVideoTask, event: String, code: String) async throws {
+        guard await current() else {throw DreaminaError.wrongOwner}
+        let fields=["payloadHash":task.payloadHash,"event":event,"failureCode":code]
+        let (data,_)=try await client.json(request("tasks/"+task.id+"/events",fields:fields))
+        try ClassicCliReceipt.event(data,task:task,event:event,submitId:nil)
+        guard await current() else {throw DreaminaError.wrongOwner}
+    }
     func upload(task: ClassicVideoTask, submitId: String, file: URL) async throws {
         guard await current() else { throw DreaminaError.wrongOwner }
         let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
@@ -80,10 +87,17 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
         guard let studio, let user = studio.user, !studio.workspaceID.isEmpty else { return nil }
         return studio.environment.baseURL.absoluteString + "|" + user.id + "|" + studio.workspaceID
     }
+    var targetSiteDescription: String {
+        guard let studio else { return "请先登录 Studio" }
+        let site = studio.environment.siteLabel + " · " + (studio.environment.baseURL.host ?? "")
+        return (connected ? "已关联：" : "当前站点：") + site
+    }
+    var targetWorkspaceName: String { studio?.workspaceName ?? "未选择工作区" }
+    var targetDescription: String { targetSiteDescription + "\n工作区：" + targetWorkspaceName }
     func identityChanged() {
         clearAuthorization()
         generation = UUID(); loop?.cancel(); heartbeat?.stop(); operation?.cancel(); loop = nil; heartbeat = nil; operation = nil
-        let previous = bridge; bridge = nil; connected = false; busy = false; status = "请为当前账号连接"
+        let previous = bridge; bridge = nil; connected = false; busy = false; status = "站点、账号或工作区已变更，请重新连接"
         if let previous {
             Task { _ = try? await previous.client.json(previous.request("devices/pause")) }
         }
@@ -225,7 +239,7 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
                 guard self.owner == owner, self.generation == ticket && self.operationID == op && !Task.isCancelled else { return }
                 if candidate == nil {
                     let alert = NSAlert(); alert.messageText = "关联本机即梦登录？"
-                    alert.informativeText = "使用本机即梦登录，经典 CLI 无法核验即梦账号 ID。关联当前 Studio 账号与工作区；每个视频将在本机再次确认，使用本人即梦额度。"
+                    alert.informativeText = "使用本机即梦登录，经典 CLI 无法核验即梦账号 ID。关联当前 Studio 账号与工作区；画布点击生成后由本机直接执行，使用本人即梦额度。"
                     alert.addButton(withTitle: "关联"); alert.addButton(withTitle: "取消")
                     guard alert.runModal() == .alertFirstButtonReturn else { self.status = "未连接"; return }
                     guard await current(),self.operationID == op,!Task.isCancelled else { return }
@@ -263,15 +277,7 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
                         self.claimed=true
                         defer {self.claimed=false}
                         self.status = task.submitId == nil && task.stage != "awaiting-confirmation" ? "提交结果待核对，请勿重新生成" : "本机视频处理中"
-                        try await executor.step(task: task, owner: owner, bridge: bridge, authorize: {
-                            await MainActor.run {
-                                guard self.owner == owner, self.generation == ticket else { return false }
-                                let alert = NSAlert(); alert.messageText = "使用本机即梦额度生成视频？"
-                                alert.informativeText = ClassicCliConfirmation.text(task.snapshot)
-                                alert.addButton(withTitle: "确认生成"); alert.addButton(withTitle: "取消")
-                                return alert.runModal() == .alertFirstButtonReturn
-                            }
-                        }, isCurrent: bridge.current, validateVideo: { try await Self.validateVideo($0) })
+                        try await executor.step(task: task, owner: owner, bridge: bridge, isCurrent: bridge.current, validateVideo: { try await Self.validateVideo($0) })
                     } else { self.status = "已连接 · 使用本机即梦登录" }
                 } catch {
                     guard self.generation == ticket else { return }
@@ -313,7 +319,7 @@ enum ClassicCliConfirmation {
                 "第\(index + 1)→\(index + 2)张 · \(String(format:"%g",row.duration))秒：\(row.prompt.prefix(100))"
             }.joined(separator:"\n")
         } else { preview = String(snapshot.prompt.prefix(500)) }
-        return "\(title) · \(snapshot.model) · \(String(format:"%g",snapshot.duration))秒 · \(snapshot.aspect == "source" ? "随源图比例" : snapshot.aspect) · \(snapshot.resolution == "default" ? "CLI 默认清晰度" : snapshot.resolution)\n引用：\(order.isEmpty ? "无" : order)\n\(preview)\n使用当前本机即梦登录；确认后只提交一次。"
+        return "\(title) · \(snapshot.model) · \(String(format:"%g",snapshot.duration))秒 · \(snapshot.aspect == "source" ? "随源图比例" : snapshot.aspect) · \(snapshot.resolution == "default" ? "CLI 默认清晰度" : snapshot.resolution)\n引用：\(order.isEmpty ? "无" : order)\n\(preview)\n使用当前本机即梦登录；画布点击生成后直接执行。"
     }
 }
 

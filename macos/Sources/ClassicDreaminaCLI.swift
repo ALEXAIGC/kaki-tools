@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 import Darwin
 import CryptoKit
 
@@ -106,13 +107,16 @@ struct ClassicCliJournal: Codable {
     var stage: String
     var submitId: String?
     var file: String?
+    var failureCode: String? = nil
 }
 protocol ClassicCliBridge: Sendable {
     func prepareReferences(task: ClassicVideoTask, directory: URL) async throws -> [URL]
     func event(task: ClassicVideoTask, event: String, submitId: String?) async throws
     func upload(task: ClassicVideoTask, submitId: String, file: URL) async throws
+    func failure(task: ClassicVideoTask, event: String, code: String) async throws
 }
 extension ClassicCliBridge {
+    func failure(task: ClassicVideoTask, event: String, code: String) async throws { try await self.event(task:task,event:event,submitId:nil) }
     func prepareReferences(task: ClassicVideoTask, directory: URL) async throws -> [URL] {
         guard task.snapshot.references?.isEmpty != false else {throw DreaminaError.unsupportedCLI}
         return []
@@ -159,8 +163,18 @@ struct ClassicDreaminaCLI: Sendable {
             throw DreaminaError.invalidResponse
         }
         let object=try Self.object(output)
-        guard let credit=object["total_credit"] as? NSNumber, credit.doubleValue.isFinite, credit.doubleValue >= 0 else {throw DreaminaError.invalidResponse}
+        guard Self.hasAccountIdentity(object), let credit=object["total_credit"] as? NSNumber, CFGetTypeID(credit) != CFBooleanGetTypeID(), credit.doubleValue.isFinite, credit.doubleValue >= 0 else {throw DreaminaError.invalidResponse}
         return true
+    }
+    static func hasAccountIdentity(_ object: [String: Any]) -> Bool {
+        if let id=object["user_id"] as? String {
+            let value=id.trimmingCharacters(in:.whitespacesAndNewlines)
+            return !value.isEmpty && value != "0"
+        }
+        if let id=object["user_id"] as? NSNumber {
+            return CFGetTypeID(id) != CFBooleanGetTypeID() && id.doubleValue.isFinite && id.doubleValue > 0
+        }
+        return false
     }
     static func object(_ output: DreaminaOutput) throws -> [String: Any] {
         guard output.status == 0, output.data.count <= 2 * 1024 * 1024,
@@ -198,8 +212,35 @@ struct ClassicDreaminaCLI: Sendable {
     }
     func submit(_ snapshot: ClassicVideoSnapshot, files: [URL] = []) async throws -> String {
         let output = try await runner.run(Self.arguments(snapshot, files: files), timeout: 90)
-        let object = try Self.object(output)
-        guard let id = object["submit_id"] as? String, Self.validID(id) else { throw DreaminaError.invalidResponse }
+        return try Self.submissionID(output)
+    }
+    static func submissionID(_ output: DreaminaOutput) throws -> String {
+        guard output.data.count<=2*1024*1024,let text=String(data:output.data,encoding:.utf8) else {throw ClassicCliSubmissionError.receiptInvalid}
+        if output.status != 0 {
+            let lower=text.lowercased()
+            if text.contains("AigcComplianceConfirmationRequired") {throw ClassicCliSubmissionError.complianceRequired}
+            if text.contains("未检测到有效登录态") || text.contains("请先执行 dreamina login") {throw ClassicCliSubmissionError.loginRequired}
+            if text.contains("额度不足") || text.contains("积分不足") || text.contains("余额不足") || lower.contains("insufficient credit") {throw ClassicCliSubmissionError.insufficientCredits}
+            if lower.contains("unknown flag") || lower.contains("invalid argument") || lower.contains("required flag") {throw ClassicCliSubmissionError.argumentsRejected}
+            throw ClassicCliSubmissionError.rejected
+        }
+        // Upload progress may contain earlier JSON documents. Accept only the final complete object.
+        var depth=0,quoted=false,escaped=false,start:String.Index?,last:[String:Any]?,lastEnd:String.Index?
+        for index in text.indices {
+            let c=text[index]
+            if quoted {if escaped {escaped=false} else if c=="\\" {escaped=true} else if c=="\"" {quoted=false};continue}
+            if depth>0 && c=="\"" {quoted=true;continue}
+            if c=="{" {if depth==0 {start=index};depth += 1}
+            if c=="}" && depth>0 {
+                depth -= 1
+                if depth==0,let start {
+                    last=try? JSONSerialization.jsonObject(with:Data(text[start...index].utf8)) as? [String:Any]
+                    lastEnd=text.index(after:index)
+                }
+            }
+        }
+        guard depth==0,let object=last,let end=lastEnd,text[end...].trimmingCharacters(in:.whitespacesAndNewlines).isEmpty else {throw ClassicCliSubmissionError.receiptInvalid}
+        guard let id=object["submit_id"] as? String,Self.validID(id) else {throw ClassicCliSubmissionError.receiptMissing}
         return id
     }
     static func validID(_ value: String) -> Bool { !value.isEmpty && value.count <= 200 && value.range(of: "^[a-zA-Z0-9_-]+$", options: .regularExpression) != nil }
@@ -240,7 +281,7 @@ actor ClassicCliExecutor {
         guard fsync(descriptor) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
     }
     func step(task: ClassicVideoTask, owner: String, bridge: ClassicCliBridge,
-              authorize: @Sendable () async throws -> Bool,
+              authorize: (@Sendable () async throws -> Bool)? = nil,
               isCurrent: @Sendable () async -> Bool,
               validateVideo: @Sendable (URL) async throws -> Void) async throws {
         if busy { return }; busy = true; defer { busy = false }
@@ -265,7 +306,7 @@ actor ClassicCliExecutor {
         guard await isCurrent() else { throw DreaminaError.wrongOwner }
         if journal.stage == "completed" { return }
         if journal.stage == "declined" || journal.stage == "failed" || journal.stage == "preparation-failed" {
-            try await bridge.event(task: task, event: journal.stage, submitId: journal.submitId); return
+            if let code=journal.failureCode {try await bridge.failure(task:task,event:journal.stage,code:code)} else {try await bridge.event(task: task, event: journal.stage, submitId: journal.submitId)}; return
         }
         if journal.stage == "awaiting-confirmation" {
             guard task.snapshot.profile == "resolution-five" else {
@@ -293,7 +334,8 @@ actor ClassicCliExecutor {
                 try await bridge.event(task: task, event: "preparation-failed", submitId: nil)
                 return
             }
-            let approved = try await authorize()
+            let approved: Bool
+            if let authorize { approved = try await authorize() } else { approved = await isCurrent() }
             guard await isCurrent() else { throw DreaminaError.wrongOwner }
             if !approved { journal.stage = "declined"; try save(journal); try await bridge.event(task: task, event: "declined", submitId: nil); return }
             guard await isCurrent() else {throw DreaminaError.wrongOwner}
@@ -305,14 +347,18 @@ actor ClassicCliExecutor {
                 let id = try await cli.submit(task.snapshot, files: files)
                 journal.submitId = id; journal.stage = "submitted"; try save(journal)
             } catch {
-                journal.stage = "unknown"; try save(journal)
-                try? await bridge.event(task: task, event: "unknown", submitId: nil)
+                journal.stage = "unknown"
+                journal.failureCode=ClassicCliSubmissionError.code(error)
+                try save(journal)
+                try? await bridge.failure(task:task,event:"unknown",code:journal.failureCode!)
                 return
             }
         }
         // Consent declined is persisted even if its first API receipt was lost.
         guard let submitId = journal.submitId ?? task.submitId else {
-            journal.stage = "unknown"; try save(journal); try? await bridge.event(task: task, event: "unknown", submitId: nil); return
+            journal.stage = "unknown"; try save(journal)
+            if let code=journal.failureCode {try? await bridge.failure(task:task,event:"unknown",code:code)} else {try? await bridge.event(task: task, event: "unknown", submitId: nil)}
+            return
         }
         guard await isCurrent() else { throw DreaminaError.wrongOwner }
         if journal.stage != "upload-ready" {
@@ -370,5 +416,15 @@ struct ClassicCliReceipt {
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any], object["jobId"] as? String == task.id,
               object["status"] as? String == "done", object["submitId"] as? String == submitId,
               let url = object["url"] as? String, url.range(of: "^/api/private-files/[a-f0-9-]{36}\\.(mp4|mov|webm)$", options: .regularExpression) != nil else { throw DreaminaError.invalidResponse }
+    }
+}
+
+enum ClassicCliSubmissionError: String, Error {
+    case insufficientCredits="insufficient-credits",loginRequired="login-required",argumentsRejected="arguments-rejected",complianceRequired="compliance-required",rejected="cli-rejected",receiptMissing="receipt-missing",receiptInvalid="receipt-invalid"
+    static func code(_ error:Error)->String {
+        if let error=error as? Self {return error.rawValue}
+        if error is CancellationError {return "submit-cancelled"}
+        if let error=error as? DreaminaError,case .timedOut=error {return "submit-timeout"}
+        return "submit-error"
     }
 }

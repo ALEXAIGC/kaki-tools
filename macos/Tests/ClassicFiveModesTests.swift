@@ -64,7 +64,7 @@ func runClassicFiveModesTests() async throws {
         let task = ClassicVideoTask(id:mode,projectId:"project",nodeId:"target",payloadHash:String(repeating:"a",count:64),snapshot:snapshot,stage:"awaiting-confirmation",submitId:nil)
         let bridge = PreparationBridgeFixture(files:Array(files.prefix(count)))
         let executor = ClassicCliExecutor(cli:cli,directory:root.appendingPathComponent(mode))
-        try await executor.step(task:task,owner:"same-owner",bridge:bridge,authorize:{true},isCurrent:{true},validateVideo:{_ in})
+        try await executor.step(task:task,owner:"same-owner",bridge:bridge,isCurrent:{true},validateVideo:{_ in})
         try await executor.step(task:task,owner:"same-owner",bridge:bridge,authorize:{throw StudioError.invalidResponse},isCurrent:{true},validateVideo:{_ in})
         let calls = await runner.allCalls()
         try check(calls.filter {$0.first == command}.count == 1,"every mode uploads/reenters without second submission")

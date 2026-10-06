@@ -16,6 +16,7 @@ enum AccountConnectionSite: String, CaseIterable, Identifiable {
     var openLibrary: () -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var classicStatus = ""
+    @State private var classicConnected = false
     @State private var expanded: AccountConnectionSite?
 
     init(studio: StudioStore, connector: DreaminaConnector, classicCli: ClassicCliConnection? = nil, openLibrary: @escaping () -> Void,
@@ -41,6 +42,7 @@ enum AccountConnectionSite: String, CaseIterable, Identifiable {
             }
         }
         .onReceive(classicCli?.$status.eraseToAnyPublisher() ?? Just("").eraseToAnyPublisher()) { classicStatus = $0 }
+        .onReceive(classicCli?.$connected.eraseToAnyPublisher() ?? Just(false).eraseToAnyPublisher()) { classicConnected = $0 }
         .animation(reduceMotion ? nil : .spring(response: 0.32, dampingFraction: 0.88), value: expanded)
         .task { if !Task.isCancelled { await studio.restoreSession() } }
         .onDisappear { select(nil) }
@@ -62,12 +64,12 @@ enum AccountConnectionSite: String, CaseIterable, Identifiable {
         (notification.object as? NSWindow)?.contentView is NSHostingView<NativeSettingsView>
     }
     private func domain(_ site: AccountConnectionSite) -> String {
-        site == .studio ? (studio.environment.baseURL.host ?? "kakiai.xin") : "jimeng.jianying.com"
+        site == .studio ? (studio.environment.siteLabel + " · " + (studio.environment.baseURL.host ?? "kakiai.xin")) : "jimeng.jianying.com"
     }
-    private func active(_ site: AccountConnectionSite) -> Bool { site == .studio ? studio.user != nil : (classicCli?.connected == true || connector.verified) }
+    private func active(_ site: AccountConnectionSite) -> Bool { site == .studio ? studio.user != nil : (classicCli != nil ? classicConnected : connector.verified) }
     private func status(_ site: AccountConnectionSite) -> String {
         if site == .studio { return studio.user != nil ? "已登录" : "未登录" }
-        if classicCli != nil { return classicStatus.isEmpty ? "未连接" : classicStatus }
+        if classicCli != nil { return classicConnected ? "已连接" : classicStatus.isEmpty ? "未连接" : classicStatus }
         return connector.verified ? "已关联" : connector.binding == nil ? "未关联" : "待验证"
     }
     private func subtitle(_ site: AccountConnectionSite) -> String {
@@ -91,7 +93,13 @@ enum AccountConnectionSite: String, CaseIterable, Identifiable {
                 if site == .studio { StudioAccountView(studio: studio, openLibrary: openLibrary, embedded: true) }
                 else if let classicCli {
                     ClassicCliConnectionView(connection: classicCli)
-                    DisclosureGroup("dreamina-canvas 独立连接") { DreaminaConnectionView(connector: connector, studio: studio, isPresented: { expanded == .dreamina }) }
+                    DisclosureGroup("dreamina-canvas 独立连接") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("此通路独立关联，连接结果不影响经典 CLI。")
+                                .font(.system(size: 11)).foregroundStyle(.secondary)
+                            DreaminaConnectionView(connector: connector, studio: studio, isPresented: { expanded == .dreamina })
+                        }
+                    }
                 }
                 else { DreaminaConnectionView(connector: connector, studio: studio, isPresented: { expanded == .dreamina }) }
             }
@@ -206,7 +214,13 @@ private struct WebsiteIllustration: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("经典即梦 CLI").font(.system(size: 12, weight: .semibold))
             Text(connection.status).font(.system(size: 13, weight: .medium))
-            Text("使用本机即梦登录 · 每次生成需确认本人即梦额度").font(.system(size: 11)).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(connection.targetSiteDescription).lineLimit(1).truncationMode(.middle)
+                    .help(connection.targetSiteDescription)
+                Text("工作区：" + connection.targetWorkspaceName).lineLimit(1).truncationMode(.tail)
+                    .help(connection.targetWorkspaceName)
+            }.font(.system(size: 11)).foregroundStyle(.secondary).textSelection(.enabled)
+            Text("使用本机即梦登录 · 由画布发起 · 使用本人即梦额度").font(.system(size: 11)).foregroundStyle(.secondary)
             if !connection.version.isEmpty {Text(connection.version).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)}
             if let url=connection.authorizationURL {
                 Text("本次授权码：" + connection.authorizationUserCode).font(.system(size:15,weight:.semibold,design:.monospaced)).textSelection(.enabled)
