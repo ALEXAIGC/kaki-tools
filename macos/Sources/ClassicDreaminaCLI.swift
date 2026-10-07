@@ -14,6 +14,24 @@ struct ClassicCliReference: Codable, Equatable, Sendable {
     let duration: Double?
 }
 struct ClassicCliTransition: Codable, Equatable, Sendable { let prompt: String; let duration: Double }
+enum ClassicVideoModels {
+    static let supported = ["seedance2.0", "seedance2.0fast", "seedance2.0_vip", "seedance2.0fast_vip", "seedance2.0mini", "seedance2.5"]
+    static func title(_ model: String) -> String {
+        switch model {
+        case "seedance2.0": return "Seedance 2.0 · 普通"
+        case "seedance2.0fast": return "Seedance 2.0 Fast · 普通"
+        case "seedance2.0_vip": return "Seedance 2.0 · VIP"
+        case "seedance2.0fast_vip": return "Seedance 2.0 Fast · VIP"
+        case "seedance2.0mini": return "Seedance 2.0 Mini"
+        case "seedance2.5": return "Seedance 2.5 · VIP · 常规生成"
+        default: return model
+        }
+    }
+    static func valid(model: String, duration: Double, resolution: String) -> Bool {
+        let resolutions = model == "seedance2.5" ? ["480p", "720p", "1080p"] : model == "seedance2.0_vip" ? ["720p", "1080p", "4k"] : ["720p"]
+        return supported.contains(model) && duration.isFinite && duration.rounded() == duration && (4...(model == "seedance2.5" ? 30.0 : 15.0)).contains(duration) && resolutions.contains(resolution)
+    }
+}
 struct ClassicVideoSnapshot: Codable, Equatable, Sendable {
     let prompt: String
     let model: String
@@ -29,7 +47,7 @@ struct ClassicVideoSnapshot: Codable, Equatable, Sendable {
         let refs = references ?? [], images = refs.filter {$0.kind == "image"}, videos = refs.filter {$0.kind == "video"}, audios = refs.filter {$0.kind == "audio"}
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, prompt.count <= 10000,
               ["text", "image", "firstlast", "imageref", "omni"].contains(effectiveMode),
-              refs.count <= 20, Set(refs.map {$0.kind + ":" + $0.nodeId}).count == refs.count,
+              refs.count <= (model == "seedance2.5" ? 50 : 20), Set(refs.map {$0.kind + ":" + $0.nodeId}).count == refs.count,
               refs.allSatisfy({["image", "video", "audio"].contains($0.kind) && $0.bytes > 0 && $0.bytes <= ($0.kind == "video" ? 100 : 30) * 1024 * 1024 && $0.sha256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil && $0.source.range(of: "^/api/private-files/[a-f0-9-]{36}\\.[a-z0-9]{1,5}$", options: .regularExpression) != nil}) else { throw DreaminaError.invalidResponse }
         guard profile == "resolution-five" else {throw ClassicCliUpgradeError.required}
         if effectiveMode == "imageref" {
@@ -40,16 +58,16 @@ struct ClassicVideoSnapshot: Codable, Equatable, Sendable {
                   ["720p", "1080p"].contains(resolution) else {throw DreaminaError.invalidResponse}
             return
         }
-        guard ["seedance2.0", "seedance2.0fast"].contains(model), duration.rounded() == duration, (4...15).contains(duration), resolution == "720p", transitions?.isEmpty != false else {throw DreaminaError.invalidResponse}
+        guard ClassicVideoModels.valid(model: model, duration: duration, resolution: resolution), transitions?.isEmpty != false else {throw DreaminaError.invalidResponse}
         switch effectiveMode {
         case "text": guard refs.isEmpty else {throw DreaminaError.invalidResponse}
         case "image": guard images.count == 1, refs.count == 1, aspect == "source" else {throw DreaminaError.invalidResponse}
         case "firstlast": guard images.count == 2, refs.count == 2, aspect == "source" else {throw DreaminaError.invalidResponse}
         case "omni":
-            guard images.count + videos.count > 0, images.count <= 9, videos.count <= 3, audios.count <= 3, refs.count <= 12 else {throw DreaminaError.invalidResponse}
+            guard (model == "seedance2.5" ? !refs.isEmpty : images.count + videos.count > 0), images.count <= (model == "seedance2.5" ? 30 : 9), videos.count <= (model == "seedance2.5" ? 10 : 3), audios.count <= (model == "seedance2.5" ? 10 : 3), refs.count <= (model == "seedance2.5" ? 50 : 12) else {throw DreaminaError.invalidResponse}
             for kind in ["video", "audio"] {
                 let media = refs.filter {$0.kind == kind}
-                guard media.allSatisfy({$0.duration?.isFinite == true && $0.duration! >= 2 && $0.duration! <= 15}), media.reduce(0, {$0 + ($1.duration ?? 0)}) <= 15 else {throw DreaminaError.invalidResponse}
+                guard media.allSatisfy({$0.duration?.isFinite == true && $0.duration! >= 2 && $0.duration! <= (model == "seedance2.5" ? 30 : 15)}), media.reduce(0, {$0 + ($1.duration ?? 0)}) <= (model == "seedance2.5" ? 30 : 15) else {throw DreaminaError.invalidResponse}
             }
         default: throw DreaminaError.invalidResponse
         }
@@ -60,7 +78,7 @@ struct ClassicVideoSnapshot: Codable, Equatable, Sendable {
         let refs = references ?? [], images = refs.filter {$0.kind == "image"}, videos = refs.filter {$0.kind == "video"}, audios = refs.filter {$0.kind == "audio"}
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, prompt.count <= 10000,
               ["text", "image", "firstlast", "imageref", "omni"].contains(effectiveMode),
-              refs.count <= 20, Set(refs.map {$0.kind + ":" + $0.nodeId}).count == refs.count,
+              refs.count <= (model == "seedance2.5" ? 50 : 20), Set(refs.map {$0.kind + ":" + $0.nodeId}).count == refs.count,
               refs.allSatisfy({["image", "video", "audio"].contains($0.kind) && $0.bytes > 0 && $0.bytes <= ($0.kind == "video" ? 100 : 30) * 1024 * 1024 && $0.sha256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil && $0.source.range(of: "^/api/private-files/[a-f0-9-]{36}\\.[a-z0-9]{1,5}$", options: .regularExpression) != nil}) else { throw DreaminaError.invalidResponse }
         if effectiveMode != "text" { guard ["legacy-five", "resolution-five"].contains(profile ?? "") else {throw DreaminaError.unsupportedCLI} }
         if effectiveMode == "imageref" {
@@ -71,16 +89,16 @@ struct ClassicVideoSnapshot: Codable, Equatable, Sendable {
                   profile == "resolution-five" ? ["720p", "1080p"].contains(resolution) : resolution == "default" else {throw DreaminaError.invalidResponse}
             return
         }
-        guard ["seedance2.0", "seedance2.0fast"].contains(model), duration.rounded() == duration, (4...15).contains(duration), resolution == "720p", transitions?.isEmpty != false else {throw DreaminaError.invalidResponse}
+        guard ClassicVideoModels.valid(model: model, duration: duration, resolution: resolution), transitions?.isEmpty != false else {throw DreaminaError.invalidResponse}
         switch effectiveMode {
         case "text": guard refs.isEmpty else {throw DreaminaError.invalidResponse}
         case "image": guard images.count == 1, refs.count == 1, aspect == "source" else {throw DreaminaError.invalidResponse}
         case "firstlast": guard images.count == 2, refs.count == 2, aspect == "source" else {throw DreaminaError.invalidResponse}
         case "omni":
-            guard images.count + videos.count > 0, images.count <= 9, videos.count <= 3, audios.count <= 3, refs.count <= 12 else {throw DreaminaError.invalidResponse}
+            guard (model == "seedance2.5" ? !refs.isEmpty : images.count + videos.count > 0), images.count <= (model == "seedance2.5" ? 30 : 9), videos.count <= (model == "seedance2.5" ? 10 : 3), audios.count <= (model == "seedance2.5" ? 10 : 3), refs.count <= (model == "seedance2.5" ? 50 : 12) else {throw DreaminaError.invalidResponse}
             for kind in ["video", "audio"] {
                 let media = refs.filter {$0.kind == kind}
-                guard media.allSatisfy({$0.duration?.isFinite == true && $0.duration! >= 2 && $0.duration! <= 15}), media.reduce(0, {$0 + ($1.duration ?? 0)}) <= 15 else {throw DreaminaError.invalidResponse}
+                guard media.allSatisfy({$0.duration?.isFinite == true && $0.duration! >= 2 && $0.duration! <= (model == "seedance2.5" ? 30 : 15)}), media.reduce(0, {$0 + ($1.duration ?? 0)}) <= (model == "seedance2.5" ? 30 : 15) else {throw DreaminaError.invalidResponse}
             }
         default: throw DreaminaError.invalidResponse
         }
@@ -150,7 +168,7 @@ struct ClassicDreaminaCLI: Sendable {
         let data = try Data(contentsOf: executable.resolvingSymlinksInPath(), options: .mappedIfSafe)
         return executable.resolvingSymlinksInPath().path + ":" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
-    func detectedProfile() async throws -> String {
+    private func detectedCapabilities() async throws -> (profile: String, models: [String]) {
         let contracts: [(String, [String])] = [
             ("text2video", ["--prompt", "--duration", "--ratio", "--video_resolution", "--model_version", "--poll", "seedance2.0", "seedance2.0fast", "720p", "21:9"]),
             ("image2video", ["--image", "--prompt", "--duration", "--video_resolution", "--model_version", "--poll"]),
@@ -160,18 +178,25 @@ struct ClassicDreaminaCLI: Sendable {
             ("query_result", ["--submit_id", "--download_dir"])
         ]
         let profile = "resolution-five"
+        var models = Set(ClassicVideoModels.supported)
         for (command, flags) in contracts {
             let output = try await runner.run([command, "--help"], timeout: 15)
             let text = String(decoding: output.data, as: UTF8.self)
             guard output.status == 0, output.data.count < 128000, flags.allSatisfy(text.contains) else {throw ClassicCliUpgradeError.required}
-
+            if ["text2video", "image2video", "frames2video", "multimodal2video"].contains(command) {
+                let tokens = Set(text.components(separatedBy: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._")).inverted))
+                // Existing CLIs may list model names only in text2video help.
+                if command == "text2video" { models.formIntersection(tokens) }
+                else { for model in ClassicVideoModels.supported.dropFirst(2) where !tokens.contains(model) { models.remove(model) } }
+            }
         }
-        return profile
+        return (profile, ClassicVideoModels.supported.filter(models.contains) + ["dreamina-multiframe"])
     }
+    func detectedProfile() async throws -> String { try await detectedCapabilities().profile }
     func verify() async throws -> [String] {
-        _ = try await detectedProfile()
+        let capabilities = try await detectedCapabilities()
         guard try await loginState() else {throw DreaminaError.notLinked}
-        return ["seedance2.0", "seedance2.0fast", "dreamina-multiframe"]
+        return capabilities.models
     }
     func loginState() async throws -> Bool {
         let output=try await runner.run(["user_credit"],timeout:15)

@@ -21,12 +21,12 @@ extension ClassicStudioBridge {
             let file = directory.appendingPathComponent("reference-" + String(index) + "." + reference.extension)
             try bytes.write(to: file, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
-            try await Self.validateReference(file, reference: reference)
+            try await Self.validateReference(file, reference: reference, maximumDuration: task.snapshot.model == "seedance2.5" ? 30 : 15)
             files.append(file)
         }
         return files
     }
-    nonisolated static func validateReference(_ file: URL, reference: ClassicCliReference) async throws {
+    nonisolated static func validateReference(_ file: URL, reference: ClassicCliReference, maximumDuration: Double = 15) async throws {
         if reference.kind == "image" {
             guard let source = CGImageSourceCreateWithURL(file as CFURL, nil), CGImageSourceGetCount(source) == 1,
                   let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
@@ -37,7 +37,7 @@ extension ClassicStudioBridge {
         } else {
             let asset = AVURLAsset(url: file), duration = try await asset.load(.duration).seconds
             let tracks = try await asset.loadTracks(withMediaType: reference.kind == "video" ? .video : .audio)
-            guard !tracks.isEmpty, duration.isFinite, duration >= 2, duration <= 15, let expected = reference.duration, abs(expected - duration) < 0.1 else {throw StudioError.invalidResponse}
+            guard !tracks.isEmpty, duration.isFinite, duration >= 2, duration <= maximumDuration, let expected = reference.duration, abs(expected - duration) < 0.1 else {throw StudioError.invalidResponse}
         }
     }
 }

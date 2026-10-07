@@ -32,6 +32,7 @@ func check(_ condition: @autoclosure () -> Bool, _ message: String, file: Static
             try await runStudioCacheTests()
             try await runDreaminaProcessLifecycleTests()
             try await runClassicCliTests()
+            try await runSeedanceModelTests()
             try await runClassicDiagnosticsTests()
             try await runClassicFiveModesTests()
             try await runClassicModernTests()

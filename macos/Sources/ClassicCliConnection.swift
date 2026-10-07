@@ -400,7 +400,7 @@ enum ClassicCliConfirmation {
                 "第\(index + 1)→\(index + 2)张 · \(String(format:"%g",row.duration))秒：\(row.prompt.prefix(100))"
             }.joined(separator:"\n")
         } else { preview = String(snapshot.prompt.prefix(500)) }
-        return "\(title) · \(snapshot.model) · \(String(format:"%g",snapshot.duration))秒 · \(snapshot.aspect == "source" ? "随源图比例" : snapshot.aspect) · \(snapshot.resolution == "default" ? "CLI 默认清晰度" : snapshot.resolution)\n引用：\(order.isEmpty ? "无" : order)\n\(preview)\n使用当前本机即梦登录；画布点击生成后直接执行。"
+        return "\(title) · \(ClassicVideoModels.title(snapshot.model)) · \(String(format:"%g",snapshot.duration))秒 · \(snapshot.aspect == "source" ? "随源图比例" : snapshot.aspect) · \(snapshot.resolution == "default" ? "CLI 默认清晰度" : snapshot.resolution)\n引用：\(order.isEmpty ? "无" : order)\n\(preview)\n使用当前本机即梦登录；画布点击生成后直接执行。"
     }
 }
 
