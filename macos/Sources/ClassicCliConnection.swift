@@ -85,11 +85,13 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
     private let locator: @Sendable () -> URL?
     private let inspector: @Sendable (URL) async throws -> ClassicCliInstallation
     private let runnerFactory: @Sendable (URL) -> DreaminaRunning
+    private let capabilityFingerprint: @Sendable (URL) async throws -> String
     private let detectionTimeout:TimeInterval
     private struct Authorization: Codable { let owner: String; let fingerprint: String; let device: ClassicCliDevice; var profile: String? = nil; var autoResume: Bool? = nil; var capabilities: ClassicCliPublicDevice? = nil; var pendingCapabilities: ClassicCliCapabilityPayload? = nil }
-    init(studio: StudioStore, directory: URL, enabled: Bool, locator: @escaping @Sendable () -> URL? = {ClassicDreaminaCLI.locate()}, inspector: @escaping @Sendable (URL) async throws -> ClassicCliInstallation = {try await ClassicCliInstaller.inspect($0)}, runnerFactory: @escaping @Sendable (URL) -> DreaminaRunning = {DreaminaProcessRunner(executable:$0)}, detectionTimeout:TimeInterval = 30,loginTimeout:TimeInterval = 180,pollInterval:UInt64 = 2_000_000_000,restoreRetryNanoseconds: UInt64 = 30_000_000_000,openAuthorization:@escaping @MainActor (URL)->Bool = {NSWorkspace.shared.open($0)}) {
+    init(studio: StudioStore, directory: URL, enabled: Bool, locator: @escaping @Sendable () -> URL? = {ClassicDreaminaCLI.locate()}, inspector: @escaping @Sendable (URL) async throws -> ClassicCliInstallation = {try await ClassicCliInstaller.inspect($0)}, runnerFactory: @escaping @Sendable (URL) -> DreaminaRunning = {DreaminaProcessRunner(executable:$0)}, detectionTimeout:TimeInterval = 30,loginTimeout:TimeInterval = 180,pollInterval:UInt64 = 2_000_000_000,restoreRetryNanoseconds: UInt64 = 30_000_000_000,openAuthorization:@escaping @MainActor (URL)->Bool = {NSWorkspace.shared.open($0)}, capabilityFingerprint: @escaping @Sendable (URL) async throws -> String = { url in try await Task.detached { try ClassicDreaminaCLI.fingerprint(url) }.value }) {
         self.studio=studio;self.directory=directory.appendingPathComponent("classic-cli",isDirectory:true);self.enabled=enabled
         self.restoreRetryNanoseconds = max(1_000_000, min(120_000_000_000, restoreRetryNanoseconds))
+        self.capabilityFingerprint = capabilityFingerprint
         self.locator=locator;self.inspector=inspector;self.runnerFactory=runnerFactory;self.detectionTimeout=detectionTimeout;self.loginTimeout=loginTimeout;self.pollInterval=pollInterval;self.openAuthorization=openAuthorization;self.installed=locator() != nil
     }
     func cancelOperation() {discardCapabilityPreview();clearAuthorization();operationID=UUID();operation?.cancel();operation=nil;busy=false;status="操作已取消，请重试"}
@@ -122,21 +124,29 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
         try JSONEncoder().encode(saved).write(to: file, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
     }
-    private func capabilityCurrent(_ approval: CapabilityApproval) async -> Bool {
-        guard owner == approval.owner, generation == approval.ticket, !Task.isCancelled,
-              connected, bridge?.device.id == approval.bridge.device.id, bridge?.device.epoch == approval.bridge.device.epoch,
-              locator()?.resolvingSymlinksInPath() == approval.executable.resolvingSymlinksInPath(),
-              (try? ClassicDreaminaCLI.fileIdentity(approval.executable)) == approval.identity else { return false }
-        return (try? await Task.detached { try ClassicDreaminaCLI.fingerprint(approval.executable) }.value) == approval.fingerprint
+    // No suspension between this check and a side effect on MainActor.
+    private func capabilityContextCurrent(_ approval: CapabilityApproval, op: UUID) -> Bool {
+        owner == approval.owner && generation == approval.ticket && operationID == op && !Task.isCancelled &&
+        connected && bridge?.device.id == approval.bridge.device.id && bridge?.device.epoch == approval.bridge.device.epoch &&
+        locator()?.resolvingSymlinksInPath() == approval.executable.resolvingSymlinksInPath() &&
+        (try? ClassicDreaminaCLI.fileIdentity(approval.executable)) == approval.identity
     }
-    private func readCapabilities(_ approval: CapabilityApproval, minimumRevision: Int) async throws -> ClassicCliPublicDevice {
-        guard await capabilityCurrent(approval) else { throw DreaminaError.wrongOwner }
+    private func capabilityCurrent(_ approval: CapabilityApproval, op: UUID) async -> Bool {
+        guard capabilityContextCurrent(approval, op: op) else { return false }
+        let fingerprint = try? await capabilityFingerprint(approval.executable)
+        // The detached hash does not inherit cancellation or serialize account changes.
+        return capabilityContextCurrent(approval, op: op) && fingerprint == approval.fingerprint
+    }
+    private func readCapabilities(_ approval: CapabilityApproval, minimumRevision: Int, op: UUID) async throws -> ClassicCliPublicDevice {
+        guard await capabilityCurrent(approval, op: op), capabilityContextCurrent(approval, op: op) else { throw DreaminaError.wrongOwner }
         let api = approval.bridge
-        let (data, _) = try await api.client.json(api.client.request(path: "api/local-cli/catalog", session: api.session, workspace: api.workspace))
+        let request = api.client.request(path: "api/local-cli/catalog", session: api.session, workspace: api.workspace)
+        guard capabilityContextCurrent(approval, op: op) else { throw DreaminaError.wrongOwner }
+        let (data, _) = try await api.client.json(request)
         struct Catalog: Decodable { let device: ClassicCliPublicDevice? }
         guard let device = try JSONDecoder().decode(Catalog.self, from: data).device else { throw DreaminaError.notLinked }
         try device.validate(for: api.device, minimumRevision: minimumRevision)
-        guard await capabilityCurrent(approval) else { throw DreaminaError.wrongOwner }
+        guard await capabilityCurrent(approval, op: op), capabilityContextCurrent(approval, op: op) else { throw DreaminaError.wrongOwner }
         return device
     }
     func detectCapabilities() {
@@ -153,22 +163,22 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
                 let file = try self.location(owner)
                 let saved = try JSONDecoder().decode(Authorization.self, from: Data(contentsOf: file))
                 let identity = try ClassicDreaminaCLI.fileIdentity(executable)
-                let fingerprint = try await Task.detached { try ClassicDreaminaCLI.fingerprint(executable) }.value
+                let fingerprint = try await self.capabilityFingerprint(executable)
                 guard saved.owner == owner, saved.device.id == bridge.device.id, saved.device.epoch == bridge.device.epoch,
                       saved.fingerprint == fingerprint else { throw DreaminaError.wrongOwner }
                 let approval = CapabilityApproval(owner: owner, ticket: ticket, fingerprint: fingerprint, identity: identity, executable: executable, bridge: bridge)
-                guard await self.capabilityCurrent(approval) else { throw DreaminaError.wrongOwner }
+                guard await self.capabilityCurrent(approval, op: op), self.capabilityContextCurrent(approval, op: op) else { throw DreaminaError.wrongOwner }
                 let models = try await classicCliDeadline(seconds: self.detectionTimeout) {
                     try await ClassicDreaminaCLI(runner: self.runnerFactory(executable)).verify()
                 }
-                let current = try await self.readCapabilities(approval, minimumRevision: saved.capabilities?.effectiveRevision ?? 0)
+                let current = try await self.readCapabilities(approval, minimumRevision: saved.capabilities?.effectiveRevision ?? 0, op: op)
                 let payload: ClassicCliCapabilityPayload
                 if let pending = saved.pendingCapabilities {
                     // An uncertain response must be reconciled with the exact original request.
                     guard pending.models == Array(Set(models)).sorted() else { throw DreaminaError.wrongOwner }
                     payload = pending
                 } else { payload = try ClassicCliCapabilityPayload(current: current, models: models) }
-                guard self.operationID == op, await self.capabilityCurrent(approval) else { return }
+                guard await self.capabilityCurrent(approval, op: op), self.capabilityContextCurrent(approval, op: op) else { return }
                 self.capabilityApproval = approval
                 self.capabilityPreview = ClassicCliCapabilityPreview(current: current, payload: payload, retry: saved.pendingCapabilities != nil)
                 self.capabilityStatus = "检测完成，请核对并确认。型号能力不代表会员资格，VIP 失败不会降级或切渠道。"
@@ -188,7 +198,7 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
             guard let self else { return }
             defer { if self.generation == approval.ticket && self.operationID == op { self.busy = false } }
             do {
-                guard await self.capabilityCurrent(approval) else { throw DreaminaError.wrongOwner }
+                guard await self.capabilityCurrent(approval, op: op), self.capabilityContextCurrent(approval, op: op) else { throw DreaminaError.wrongOwner }
                 let file = try self.location(approval.owner)
                 var saved = try JSONDecoder().decode(Authorization.self, from: Data(contentsOf: file))
                 guard saved.owner == approval.owner, saved.device.id == approval.bridge.device.id,
@@ -196,35 +206,39 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
                       saved.pendingCapabilities == nil || saved.pendingCapabilities == preview.payload else { throw DreaminaError.wrongOwner }
                 // Persist before sending, so a restart never substitutes a newer CAS revision.
                 saved.pendingCapabilities = preview.payload
+                guard self.capabilityContextCurrent(approval, op: op) else { throw DreaminaError.wrongOwner }
                 try self.saveAuthorization(saved, at: file)
                 var request = try approval.bridge.request("devices/capabilities")
                 request.httpBody = try JSONEncoder().encode(preview.payload)
-                guard self.operationID == op, await self.capabilityCurrent(approval) else { throw DreaminaError.wrongOwner }
+                guard await self.capabilityCurrent(approval, op: op), self.capabilityContextCurrent(approval, op: op) else { throw DreaminaError.wrongOwner }
                 let (data, _) = try await approval.bridge.client.json(request)
                 let receipt = try JSONDecoder().decode(ClassicCliPublicDevice.self, from: data)
                 try preview.payload.validateReceipt(receipt, device: saved.device)
-                guard self.operationID == op, await self.capabilityCurrent(approval) else { return }
+                guard await self.capabilityCurrent(approval, op: op), self.capabilityContextCurrent(approval, op: op) else { return }
                 // Reload so an explicit disconnect or another operation cannot be overwritten.
                 var latest = try JSONDecoder().decode(Authorization.self, from: Data(contentsOf: file))
                 guard latest.owner == saved.owner, latest.device.id == saved.device.id, latest.device.epoch == saved.device.epoch,
                       latest.pendingCapabilities == preview.payload,
                       receipt.effectiveRevision >= (latest.capabilities?.effectiveRevision ?? 0) else { throw DreaminaError.wrongOwner }
                 latest.capabilities = receipt; latest.pendingCapabilities = nil
+                guard self.capabilityContextCurrent(approval, op: op) else { throw DreaminaError.wrongOwner }
                 try self.saveAuthorization(latest, at: file)
                 self.discardCapabilityPreview(); self.capabilityStatus = "设备能力已确认更新（版本 \(receipt.effectiveRevision)）。原设备与任务记录保留。"
             } catch StudioError.http(409, _) {
-                guard self.operationID == op, await self.capabilityCurrent(approval) else { return }
+                guard await self.capabilityCurrent(approval, op: op), self.capabilityContextCurrent(approval, op: op) else { return }
                 self.discardCapabilityPreview()
                 do {
-                    let current = try await self.readCapabilities(approval, minimumRevision: preview.current.effectiveRevision)
+                    let current = try await self.readCapabilities(approval, minimumRevision: preview.current.effectiveRevision, op: op)
+                    guard await self.capabilityCurrent(approval, op: op), self.capabilityContextCurrent(approval, op: op) else { return }
                     let file = try self.location(approval.owner)
                     var saved = try JSONDecoder().decode(Authorization.self, from: Data(contentsOf: file))
                     guard saved.owner == approval.owner, saved.device.id == current.id, saved.device.epoch == current.epoch,
-                          saved.pendingCapabilities == preview.payload, self.operationID == op, await self.capabilityCurrent(approval) else { return }
+                          saved.pendingCapabilities == preview.payload, self.capabilityContextCurrent(approval, op: op) else { return }
                     saved.capabilities = current; saved.pendingCapabilities = nil
+                    guard self.capabilityContextCurrent(approval, op: op) else { return }
                     try self.saveAuthorization(saved, at: file)
                     self.capabilityStatus = "设备版本冲突，已重新读取版本 \(current.effectiveRevision)。请重新检测并核对，再确认；不会自动覆盖。"
-                } catch { self.capabilityStatus = "设备版本冲突，当前设备暂无法读取。请核对原设备连接后重新检测；不会自动覆盖。" }
+                } catch { guard self.capabilityContextCurrent(approval, op: op) else { return }; self.capabilityStatus = "设备版本冲突，当前设备暂无法读取。请核对原设备连接后重新检测；不会自动覆盖。" }
             } catch {
                 guard self.generation == approval.ticket && self.operationID == op else { return }
                 self.discardCapabilityPreview()

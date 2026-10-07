@@ -31,3 +31,9 @@ CLI 路径或内容变化须用户单独重新授权。旧授权记录缺少公�
 未验真实CLI/账号/设备更新、真实Studio部署版本、生产Redis/CAS、UI现场交互和真实生成；需后续单独授权。候选提交后须父对话独立安全审查通过再普通push，不能merge main。
 
 实际候选验证：能力/型号/原连接定向62项断言通过；最终源码 arm64 优化编译通过（可执行编译产物，不是签名安装包）。最新远端原样基线全量测试同样在 ShortcutRecorderTests.swift:64 的菜单键事件断言失败；初版候选全量也在此处失败。扩大组合定向时既有 ClassicFiveModesTests 的 CLI 升级fixture抛出 active，未把该组合当作通过证据。固定签名构建因仓库当前身份不可用停止，未更换签名。
+
+## 独立复审修复：异步哈希后的身份核验
+
+第一次独立审查发现后台哈希等待时用户切换身份/取消，旧检查结果可能用于发请求或落盘。已拆出 MainActor 同步上下文核验：owner/generation/operationID/cancel/connected/exact device id+epoch/CLI路径+fileIdentity。在异步哈希前后均核验；调用者await结束后以及GET/POST、公开缓存/未确认payload落盘前再次同步核验，最终检查与副作用间没有新的await。
+
+可注入且故意不响应取消的哈希挂起点覆盖五阶段（预览、POST前、成功回执、409入口、409缓存）×五动作（实际切环境、退出账号、切工作区、断开、取消）共25交错；验证旧请求不发送，迟到缓存/preview不接受，原revision/pending/journal/device保持。新版定向回归257项断言通过；最终源码arm64优化编译通过，仍不是签名安装包。积分新需求不混入此候选。

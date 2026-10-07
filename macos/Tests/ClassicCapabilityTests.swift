@@ -29,7 +29,8 @@ private actor CapabilityTransport: StudioTransport {
         case "/api/auth/login":
             headers["Set-Cookie"] = "kaki_session=synthetic; Max-Age=3600; Secure; Path=/; HttpOnly"
             body = ["user": ["id": "fixture-user", "email": "fixture@example.invalid"]]
-        case "/api/workspaces": body = [["id": "personal", "name": "Personal", "kind": "personal", "role": "owner"]]
+        case "/api/workspaces": body = [["id": "personal", "name": "Personal", "kind": "personal", "role": "owner"], ["id": "team", "name": "Team", "kind": "team", "role": "owner"]]
+        case "/api/auth/logout": body = [:] as [String: String]
         case "/api/assets": body = ["items": [], "total": 0]
         case "/api/local-cli/catalog": body = ["device": publicDevice()]
         case "/api/local-cli/devices/capabilities":
@@ -158,4 +159,81 @@ private actor CapabilityTransport: StudioTransport {
     let pausedRecord = try record(), pausedRequests = await transport.recorded()
     try check(!restarted.connected && pausedRecord["autoResume"] as? Bool == false && pausedRequests.count == pausedBefore, "detecting paused device never restores or expands authorization")
     restarted.shutdown(); studio.shutdown()
+    try await runCapabilityHashRaceTests()
+}
+
+// A deliberately non-cancellable hash wait reproduces detached-task completion after invalidation.
+private actor CapabilityHashGate {
+    private var calls = 0
+    private var target: Int?
+    private var held: CheckedContinuation<Void, Never>?
+    func arm(after count: Int) { target = calls + count }
+    func isHeld() -> Bool { held != nil }
+    func release() { target = nil; held?.resume(); held = nil }
+    func fingerprint(_ url: URL) async throws -> String {
+        calls += 1
+        let result = try ClassicDreaminaCLI.fingerprint(url)
+        if calls == target { await withCheckedContinuation { held = $0 } }
+        return result
+    }
+}
+@MainActor private func runCapabilityHashRaceTests() async throws {
+    let phases = [("preview", 5), ("send", 2), ("receipt", 3), ("409-entry", 3), ("409-cache", 6)]
+    for (phase, pauseAt) in phases {
+        for action in ["environment", "account", "workspace", "disconnect", "cancel"] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("kaki-hash-race-" + UUID().uuidString)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let transport = CapabilityTransport(), runner = ClassicFixtureRunner(), gate = CapabilityHashGate()
+            let studio = StudioStore(directory: root, credentials: StudioMemoryCredentials(), transport: transport)
+            await studio.login(email: "fixture@example.invalid", password: "synthetic", code: "")
+            let binary = root.appendingPathComponent("dreamina"); try Data("hash-race CLI".utf8).write(to: binary)
+            let owner = studio.environment.baseURL.absoluteString + "|fixture-user|personal"
+            let directory = root.appendingPathComponent("classic-cli")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let key = SHA256.hash(data: Data(owner.utf8)).map { String(format: "%02x", $0) }.joined()
+            let file = directory.appendingPathComponent(key + ".json")
+            let cached: [String: Any] = ["id": "fixture-device", "epoch": "fixture-epoch", "models": ["seedance2.0"], "revision": 0, "profile": "resolution-five"]
+            try JSONSerialization.data(withJSONObject: ["owner": owner, "fingerprint": ClassicDreaminaCLI.fingerprint(binary), "device": ["id": "fixture-device", "epoch": "fixture-epoch", "secret": "synthetic"], "profile": "resolution-five", "capabilities": cached]).write(to: file)
+            let journal = directory.appendingPathComponent("journal")
+            try FileManager.default.createDirectory(at: journal, withIntermediateDirectories: true)
+            let journalFile = journal.appendingPathComponent("original.json"), journalBytes = Data("original task signature/token/submitId".utf8)
+            try journalBytes.write(to: journalFile)
+            let connection = ClassicCliConnection(studio: studio, directory: root, enabled: true, locator: { binary }, runnerFactory: { _ in runner }, capabilityFingerprint: { try await gate.fingerprint($0) })
+            func settle() async throws {
+                for _ in 0..<200 { if !connection.busy { return }; try await Task.sleep(nanoseconds: 5_000_000) }
+                throw NativeTestFailure(description: "hash-race setup did not settle")
+            }
+            connection.connect(automatically: true); try await settle()
+            try check(connection.connected, "hash-race fixture restores exact approved device")
+            if phase != "preview" { connection.detectCapabilities(); try await settle(); try check(connection.capabilityPreview != nil, "hash-race fixture has approved preview") }
+            if phase.hasPrefix("409") { await transport.configure(conflict: true) }
+            await gate.arm(after: pauseAt)
+            if phase == "preview" { connection.detectCapabilities() } else { connection.confirmCapabilities() }
+            for _ in 0..<200 { if await gate.isHeld() { break }; try await Task.sleep(nanoseconds: 5_000_000) }
+            let held = await gate.isHeld()
+            try check(held, "controlled hash suspended at " + phase)
+            let before = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as! [String: Any]
+            switch action {
+            case "environment": await studio.changeEnvironment(.production); connection.identityChanged()
+            case "account": await studio.logout(); connection.identityChanged()
+            case "workspace": await studio.selectWorkspace("team"); connection.identityChanged()
+            case "disconnect": connection.disconnect()
+            default: connection.cancelOperation()
+            }
+            let invalidatedBytes = try Data(contentsOf: file)
+            await gate.release()
+            try await Task.sleep(nanoseconds: 50_000_000)
+            let afterBytes = try Data(contentsOf: file), after = try JSONSerialization.jsonObject(with: afterBytes) as! [String: Any]
+            let writes = (await transport.recorded()).filter { $0.url!.path == "/api/local-cli/devices/capabilities" }
+            try check(writes.count == (["preview", "send"].contains(phase) ? 0 : 1), "hash completion after " + action + " cannot send a stale update at " + phase)
+            try check(afterBytes == invalidatedBytes, "hash completion after " + action + " cannot persist a stale receipt or 409 cache at " + phase)
+            let caps = after["capabilities"] as? [String: Any]
+            try check(caps?["revision"] as? Int == 0 && connection.capabilityPreview == nil, "invalidation preserves original revision and clears preview at " + phase)
+            try check((before["pendingCapabilities"] == nil) == (after["pendingCapabilities"] == nil), "hash invalidation preserves uncertain pending request at " + phase)
+            let unchangedJournal = try Data(contentsOf: journalFile)
+            try check(unchangedJournal == journalBytes && (after["device"] as? [String: String])?["id"] == "fixture-device", "hash invalidation preserves journal and device at " + phase)
+            connection.shutdown(); studio.shutdown()
+        }
+    }
 }
