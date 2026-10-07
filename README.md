@@ -1,6 +1,6 @@
 # Kaki Tools
 
-原生 macOS 效率工具，使用 Swift、AppKit 和 SwiftUI。最低 macOS 13；当前源码版本 1.5.9。默认应用不包含 Electron、Node.js、WebView、Qt 或第三方 Swift 包。剪贴板普通历史最多100条，固定与收藏独立保留；窗口调整和区域截图使用系统接口。Studio 账号与素材库复用现有用户身份和工作区权限，支持搜索、多选复制引用、单项复制真实素材及批量下载。
+原生 macOS 效率工具，使用 Swift、AppKit 和 SwiftUI。最低 macOS 13；当前源码版本 1.5.10。默认应用不包含 Electron、Node.js、WebView、Qt 或第三方 Swift 包。剪贴板普通历史最多100条，固定与收藏独立保留；窗口调整和区域截图使用系统接口。Studio 账号与素材库复用现有用户身份和工作区权限，支持搜索、多选复制引用、单项复制真实素材及批量下载。
 
 安装包见 [最新发布](https://github.com/ALEXAIGC/kaki-tools/releases/latest)。当前发布为 Apple Silicon、macOS 13 或更高版本。
 
