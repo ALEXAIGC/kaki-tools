@@ -47,16 +47,56 @@ struct ClassicCreditState: Codable {
 // Separate owner/device/epoch private record: old authorization writers cannot overwrite the counter.
 @MainActor final class ClassicCreditLedger {
     let file: URL
-    init(directory: URL, binding: String) throws {
+    let epoch: String
+    let clock: () -> Date
+    init(directory: URL, binding: String, epoch: String, clock: @escaping () -> Date = Date.init) throws {
+        self.epoch = epoch; self.clock = clock
         let directory = directory.appendingPathComponent("credit", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         file = directory.appendingPathComponent(SHA256.hash(data: Data(binding.utf8)).map { String(format: "%02x", $0) }.joined() + ".json")
     }
     func read() throws -> ClassicCreditState {
         guard FileManager.default.fileExists(atPath: file.path) else { return ClassicCreditState() }
-        return try JSONDecoder().decode(ClassicCreditState.self, from: Data(contentsOf: file))
+        var state: ClassicCreditState
+        do { state = try JSONDecoder().decode(ClassicCreditState.self, from: Data(contentsOf: file)); try validate(state) }
+        catch { throw DreaminaError.invalidResponse }
+        if let pending = state.pending, let queried = ClassicCreditRefresh.date(pending.queriedAt),
+           let id = pending.requestId, let expiry = state.reservations?[id].flatMap(ClassicCreditRefresh.date),
+           clock() >= expiry || clock().timeIntervalSince(queried) >= 120 {
+            state.pending = nil; state.pendingIdentityHMAC = nil
+            try write(state)
+        }
+        return state
+    }
+    private func validate(_ state: ClassicCreditState) throws {
+        let maximum = 9_007_199_254_740_991
+        func identifier(_ raw: String) -> Bool { !raw.isEmpty && raw.count <= 200 && !raw.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) } }
+        func digest(_ raw: String?) -> Bool { raw == nil || (raw!.count == 64 && raw!.allSatisfy { "0123456789abcdef".contains($0) }) }
+        func date(_ raw: String) -> Date? { raw.hasSuffix("Z") ? ClassicCreditRefresh.date(raw) : nil }
+        guard !epoch.isEmpty, state.reserved >= 0, state.reserved <= maximum,
+              digest(state.identityHMAC), digest(state.pendingIdentityHMAC),
+              state.handledRequest.map(identifier) ?? true else { throw DreaminaError.invalidResponse }
+        for (id, expiry) in state.reservations ?? [:] {
+            guard identifier(id), date(expiry) != nil else { throw DreaminaError.invalidResponse }
+        }
+        guard let pending = state.pending else {
+            guard state.pendingIdentityHMAC == nil else { throw DreaminaError.invalidResponse }; return
+        }
+        guard pending.epoch == epoch, pending.capabilityRevision >= 0, pending.capabilityRevision <= maximum,
+              pending.sequence > 0, pending.sequence == state.reserved,
+              let id = pending.requestId, identifier(id), state.handledRequest == id,
+              let expiryRaw = state.reservations?[id], let expiry = date(expiryRaw),
+              let queried = date(pending.queriedAt), queried <= clock().addingTimeInterval(30),
+              queried >= expiry.addingTimeInterval(-90), queried <= expiry,
+              ["ok", "error", "cleared"].contains(pending.status) else { throw DreaminaError.invalidResponse }
+        if pending.status == "ok" {
+            guard let amount = pending.totalCredit, amount.isFinite, amount >= 0, state.pendingIdentityHMAC != nil else { throw DreaminaError.invalidResponse }
+        } else {
+            guard pending.totalCredit == nil, state.pendingIdentityHMAC == nil else { throw DreaminaError.invalidResponse }
+        }
     }
     func write(_ state: ClassicCreditState) throws {
+        try validate(state)
         let data = try JSONEncoder().encode(state)
         let temporary = file.deletingLastPathComponent().appendingPathComponent(".credit-" + UUID().uuidString)
         let descriptor = open(temporary.path, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0o600)
@@ -158,7 +198,10 @@ extension ClassicStudioBridge: ClassicCreditBridge {
         return formatter.string(from: value)
     }
     private func valid(_ request: ClassicCreditRequest) -> Bool {
-        current() && !Task.isCancelled && request.deviceId == device.id && request.epoch == device.epoch && request.status == "pending" &&
+        guard request.requestedAt.hasSuffix("Z"), request.expiresAt.hasSuffix("Z"),
+              let requested = Self.date(request.requestedAt), let expires = Self.date(request.expiresAt),
+              expires > requested, expires.timeIntervalSince(requested) <= 60.01 else { return false }
+        return current() && !Task.isCancelled && request.deviceId == device.id && request.epoch == device.epoch && request.status == "pending" &&
         !request.requestId.isEmpty && request.requestId.count <= 200 && request.capabilityRevision >= 0 && request.capabilityRevision <= 9_007_199_254_740_991 &&
         Self.date(request.expiresAt).map { clock() < $0 } == true && Self.date(request.requestedAt).map { $0 <= clock().addingTimeInterval(30) } == true
     }
@@ -168,6 +211,7 @@ extension ClassicStudioBridge: ClassicCreditBridge {
         guard await hashCurrent(), valid(request) else { throw DreaminaError.wrongOwner }
         let state = try ledger.read()
         if let pending = state.pending, pending.requestId == request.requestId {
+            guard state.reservations?[request.requestId] == request.expiresAt else { throw DreaminaError.invalidResponse }
             return try await send(pending, request: request)
         }
         guard state.handledRequest != request.requestId, state.reservations?[request.requestId] == nil else { return nil }

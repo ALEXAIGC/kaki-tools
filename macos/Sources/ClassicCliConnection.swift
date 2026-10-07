@@ -204,12 +204,12 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
     }
     func confirmCapabilities() {
         guard !busy, let preview = capabilityPreview, let approval = capabilityApproval else { return }
-        creditTotal = nil; creditQueriedAt = nil; creditExpiresAt = nil
+        stopCreditRefresh()
         busy = true; actionTitle = "更新设备能力"; capabilityStatus = "提交已确认的能力版本…"
         let op = UUID(); operationID = op
         operation = Task { [weak self] in
             guard let self else { return }
-            defer { if self.generation == approval.ticket && self.operationID == op { self.busy = false } }
+            defer { if self.generation == approval.ticket && self.operationID == op { self.busy = false; self.restartCreditRefresh() } }
             do {
                 guard await self.capabilityCurrent(approval, op: op), self.capabilityContextCurrent(approval, op: op) else { throw DreaminaError.wrongOwner }
                 let file = try self.location(approval.owner)
@@ -484,6 +484,7 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
         startCreditRefresh(executable: executable, bridge: bridge, owner: owner, ticket: generation, fingerprint: saved.fingerprint)
     }
     private func stopCreditRefresh() {
+        _ = try? creditService?.ledger.read()
         creditTicket = UUID(); creditLoop?.cancel(); creditLoop = nil; creditService = nil
         creditTotal = nil; creditQueriedAt = nil; creditExpiresAt = nil; creditStatus = "积分未查询"
     }
@@ -491,7 +492,7 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
         stopCreditRefresh()
         let creditTicket = self.creditTicket
         guard let identity = try? ClassicDreaminaCLI.fileIdentity(executable),
-              let ledger = try? ClassicCreditLedger(directory: directory, binding: owner + "|" + bridge.device.id + "|" + bridge.device.epoch) else { return }
+              let ledger = try? ClassicCreditLedger(directory: directory, binding: owner + "|" + bridge.device.id + "|" + bridge.device.epoch, epoch: bridge.device.epoch) else { return }
         let context: @MainActor () -> Bool = { [weak self] in
             guard let self else { return false }
             return self.owner == owner && self.generation == ticket && self.creditTicket == creditTicket && !Task.isCancelled &&

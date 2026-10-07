@@ -21,6 +21,12 @@ private actor CreditMockBridge: ClassicCreditBridge {
     var lost = false
     var conflict = false
     var wrong = false
+    var holdAck = false
+    var acceptedWaiter: CheckedContinuation<Void, Never>?
+    var ackWaiter: CheckedContinuation<Void, Never>?
+    func suspendAck() { holdAck = true }
+    func waitAccepted() async { if ackWaiter != nil { return }; await withCheckedContinuation { acceptedWaiter = $0 } }
+    func releaseAck() { holdAck = false; ackWaiter?.resume(); ackWaiter = nil }
     func configure(lost: Bool = false, conflict: Bool = false, wrong: Bool = false) { self.lost = lost; self.conflict = conflict; self.wrong = wrong }
     func records() -> [ClassicCreditPayload] { submitted }
     func bootstrap() async throws -> ClassicCreditSnapshot {
@@ -28,6 +34,7 @@ private actor CreditMockBridge: ClassicCreditBridge {
     }
     func submit(_ payload: ClassicCreditPayload) async throws -> ClassicCreditSnapshot {
         submitted.append(payload)
+        if holdAck { await withCheckedContinuation { ackWaiter = $0; acceptedWaiter?.resume(); acceptedWaiter = nil } }
         if lost { lost = false; throw URLError(.networkConnectionLost) }
         if conflict { throw StudioError.http(409, "synthetic") }
         return ClassicCreditSnapshot(status: payload.status == "ok" ? "available" : "error", deviceId: wrong ? "other" : "device", epoch: "epoch", capabilityRevision: payload.capabilityRevision, snapshotSequence: payload.sequence, totalCredit: payload.totalCredit, queriedAt: payload.queriedAt, receivedAt: payload.queriedAt, expiresAt: ClassicCreditRefresh.timestamp(Date().addingTimeInterval(120)), sequenceMeta: .init(lastSequence: payload.sequence), requestId: payload.requestId)
@@ -40,7 +47,7 @@ private actor CreditMockBridge: ClassicCreditBridge {
     let device = ClassicCliDevice(id: "device", epoch: "epoch", secret: "synthetic-secret")
     let runner = CreditMockRunner(), bridge = CreditMockBridge()
     var current = true, confirmation = true, confirmations = [Bool]()
-    let ledger = try ClassicCreditLedger(directory: root, binding: "synthetic-owner|origin|workspace|device|epoch")
+    let ledger = try ClassicCreditLedger(directory: root, binding: "synthetic-owner|origin|workspace|device|epoch", epoch: "epoch")
     func request(_ id: String, expires: Date = Date().addingTimeInterval(60), revision: Int = 1) -> ClassicCreditRequest {
         ClassicCreditRequest(requestId: id, deviceId: "device", epoch: "epoch", capabilityRevision: revision, status: "pending", requestedAt: ClassicCreditRefresh.timestamp(Date()), expiresAt: ClassicCreditRefresh.timestamp(expires))
     }
@@ -114,21 +121,76 @@ private actor CreditMockBridge: ClassicCreditBridge {
     do { _ = try await make().run(request("wrong-receipt")); throw NativeTestFailure(description: "wrong owner ack expected") } catch DreaminaError.wrongOwner { }
     let wrongPending = try ledger.read().pending
     try check(wrongPending != nil, "unverified ack cannot clear pending or confirm account")
-    let independent = try ClassicCreditLedger(directory: root, binding: "different-owner|origin|workspace|device|epoch")
+    let independent = try ClassicCreditLedger(directory: root, binding: "different-owner|origin|workspace|device|epoch", epoch: "epoch")
     let independentState = try independent.read()
     try check(independentState.reserved == 0 && independent.file != ledger.file, "owner/workspace/origin/device/epoch isolate counters")
+    // Decodable damage must never reach the CLI or POST, and must preserve the original bytes.
+    let good = try Data(contentsOf: ledger.file)
+    let original = try JSONSerialization.jsonObject(with: good) as! [String: Any]
+    var corruptions = [[String: Any]]()
+    for value in [-1, 9_007_199_254_740_992] { var valueState = original; valueState["reserved"] = value; corruptions.append(valueState) }
+    for (key, value) in [("epoch", "other" as Any), ("sequence", 0 as Any), ("sequence", 9_007_199_254_740_992 as Any), ("capabilityRevision", -1 as Any), ("status", "arbitrary" as Any), ("totalCredit", -1 as Any), ("queriedAt", "invalid" as Any), ("requestId", "missing" as Any)] {
+        var valueState = original, payload = valueState["pending"] as! [String: Any]
+        payload[key] = value; valueState["pending"] = payload; corruptions.append(valueState)
+    }
+    var badHash = original; badHash["pendingIdentityHMAC"] = "bad"; corruptions.append(badHash)
+    var missingReservation = original; missingReservation["reservations"] = [:] as [String: String]; corruptions.append(missingReservation)
+    for damaged in corruptions {
+        let data = try JSONSerialization.data(withJSONObject: damaged)
+        try data.write(to: ledger.file)
+        let beforeCLI = await runner.count(), beforePOST = await bridge.records().count
+        do { _ = try await make().run(request("wrong-receipt")); throw NativeTestFailure(description: "corrupt ledger must fail closed") }
+        catch DreaminaError.invalidResponse { }
+        let afterCLI = await runner.count(), afterPOST = await bridge.records().count
+        try check(beforeCLI == afterCLI && beforePOST == afterPOST, "corrupt ledger cannot query or submit")
+        let preserved = try Data(contentsOf: ledger.file)
+        try check(preserved == data, "corrupt ledger bytes remain unchanged")
+    }
+    try good.write(to: ledger.file)
+    await bridge.configure()
+    await runner.configure(#"{"total_credit":42,"user_id":456}"#)
+    await bridge.suspendAck()
+    let delayed = Task { try await make().run(request("accepted-before-capability")) }
+    await bridge.waitAccepted()
+    // Same invalidation used by capability confirmation, both success and conflict paths.
+    current = false
+    let acceptedState = try ledger.read()
+    var nextState = acceptedState
+    nextState.pending = nil; nextState.pendingIdentityHMAC = nil
+    try ledger.write(nextState)
+    let nextBytes = try Data(contentsOf: ledger.file)
+    await bridge.releaseAck()
+    do { _ = try await delayed.value; throw NativeTestFailure(description: "accepted late ack must fail") } catch DreaminaError.wrongOwner { }
+    let afterOldAck = try Data(contentsOf: ledger.file)
+    try check(afterOldAck == nextBytes, "accepted old revision ack cannot confirm identity or clear new state")
+    current = true
+    // A restart cleans only valid expired pending, preserving the highwater and identity.
+    try good.write(to: ledger.file)
+    let futureLedger = try ClassicCreditLedger(directory: root, binding: "synthetic-owner|origin|workspace|device|epoch", epoch: "epoch", clock: { Date().addingTimeInterval(180) })
+    let cleaned = try futureLedger.read()
+    try check(cleaned.pending == nil && cleaned.pendingIdentityHMAC == nil && cleaned.reserved == wrongPending?.sequence, "restart drops expired amount without resetting sequence")
     try await runCreditLoopIntegrationTests()
 }
 
 private actor CreditLoopTransport: StudioTransport {
     var pending = true
     var loseFirstAcknowledgement = true
+    var holdAcceptedAck = false
+    var conflictCapabilities = false
+    var revision = 1
+    var models = ["seedance2.0"]
+    var acceptedWaiter: CheckedContinuation<Void, Never>?
+    var ackWaiter: CheckedContinuation<Void, Never>?
+    func holdForCapability(conflict: Bool) { loseFirstAcknowledgement = false; holdAcceptedAck = true; conflictCapabilities = conflict }
+    func waitAccepted() async { if ackWaiter != nil { return }; await withCheckedContinuation { acceptedWaiter = $0 } }
+    func releaseAccepted() { holdAcceptedAck = false; ackWaiter?.resume(); ackWaiter = nil }
     var writes: [ClassicCreditPayload] = []
     func recorded() -> [ClassicCreditPayload] { writes }
     func perform(_ request: URLRequest, maximumBytes: Int64) async throws -> StudioHTTPFile {
         let path = request.url!.path
         var headers = ["Content-Type": "application/json"]
         let body: Data
+        var status = 200
         switch path {
         case "/api/auth/login":
             headers["Set-Cookie"] = "kaki_session=synthetic; Max-Age=3600; Secure; Path=/; HttpOnly"
@@ -137,7 +199,16 @@ private actor CreditLoopTransport: StudioTransport {
         case "/api/assets": body = Data(#"{"items":[],"total":0}"#.utf8)
         case "/api/local-cli/devices/resume", "/api/local-cli/devices/pause", "/api/local-cli/devices/heartbeat": body = Data("{}".utf8)
         case "/api/local-cli/devices/claim": body = Data(#"{"task":null}"#.utf8)
+        case "/api/local-cli/catalog":
+            body = try JSONSerialization.data(withJSONObject: ["device": ["id": "device", "epoch": "epoch", "revision": revision, "models": models, "profile": "resolution-five"]])
+        case "/api/local-cli/devices/capabilities":
+            let payload = try JSONDecoder().decode(ClassicCliCapabilityPayload.self, from: request.httpBody!)
+            revision += 1
+            if conflictCapabilities { status = 409; models = ["seedance2.0fast"]; body = Data("{}".utf8) }
+            else { models = payload.models; body = try JSONSerialization.data(withJSONObject: ["id": "device", "epoch": "epoch", "revision": revision, "models": models, "profile": "resolution-five"]) }
         case "/api/local-cli/devices/credit-refresh":
+            // Keep the fresh loop away from the ledger while the retired ack is inspected.
+            if revision > 1 { throw URLError(.notConnectedToInternet) }
             try check(request.httpMethod == "GET" && request.value(forHTTPHeaderField: "X-Local-CLI-Device") == "device" && request.value(forHTTPHeaderField: "X-Local-CLI-Secret") == "synthetic-secret", "credit poll uses GET and private original device headers")
             if pending {
                 let refresh = ClassicCreditRequest(requestId: "loop-request", deviceId: "device", epoch: "epoch", capabilityRevision: 1, status: "pending", requestedAt: ClassicCreditRefresh.timestamp(Date()), expiresAt: ClassicCreditRefresh.timestamp(Date().addingTimeInterval(60)))
@@ -150,13 +221,14 @@ private actor CreditLoopTransport: StudioTransport {
             try check(request.httpMethod == "POST" && request.value(forHTTPHeaderField: "X-Workspace-Id") == "personal", "snapshot write retains exact workspace")
             let payload = try JSONDecoder().decode(ClassicCreditPayload.self, from: request.httpBody!)
             writes.append(payload); pending = false
+            if holdAcceptedAck { await withCheckedContinuation { ackWaiter = $0; acceptedWaiter?.resume(); acceptedWaiter = nil } }
             if loseFirstAcknowledgement { loseFirstAcknowledgement = false; throw URLError(.networkConnectionLost) }
             body = try JSONEncoder().encode(ClassicCreditSnapshot(status: "available", deviceId: "device", epoch: "epoch", capabilityRevision: payload.capabilityRevision, snapshotSequence: payload.sequence, totalCredit: payload.totalCredit, queriedAt: payload.queriedAt, receivedAt: payload.queriedAt, expiresAt: ClassicCreditRefresh.timestamp(Date().addingTimeInterval(120)), sequenceMeta: .init(lastSequence: payload.sequence), requestId: payload.requestId))
         default: throw NativeTestFailure(description: "unexpected credit integration route")
         }
         let file = URL(fileURLWithPath: "/tmp/kaki-credit-http-" + UUID().uuidString)
         try body.write(to: file)
-        return StudioHTTPFile(file: file, response: HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: headers)!)
+        return StudioHTTPFile(file: file, response: HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: headers)!)
     }
 }
 @MainActor private func runCreditLoopIntegrationTests() async throws {
@@ -182,5 +254,55 @@ private actor CreditLoopTransport: StudioTransport {
     try check(queries == 1 && writes.count == 2 && writes[0] == writes[1] && writes[0].requestId == "loop-request", "completed slot with lost ack retries identical pending payload without querying again")
     connection.disconnect()
     try check(connection.creditTotal == nil && connection.creditQueriedAt == nil, "disconnect clears local balance immediately")
+    connection.shutdown(); studio.shutdown()
+    for conflict in [false, true] { try await runCreditCapabilityAckTest(conflict: conflict) }
+}
+@MainActor private func runCreditCapabilityAckTest(conflict: Bool) async throws {
+    let root = URL(fileURLWithPath: "/tmp/kaki-credit-cap-ack-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let api = CreditLoopTransport(), classicRunner = ClassicFixtureRunner(), creditRunner = CreditMockRunner()
+    await api.holdForCapability(conflict: conflict)
+    let studio = StudioStore(directory: root, credentials: StudioMemoryCredentials(), transport: api)
+    await studio.login(email: "fixture@example.invalid", password: "synthetic", code: "")
+    let binary = root.appendingPathComponent("dreamina"); try Data("synthetic executable".utf8).write(to: binary)
+    let owner = studio.environment.baseURL.absoluteString + "|credit-user|personal"
+    let directory = root.appendingPathComponent("classic-cli")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let key = SHA256.hash(data: Data(owner.utf8)).map { String(format: "%02x", $0) }.joined()
+    let auth = directory.appendingPathComponent(key + ".json")
+    try JSONSerialization.data(withJSONObject: ["owner": owner, "fingerprint": ClassicDreaminaCLI.fingerprint(binary), "device": ["id": "device", "epoch": "epoch", "secret": "synthetic-secret"], "profile": "resolution-five"]).write(to: auth)
+    let journal = directory.appendingPathComponent("journal-proof"); let journalBytes = Data("synthetic signed task unchanged".utf8); try journalBytes.write(to: journal)
+    let connection = ClassicCliConnection(studio: studio, directory: root, enabled: true, locator: { binary }, runnerFactory: { _ in classicRunner }, creditRunnerFactory: { _ in creditRunner }, creditConfirmation: { _ in true }, creditPollingNanoseconds: 10_000_000)
+    connection.connect(automatically: true)
+    await api.waitAccepted()
+    // Capture the actual private worker for deterministic completion, without production test hooks.
+    guard let retired = Mirror(reflecting: connection).descendant("creditLoop") as? Task<Void, Never> else { throw NativeTestFailure(description: "credit worker missing") }
+    func settle() async throws {
+        for _ in 0..<200 { if !connection.busy { return }; try await Task.sleep(nanoseconds: 10_000_000) }
+        throw NativeTestFailure(description: "capability ack fixture did not settle")
+    }
+    connection.detectCapabilities(); try await settle()
+    try check(connection.capabilityPreview != nil, "held accepted credit ack allows capability preview")
+    connection.confirmCapabilities(); try await settle()
+    try check(connection.creditTotal == nil && connection.capabilityStatus.contains(conflict ? "冲突" : "已确认更新"), "capability success or 409 clears old credit generation")
+    let ledger = try ClassicCreditLedger(directory: directory, binding: owner + "|device|epoch", epoch: "epoch")
+    var replacement = try ledger.read()
+    replacement.reserved += 1
+    let nextID = "new-pending"
+    replacement.handledRequest = nextID
+    replacement.reservations?[nextID] = ClassicCreditRefresh.timestamp(Date().addingTimeInterval(60))
+    replacement.pending = ClassicCreditPayload(epoch: "epoch", capabilityRevision: 2, sequence: replacement.reserved, queriedAt: ClassicCreditRefresh.timestamp(Date()), status: "error", totalCredit: nil, requestId: nextID)
+    replacement.pendingIdentityHMAC = nil
+    try ledger.write(replacement)
+    let before = try Data(contentsOf: ledger.file)
+    await api.releaseAccepted()
+    await retired.value
+    let after = try Data(contentsOf: ledger.file), journalAfter = try Data(contentsOf: journal)
+    let finalState = try ledger.read()
+    try check(before == after && connection.creditTotal == nil && finalState.identityHMAC == nil, "retired accepted ack cannot restore amount, confirm identity or clear new pending")
+    try check(journalAfter == journalBytes, "capability and late credit ack preserve signed journal")
+    let count = await creditRunner.count()
+    try check(count == 1, "capability change does not re-query reserved request")
     connection.shutdown(); studio.shutdown()
 }
