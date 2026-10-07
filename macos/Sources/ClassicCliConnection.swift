@@ -65,6 +65,16 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
     @Published private(set) var capabilityStatus = ""
     private var capabilityApproval: CapabilityApproval?
     private struct CapabilityApproval { let owner: String; let ticket: UUID; let fingerprint: String; let identity: ClassicDreaminaCLI.FileIdentity; let executable: URL; let bridge: ClassicStudioBridge }
+    @Published private(set) var creditTotal: Double?
+    @Published private(set) var creditStatus = "积分未查询"
+    @Published private(set) var creditQueriedAt: Date?
+    private var creditExpiresAt: Date?
+    private var creditLoop: Task<Void, Never>?
+    private var creditService: ClassicCreditRefresh?
+    private var creditTicket = UUID()
+    private let creditRunnerFactory: @Sendable (URL) -> DreaminaRunning
+    private let creditConfirmation: @MainActor (Bool) async -> Bool
+    private let creditPollingNanoseconds: UInt64
     private let openAuthorization: @MainActor (URL) -> Bool
     private let loginTimeout:TimeInterval
     private let pollInterval:UInt64
@@ -88,13 +98,14 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
     private let capabilityFingerprint: @Sendable (URL) async throws -> String
     private let detectionTimeout:TimeInterval
     private struct Authorization: Codable { let owner: String; let fingerprint: String; let device: ClassicCliDevice; var profile: String? = nil; var autoResume: Bool? = nil; var capabilities: ClassicCliPublicDevice? = nil; var pendingCapabilities: ClassicCliCapabilityPayload? = nil }
-    init(studio: StudioStore, directory: URL, enabled: Bool, locator: @escaping @Sendable () -> URL? = {ClassicDreaminaCLI.locate()}, inspector: @escaping @Sendable (URL) async throws -> ClassicCliInstallation = {try await ClassicCliInstaller.inspect($0)}, runnerFactory: @escaping @Sendable (URL) -> DreaminaRunning = {DreaminaProcessRunner(executable:$0)}, detectionTimeout:TimeInterval = 30,loginTimeout:TimeInterval = 180,pollInterval:UInt64 = 2_000_000_000,restoreRetryNanoseconds: UInt64 = 30_000_000_000,openAuthorization:@escaping @MainActor (URL)->Bool = {NSWorkspace.shared.open($0)}, capabilityFingerprint: @escaping @Sendable (URL) async throws -> String = { url in try await Task.detached { try ClassicDreaminaCLI.fingerprint(url) }.value }) {
+    init(studio: StudioStore, directory: URL, enabled: Bool, locator: @escaping @Sendable () -> URL? = {ClassicDreaminaCLI.locate()}, inspector: @escaping @Sendable (URL) async throws -> ClassicCliInstallation = {try await ClassicCliInstaller.inspect($0)}, runnerFactory: @escaping @Sendable (URL) -> DreaminaRunning = {DreaminaProcessRunner(executable:$0)}, detectionTimeout:TimeInterval = 30,loginTimeout:TimeInterval = 180,pollInterval:UInt64 = 2_000_000_000,restoreRetryNanoseconds: UInt64 = 30_000_000_000,openAuthorization:@escaping @MainActor (URL)->Bool = {NSWorkspace.shared.open($0)}, capabilityFingerprint: @escaping @Sendable (URL) async throws -> String = { url in try await Task.detached { try ClassicDreaminaCLI.fingerprint(url) }.value }, creditRunnerFactory: @escaping @Sendable (URL) -> DreaminaRunning = { ClassicCreditReadOnlyRunner(executable: $0) }, creditConfirmation: @escaping @MainActor (Bool) async -> Bool = { await ClassicCreditConsent.confirm(changed: $0) }, creditPollingNanoseconds: UInt64 = 1_000_000_000) {
         self.studio=studio;self.directory=directory.appendingPathComponent("classic-cli",isDirectory:true);self.enabled=enabled
         self.restoreRetryNanoseconds = max(1_000_000, min(120_000_000_000, restoreRetryNanoseconds))
+        self.creditRunnerFactory = creditRunnerFactory; self.creditConfirmation = creditConfirmation; self.creditPollingNanoseconds = max(10_000_000, creditPollingNanoseconds)
         self.capabilityFingerprint = capabilityFingerprint
         self.locator=locator;self.inspector=inspector;self.runnerFactory=runnerFactory;self.detectionTimeout=detectionTimeout;self.loginTimeout=loginTimeout;self.pollInterval=pollInterval;self.openAuthorization=openAuthorization;self.installed=locator() != nil
     }
-    func cancelOperation() {discardCapabilityPreview();clearAuthorization();operationID=UUID();operation?.cancel();operation=nil;busy=false;status="操作已取消，请重试"}
+    func cancelOperation() {stopCreditRefresh();discardCapabilityPreview();clearAuthorization();operationID=UUID();operation?.cancel();operation=nil;busy=false;status="操作已取消，请重试"; restartCreditRefresh()}
 
     private var owner: String? {
         guard let studio, let user = studio.user, !studio.workspaceID.isEmpty else { return nil }
@@ -110,6 +121,7 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
     var targetWorkspaceName: String { studio?.workspaceName ?? "未选择工作区" }
     var targetDescription: String { targetSiteDescription + "\n工作区：" + targetWorkspaceName }
     func identityChanged() {
+        stopCreditRefresh()
         restoreTask?.cancel(); restoreTask = nil
         discardCapabilityPreview()
         clearAuthorization()
@@ -192,6 +204,7 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
     }
     func confirmCapabilities() {
         guard !busy, let preview = capabilityPreview, let approval = capabilityApproval else { return }
+        creditTotal = nil; creditQueriedAt = nil; creditExpiresAt = nil
         busy = true; actionTitle = "更新设备能力"; capabilityStatus = "提交已确认的能力版本…"
         let op = UUID(); operationID = op
         operation = Task { [weak self] in
@@ -453,11 +466,94 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
                 }
                 self.restoreAttempts = 0
                 self.bridge = candidate; self.loggedIn = true; self.loginChecked = true; self.connected = true; self.status = "已连接 · 使用本机即梦登录"
+                self.startCreditRefresh(executable: executable, bridge: candidate, owner: owner, ticket: ticket, fingerprint: fingerprint)
                 self.start(cli: cli, executable: executable, bridge: candidate, owner: owner, ticket: ticket)
             } catch DreaminaError.notLinked {if self.generation == ticket && self.operationID == op && !Task.isCancelled {self.loggedIn=false;self.loginChecked=true;self.status="请先登录即梦"}} catch ClassicCliUpgradeError.required {if self.generation == ticket && self.operationID == op && !Task.isCancelled {self.needsUpgrade=true;self.status="请更新即梦 CLI 后重新关联"}} catch {
                 if self.generation == ticket && self.operationID == op && !Task.isCancelled {
                     self.status = automatically ? "连接暂未恢复，稍后自动重试" : "连接失败，请检查 Studio 与本机即梦登录"
                     if automatically { self.retryRememberedConnection(ticket: ticket) }
+                }
+            }
+        }
+    }
+    private func restartCreditRefresh() {
+        guard connected, let bridge, let owner, let executable = locator(),
+              let file = try? location(owner), let data = try? Data(contentsOf: file),
+              let saved = try? JSONDecoder().decode(Authorization.self, from: data),
+              saved.owner == owner, saved.device.id == bridge.device.id, saved.device.epoch == bridge.device.epoch else { return }
+        startCreditRefresh(executable: executable, bridge: bridge, owner: owner, ticket: generation, fingerprint: saved.fingerprint)
+    }
+    private func stopCreditRefresh() {
+        creditTicket = UUID(); creditLoop?.cancel(); creditLoop = nil; creditService = nil
+        creditTotal = nil; creditQueriedAt = nil; creditExpiresAt = nil; creditStatus = "积分未查询"
+    }
+    private func startCreditRefresh(executable: URL, bridge: ClassicStudioBridge, owner: String, ticket: UUID, fingerprint: String) {
+        stopCreditRefresh()
+        let creditTicket = self.creditTicket
+        guard let identity = try? ClassicDreaminaCLI.fileIdentity(executable),
+              let ledger = try? ClassicCreditLedger(directory: directory, binding: owner + "|" + bridge.device.id + "|" + bridge.device.epoch) else { return }
+        let context: @MainActor () -> Bool = { [weak self] in
+            guard let self else { return false }
+            return self.owner == owner && self.generation == ticket && self.creditTicket == creditTicket && !Task.isCancelled &&
+                self.connected && self.bridge?.device.id == bridge.device.id && self.bridge?.device.epoch == bridge.device.epoch &&
+                self.locator()?.resolvingSymlinksInPath() == executable.resolvingSymlinksInPath() &&
+                (try? ClassicDreaminaCLI.fileIdentity(executable)) == identity
+        }
+        let hash: @MainActor () async -> Bool = { [weak self] in
+            guard let self, context() else { return false }
+            let actual = try? await self.capabilityFingerprint(executable)
+            return context() && actual == fingerprint
+        }
+        let service = ClassicCreditRefresh(ledger: ledger, device: bridge.device, bridge: bridge, runner: creditRunnerFactory(executable), current: context, hashCurrent: hash,
+                                          confirm: { [weak self] changed in
+            guard let self, context() else { return false }
+            self.creditTotal = nil; self.creditStatus = changed ? "即梦登录已变化，请确认本次积分查询" : "请确认首次积分查询"
+            let accepted = await self.creditConfirmation(changed)
+            return context() && accepted
+        })
+        creditService = service
+        creditLoop = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self, context() else { return }
+                do {
+                    var request = bridge.client.request(path: "api/local-cli/devices/credit-refresh", session: bridge.session, workspace: bridge.workspace)
+                    request.setValue(bridge.device.id, forHTTPHeaderField: "X-Local-CLI-Device")
+                    request.setValue(bridge.device.secret, forHTTPHeaderField: "X-Local-CLI-Secret")
+                    guard context() else { return }
+                    let (data, _) = try await bridge.client.json(request)
+                    guard context() else { return }
+                    struct Response: Decodable { let request: ClassicCreditRequest? }
+                    var pendingRequest = try JSONDecoder().decode(Response.self, from: data).request
+                    // A completed server slot is no longer returned by polling. Reconcile the
+                    // original uncertain payload without executing another CLI query.
+                    if pendingRequest == nil, let saved = try? ledger.read(), let payload = saved.pending,
+                       let requestID = payload.requestId, let expiration = saved.reservations?[requestID],
+                       let deadline = ClassicCreditRefresh.date(expiration), Date() < deadline {
+                        pendingRequest = ClassicCreditRequest(requestId: requestID, deviceId: bridge.device.id, epoch: payload.epoch,
+                            capabilityRevision: payload.capabilityRevision, status: "pending", requestedAt: ClassicCreditRefresh.timestamp(deadline.addingTimeInterval(-60)), expiresAt: expiration)
+                    }
+                    if let pending = pendingRequest {
+                        self.creditTotal = nil; self.creditStatus = "正在刷新即梦积分…"
+                        if let snapshot = try await service.run(pending), context() {
+                            self.creditTotal = snapshot.status == "available" ? snapshot.totalCredit : nil
+                            self.creditQueriedAt = snapshot.queriedAt.flatMap(ClassicCreditRefresh.date)
+                            self.creditExpiresAt = snapshot.expiresAt.flatMap(ClassicCreditRefresh.date)
+                            if let queried = self.creditQueriedAt, let expiry = self.creditExpiresAt { self.creditExpiresAt = min(expiry, queried.addingTimeInterval(120)) }
+                            self.creditStatus = snapshot.status == "available" ? "最近查询快照，可能因即梦账号切换或使用而变化" : "积分读取失败或已过期，请重新刷新"
+                        } else if context() { self.creditStatus = "本次查询已处理或未确认，请在Studio核对结果；超时后可重新刷新" }
+                    }
+                } catch { if context() { self.creditTotal = nil; self.creditStatus = "积分读取失败，请重新刷新" } }
+                do { try await Task.sleep(nanoseconds: self.creditPollingNanoseconds) } catch { return }
+                guard context() else { return }
+                if self.creditExpiresAt.map({ Date() >= $0 }) == true {
+                    self.creditTotal = nil; self.creditQueriedAt = nil; self.creditStatus = "积分快照已过期，请重新刷新"
+                }
+                // Local expiry never triggers a CLI query or network upload.
+                if let state = try? ledger.read(), let pending = state.pending,
+                   ClassicCreditRefresh.date(pending.queriedAt).map({ Date().timeIntervalSince($0) >= 120 }) == true {
+                    self.creditTotal = nil
+                    var expired = state; expired.pending = nil; expired.pendingIdentityHMAC = nil
+                    if context() { try? ledger.write(expired) }
                 }
             }
         }
@@ -514,7 +610,7 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
         }
         identityChanged(); status = "未连接"
     }
-    func shutdown() { discardCapabilityPreview(); restoreTask?.cancel(); generation = UUID(); loop?.cancel(); heartbeat?.stop(); operation?.cancel() }
+    func shutdown() { stopCreditRefresh(); discardCapabilityPreview(); restoreTask?.cancel(); generation = UUID(); loop?.cancel(); heartbeat?.stop(); operation?.cancel() }
 }
 
 // Review only the values used by the frozen CLI argv; never expose internal node IDs.

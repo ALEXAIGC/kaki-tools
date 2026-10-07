@@ -207,6 +207,13 @@ private struct WebsiteLogo: View {
                 Text(connection.status).font(.system(size: 12)).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center).frame(maxWidth: 430)
             }
+            VStack(alignment: .leading, spacing: 6) {
+                if let total = connection.creditTotal { Text("即梦积分 " + String(format: "%g", total)) }
+                if let queried = connection.creditQueriedAt, connection.creditTotal != nil { Text("最近查询 " + queried.formatted(date: .omitted, time: .shortened)) }
+                Text(connection.creditStatus).foregroundStyle(.secondary)
+                Text("在Studio打开即梦CLI分区或点击刷新时查询；当前设备须已连接。积分仅供展示，不作为生成或会员资格判断。")
+                    .foregroundStyle(.secondary)
+            }.font(.system(size: 12)).frame(maxWidth: .infinity, alignment: .leading)
             VStack(alignment: .leading, spacing: 8) {
                 Button("检测并更新设备能力") { connection.detectCapabilities() }
                     .disabled(connection.busy)
