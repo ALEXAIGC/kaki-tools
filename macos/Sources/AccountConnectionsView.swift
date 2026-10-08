@@ -207,6 +207,26 @@ private struct WebsiteLogo: View {
                 Text(connection.status).font(.system(size: 12)).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center).frame(maxWidth: 430)
             }
+            VStack(alignment: .leading, spacing: 8) {
+                Button("检测并更新设备能力") { connection.detectCapabilities() }
+                    .disabled(connection.busy)
+                if let preview = connection.capabilityPreview {
+                    Text("当前型号（版本 \(preview.current.effectiveRevision)）：" + modelList(preview.current.models))
+                    Text("新增：" + modelList(preview.added))
+                    Text("移除：" + modelList(preview.removed))
+                    Text("确认后型号：" + modelList(preview.payload.models))
+                    if preview.retry { Text("上次结果未确认：将原样重试已确认请求（revision \(preview.payload.expectedRevision)），不会覆盖其他版本。") }
+                    Text("使用本机即梦额度；会员资格独立。移除型号后，尚未提交的对应任务可能终止，已提交任务保留原 ID。")
+                    HStack {
+                        Button(preview.retry ? "确认重试原请求" : "确认更新设备能力") { connection.confirmCapabilities() }
+                            .buttonStyle(SettingsPrimaryButtonStyle()).disabled(connection.busy)
+                        Button("取消") { connection.discardCapabilityPreview() }.disabled(connection.busy)
+                    }
+                }
+                if !connection.capabilityStatus.isEmpty { Text(connection.capabilityStatus) }
+                Text("旧设备：先单独连接原设备再检测；CLI 路径或内容变化需重新授权。不会自动注册或恢复断开。")
+                    .foregroundStyle(.secondary)
+            }.font(.system(size: 12)).frame(maxWidth: .infinity, alignment: .leading)
             HStack(spacing: 12) {
                 if connection.busy {
                     Button("取消") { connection.cancelOperation() }
@@ -229,6 +249,7 @@ private struct WebsiteLogo: View {
             }.frame(maxWidth: .infinity).padding(.bottom, 4)
         }.frame(maxWidth: .infinity)
     }
+    private func modelList(_ models: [String]) -> String { models.isEmpty ? "无" : models.map(ClassicVideoModels.title).joined(separator: "、") }
     private func context(_ label: String, value: String) -> some View {
         VStack(spacing: 4) {
             Text(label).font(.system(size: 10)).foregroundStyle(.secondary)
