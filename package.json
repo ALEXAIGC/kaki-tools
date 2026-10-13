@@ -1,7 +1,7 @@
 {
   "name": "kaki-tools",
   "productName": "Kaki Tools",
-  "version": "1.5.11",
+  "version": "1.5.12",
   "private": true,
   "description": "原生 macOS 剪贴板、窗口调整和区域截图工具",
   "scripts": {

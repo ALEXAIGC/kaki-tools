@@ -293,8 +293,20 @@ struct ClassicDreaminaCLI: Sendable {
         let object = try Self.object(output)
         guard object["submit_id"] as? String == id, let status = object["gen_status"] as? String else { throw DreaminaError.invalidResponse }
         if status == "success" {
-            guard let result = object["result_json"] as? [String: Any], let videos = result["videos"] as? [[String: Any]], videos.count == 1,
-                  let value = videos[0]["video_url"] as? String, let url = URL(string: value), url.scheme == "https", url.host != nil, url.user == nil, url.password == nil else { throw DreaminaError.invalidResponse }
+            guard let result = object["result_json"] as? [String: Any], let videos = result["videos"] as? [[String: Any]], videos.count == 1 else { throw DreaminaError.invalidResponse }
+            if let value = videos[0]["path"] as? String {
+                // With --download_dir, the official CLI replaces video_url with
+                // its downloaded path. Accept only this task's direct local file.
+                guard !value.isEmpty, !value.contains("\0") else { throw DreaminaError.invalidResponse }
+                let file = (value.hasPrefix("/") ? URL(fileURLWithPath: value) : directory.appendingPathComponent(value)).standardizedFileURL
+                guard file.deletingLastPathComponent() == directory.standardizedFileURL,
+                      ["mp4", "mov", "webm"].contains(file.pathExtension.lowercased()) else { throw DreaminaError.invalidResponse }
+                let properties = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+                guard properties.isRegularFile == true, properties.isSymbolicLink != true,
+                      let bytes = properties.fileSize, bytes > 0, bytes <= 300 * 1024 * 1024 else { throw DreaminaError.invalidResponse }
+            } else {
+                guard let value = videos[0]["video_url"] as? String, let url = URL(string: value), url.scheme == "https", url.host != nil, url.user == nil, url.password == nil else { throw DreaminaError.invalidResponse }
+            }
         }
         return status
     }

@@ -15,6 +15,14 @@ func check(_ condition: @autoclosure () -> Bool, _ message: String, file: Static
         setbuf(stdout, nil)
         do {
             _ = NSApplication.shared
+            if ProcessInfo.processInfo.environment["KAKI_TEST_SCOPE"] == "results" {
+                try await runClassicCliTests()
+                try await runClassicLocalResultTests()
+                try await runSeedanceModelTests()
+                try await runClassicDiagnosticsTests()
+                print("RESULT_TESTS_PASSED \(checkCount) assertions")
+                return
+            }
             if ProcessInfo.processInfo.environment["KAKI_TEST_SCOPE"] == "credit" {
                 try await runClassicCreditTests()
                 try await runClassicCapabilityTests()
@@ -46,6 +54,7 @@ func check(_ condition: @autoclosure () -> Bool, _ message: String, file: Static
             try await runStudioCacheTests()
             try await runDreaminaProcessLifecycleTests()
             try await runClassicCliTests()
+            try await runClassicLocalResultTests()
             try await runSeedanceModelTests()
             try await runClassicDiagnosticsTests()
             try await runClassicFiveModesTests()
