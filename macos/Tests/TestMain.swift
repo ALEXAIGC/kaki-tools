@@ -18,6 +18,8 @@ func check(_ condition: @autoclosure () -> Bool, _ message: String, file: Static
             if ProcessInfo.processInfo.environment["KAKI_TEST_SCOPE"] == "results" {
                 try await runClassicCliTests()
                 try await runClassicLocalResultTests()
+                try await runClassicRecoveryTests()
+                try await runClassicLifecycleFixTests()
                 try await runSeedanceModelTests()
                 try await runClassicDiagnosticsTests()
                 print("RESULT_TESTS_PASSED \(checkCount) assertions")
@@ -55,6 +57,8 @@ func check(_ condition: @autoclosure () -> Bool, _ message: String, file: Static
             try await runDreaminaProcessLifecycleTests()
             try await runClassicCliTests()
             try await runClassicLocalResultTests()
+            try await runClassicRecoveryTests()
+            try await runClassicLifecycleFixTests()
             try await runSeedanceModelTests()
             try await runClassicDiagnosticsTests()
             try await runClassicFiveModesTests()

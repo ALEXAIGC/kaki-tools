@@ -129,7 +129,9 @@ func runClassicCliTests() async throws {
     await bridge.configure(failEvent: "dispatch-intent")
     let lostAck = task("intent-ack-lost")
     do { try await executor.step(task: lostAck, owner: "owner|ws", bridge: bridge, authorize: { true }, isCurrent: { true }, validateVideo: videoValidator) } catch DreaminaError.timedOut { }
-    try await restarted.step(task: lostAck, owner: "owner|ws", bridge: bridge, authorize: { true }, isCurrent: { true }, validateVideo: videoValidator)
+    // This fixture records acceptance before losing the acknowledgement;
+    // a fresh claim therefore carries the server's dispatch-intent stage.
+    try await restarted.step(task: task("intent-ack-lost", stage: "dispatch-intent"), owner: "owner|ws", bridge: bridge, authorize: { true }, isCurrent: { true }, validateVideo: videoValidator)
     let callsAfterLostAck = await runner.allCalls(); try check(callsAfterLostAck.filter {$0 != ["user_credit"]} == beforeSwitch.filter {$0 != ["user_credit"]}, "intent acknowledgement loss never invokes paid command")
     await runner.configure()
     let invalidReceipts = [Data("<html>login</html>".utf8),Data("{}".utf8),Data("{\"accepted\":true,\"jobId\":\"wrong-task\"}".utf8)]

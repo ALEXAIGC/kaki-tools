@@ -49,6 +49,22 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
     }
 }
 
+// The server schedules remote generation slots; one local executor remains serial.
+// Invalid hints never reduce the legacy delay or discard an otherwise valid task.
+struct ClassicCliClaimResponse: Decodable {
+    let task: ClassicVideoTask?
+    let pollNanoseconds: UInt64
+    static let defaultPollNanoseconds: UInt64 = 10_000_000_000
+    private enum CodingKeys: String, CodingKey { case task, pollAfterMs }
+    init(from decoder: Decoder) throws {
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        task = try fields.decodeIfPresent(ClassicVideoTask.self, forKey: .task)
+        if let milliseconds = try? fields.decode(Int.self, forKey: .pollAfterMs), (200...10_000).contains(milliseconds) {
+            pollNanoseconds = UInt64(milliseconds) * 1_000_000
+        } else { pollNanoseconds = Self.defaultPollNanoseconds }
+    }
+}
+
 @MainActor final class ClassicCliConnection: ObservableObject {
     @Published private(set) var actionTitle = "检查连接"
     @Published private(set) var status = "未连接"
@@ -90,6 +106,11 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
     private var restoreAttempts = 0
     private let restoreRetryNanoseconds: UInt64
     private var bridge: ClassicStudioBridge?
+    private var resumingBridge: ClassicStudioBridge?
+    private var pendingResume: Task<Void, Error>?
+    // Never cancel an in-flight pause: a later resume must observe its confirmed completion.
+    // A lost pause receipt stays fail-closed because the server may still apply that request.
+    private var pauseBarrier: Task<Void, Error>?
     private var generation = UUID()
     private var operationID=UUID()
     private let locator: @Sendable () -> URL?
@@ -125,10 +146,24 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
         restoreTask?.cancel(); restoreTask = nil
         discardCapabilityPreview()
         clearAuthorization()
+        let previousLoop = loop, previousOperation = operation, previousResume = pendingResume
+        pendingResume = nil
         generation = UUID(); loop?.cancel(); heartbeat?.stop(); operation?.cancel(); loop = nil; heartbeat = nil; operation = nil
-        let previous = bridge; bridge = nil; connected = false; busy = false; status = "站点、账号或工作区已变更，请重新连接"
+        let previous = bridge ?? resumingBridge; bridge = nil; resumingBridge = nil; connected = false; busy = false; status = "站点、账号或工作区已变更，请重新连接"
         if let previous {
-            Task { _ = try? await previous.client.json(previous.request("devices/pause")) }
+            let pending = pauseBarrier
+            pauseBarrier = Task {
+                if let pending { try await pending.value }
+                // Cancelled executor/process work must finish before another owner loop starts.
+                if let previousLoop { await previousLoop.value }
+                // Unstructured resume requests are never cancelled with the UI operation.
+                // Wait for their receipt; a lost receipt prevents new lifecycle mutations.
+                if let previousResume { try await previousResume.value }
+                if let previousOperation { await previousOperation.value }
+                // Studio transport has bounded request/resource timeouts. Preserve an ambiguous
+                // failure rather than sending a new resume while an old pause may still arrive.
+                _ = try await previous.client.json(previous.request("devices/pause"))
+            }
         }
     }
     func discardCapabilityPreview() { capabilityPreview = nil; capabilityApproval = nil }
@@ -222,7 +257,8 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
                 guard self.capabilityContextCurrent(approval, op: op) else { throw DreaminaError.wrongOwner }
                 try self.saveAuthorization(saved, at: file)
                 var request = try approval.bridge.request("devices/capabilities")
-                request.httpBody = try JSONEncoder().encode(preview.payload)
+                let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+                request.httpBody = try encoder.encode(preview.payload)
                 guard await self.capabilityCurrent(approval, op: op), self.capabilityContextCurrent(approval, op: op) else { throw DreaminaError.wrongOwner }
                 let (data, _) = try await approval.bridge.client.json(request)
                 let receipt = try JSONDecoder().decode(ClassicCliPublicDevice.self, from: data)
@@ -317,6 +353,11 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
     }
     func upgrade() {
         guard !busy, !claimed, !connected, let executable=locator() else {status="请先断开连接并等待本机任务结束";return}
+        do {
+            guard try !ClassicCliExecutor.hasUnfinishedTasks(directory: directory.appendingPathComponent("journal", isDirectory: true)) else {
+                status = "原设备仍有未完成任务，请先回传原结果再更新 CLI"; return
+            }
+        } catch { status = "任务记录无法核对，已阻止更新；原设备与记录保留"; return }
         busy=true;actionTitle="更新即梦 CLI";status="正在验证并更新即梦 CLI…"
         let ticket=generation, op=UUID();operationID=op
         operation=Task { [weak self] in
@@ -333,7 +374,25 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
             } catch {if self.generation == ticket && self.operationID == op {self.status="CLI 更新未完成，原登录与任务记录保留"}}
         }
     }
-    private func canUpgrade(_ ticket:UUID,op:UUID) -> Bool {generation == ticket && operationID == op && !Task.isCancelled && !claimed && !connected}
+    private func canUpgrade(_ ticket:UUID,op:UUID) -> Bool {
+        guard generation == ticket, operationID == op, !Task.isCancelled, !claimed, !connected else { return false }
+        // Check every owner, since replacing one executable affects all account/workspace bindings.
+        return (try? ClassicCliExecutor.hasUnfinishedTasks(directory: directory.appendingPathComponent("journal", isDirectory: true))) == false
+    }
+    private func operationCurrent(owner: String, ticket: UUID, op: UUID) -> Bool {
+        self.owner == owner && generation == ticket && operationID == op && !Task.isCancelled
+    }
+    private func awaitPreviousPause(owner: String, ticket: UUID, op: UUID) async throws -> Bool {
+        if let pauseBarrier { try await pauseBarrier.value }
+        return operationCurrent(owner: owner, ticket: ticket, op: op)
+    }
+    private func workerConflict(owner: String, ticket: UUID, device: ClassicCliDevice) {
+        guard self.owner == owner, generation == ticket, connected,
+              bridge?.device.id == device.id, bridge?.device.epoch == device.epoch else { return }
+        identityChanged()
+        status = "原设备连接状态已变化，正在核对原授权；不会替换设备或重新生成"
+        restoreRememberedConnection()
+    }
     private func checkingLogin(_ ticket:UUID,op:UUID) {if generation == ticket && operationID == op {status="检查即梦登录…"}}
     private func clearAuthorization() {authorizationUserCode="";authorizationURL=nil}
     private func showAuthorization(_ value:ClassicCliAuthorization,ticket:UUID,op:UUID) -> Bool {
@@ -406,7 +465,7 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
         let ticket = generation, op=UUID();operationID=op
         operation = Task { [weak self] in
             guard let self else { return }
-            defer { if self.generation == ticket && self.operationID == op && !Task.isCancelled { self.busy = false } }
+            defer { if self.generation == ticket && self.operationID == op { self.busy = false; self.resumingBridge = nil; self.pendingResume = nil } }
             do {
                 let fingerprint = try await Task.detached { try ClassicDreaminaCLI.fingerprint(executable) }.value
                 let cli = ClassicDreaminaCLI(runner: self.runnerFactory(executable))
@@ -415,18 +474,34 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
                 let profile = "resolution-five"
                 guard self.owner == owner, self.generation == ticket && self.operationID == op && !Task.isCancelled else { return }
                 let file = try self.location(owner)
-                var saved = try? JSONDecoder().decode(Authorization.self, from: Data(contentsOf: file))
+                var saved: Authorization?
+                if FileManager.default.fileExists(atPath: file.path) {
+                    do {
+                        saved = try JSONDecoder().decode(Authorization.self, from: Data(contentsOf: file))
+                        guard saved?.owner == owner else { throw DreaminaError.wrongOwner }
+                    }
+                    catch { self.status = "原设备授权记录无法核对，已阻止重新关联；原记录保留"; return }
+                }
                 if automatically && (saved?.owner != owner || saved?.autoResume == false) { return }
                 let current: @Sendable () async -> Bool = { [self] in
                     guard await self.matches(owner: owner, ticket: ticket) else { return false }
                     return (try? await Task.detached { try ClassicDreaminaCLI.fingerprint(executable) }.value) == fingerprint
                 }
                 var candidate: ClassicStudioBridge?
+                do {
+                    guard try await self.awaitPreviousPause(owner: owner, ticket: ticket, op: op) else { return }
+                } catch {
+                    guard self.operationCurrent(owner: owner, ticket: ticket, op: op) else { return }
+                    self.status = "上一次断开尚未确认，已暂停重连；请核对原设备状态"; return
+                }
                 if let saved, saved.owner == owner, saved.fingerprint == fingerprint, saved.profile == profile {
                     let restored = ClassicStudioBridge(client: context.client, session: context.session, workspace: context.workspace, device: saved.device, current: current)
                     do {
-                        try Task.checkCancellation()
-                        _ = try await restored.client.json(restored.request("devices/resume"))
+                        guard self.operationCurrent(owner: owner, ticket: ticket, op: op) else { return }
+                        self.resumingBridge = restored
+                        let resume = Task { _ = try await restored.client.json(restored.request("devices/resume")) }
+                        self.pendingResume = resume
+                        try await resume.value
                         candidate = restored
                     } catch {
                         guard !Task.isCancelled, self.generation == ticket else { return }
@@ -439,12 +514,22 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
                 }
                 guard self.owner == owner, self.generation == ticket && self.operationID == op && !Task.isCancelled else { return }
                 if candidate == nil {
+                    do {
+                        guard try !ClassicCliExecutor.hasUnfinishedTasks(directory: self.directory.appendingPathComponent("journal", isDirectory: true), owner: owner) else {
+                            self.status = "原设备仍有未完成任务，请恢复原 CLI 与原授权回传结果；已阻止替换设备"; return
+                        }
+                    } catch { self.status = "原任务记录无法核对，已阻止重新关联；原授权与记录保留"; return }
                     guard !automatically else { self.status = "已保留即梦登录，请手动确认 Studio 连接"; return }
                     let alert = NSAlert(); alert.messageText = "关联本机即梦登录？"
                     alert.informativeText = "使用本机即梦登录，常规 CLI 不核验即梦账号 ID。关联当前 Studio 账号与工作区；画布点击生成后由本机直接执行，使用本人即梦额度。"
                     alert.addButton(withTitle: "关联"); alert.addButton(withTitle: "取消")
                     guard alert.runModal() == .alertFirstButtonReturn else { self.status = "未连接"; return }
-                    guard await current(),self.operationID == op,!Task.isCancelled else { return }
+                    guard await current(), self.operationCurrent(owner: owner, ticket: ticket, op: op) else { return }
+                    // Recheck after the user consent boundary; an unresolved original task
+                    // must never lose its device authorization to a replacement registration.
+                    guard try !ClassicCliExecutor.hasUnfinishedTasks(directory: self.directory.appendingPathComponent("journal", isDirectory: true), owner: owner) else {
+                        self.status = "原设备仍有未完成任务，已阻止替换设备"; return
+                    }
                     let body = try JSONSerialization.data(withJSONObject: ["origin": context.client.environment.baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")), "models": models, "profile": profile] as [String: Any])
                     let (data, _) = try await context.client.json(context.client.request(path: "api/local-cli/devices/register", method: "POST", session: context.session, workspace: context.workspace, body: body))
                     guard await current(),self.operationID == op,!Task.isCancelled else {return}
@@ -564,28 +649,45 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
         // Keep presence alive independently of confirmation, submission, and slow result downloads.
         // The copied bridge binds the original session/workspace; identityChanged cancels this task.
         let identity = try? ClassicDreaminaCLI.fileIdentity(executable)
-        heartbeat = ClassicCliHeartbeat { _ = try await bridge.client.json(bridge.request("devices/heartbeat")) }
+        heartbeat = ClassicCliHeartbeat { [weak self] in
+            guard let self, await self.matches(owner: owner, ticket: ticket),
+                  let identity, (try? ClassicDreaminaCLI.fileIdentity(executable)) == identity else { throw DreaminaError.wrongOwner }
+            do { _ = try await bridge.client.json(bridge.request("devices/heartbeat")) }
+            catch StudioError.http(409, _) {
+                await self.workerConflict(owner: owner, ticket: ticket, device: bridge.device)
+                throw DreaminaError.notLinked
+            }
+        }
         let executor = ClassicCliExecutor(cli: cli, directory: directory.appendingPathComponent("journal", isDirectory: true)); self.executor=executor
         loop = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self, self.owner == owner, self.generation == ticket else { return }
+                var pollNanoseconds = ClassicCliClaimResponse.defaultPollNanoseconds
                 do {
                     guard let identity, (try? ClassicDreaminaCLI.fileIdentity(executable)) == identity else {
                         self.identityChanged(); self.status = "CLI 已变化，请重新关联"; return
                     }
-                    let (data, _) = try await bridge.client.json(bridge.request("devices/claim"))
-                    struct Claim: Decodable { let task: ClassicVideoTask? }
-                    if let task = try JSONDecoder().decode(Claim.self, from: data).task {
+                    let data: Data
+                    do { (data, _) = try await bridge.client.json(bridge.request("devices/claim")) }
+                    catch StudioError.http(409, _) {
+                        self.workerConflict(owner: owner, ticket: ticket, device: bridge.device); return
+                    }
+                    guard self.owner == owner, self.generation == ticket, !Task.isCancelled else { return }
+                    let claim = try JSONDecoder().decode(ClassicCliClaimResponse.self, from: data)
+                    if let task = claim.task {
                         self.claimed=true
                         defer {self.claimed=false}
                         self.status = task.submitId == nil && task.stage != "awaiting-confirmation" ? "提交结果待核对，请勿重新生成" : "本机视频处理中"
                         try await executor.step(task: task, owner: owner, bridge: bridge, isCurrent: bridge.current, validateVideo: { try await Self.validateVideo($0) })
                     } else { self.status = "已连接 · 使用本机即梦登录" }
+                    // Apply hints only after a successful serial step or an acknowledged idle claim.
+                    // Failed preparation/query/upload always retains the ten-second backoff.
+                    pollNanoseconds = claim.pollNanoseconds
                 } catch {
                     guard self.generation == ticket else { return }
                     self.status = "连接或结果待核对，不会重新生成"
                 }
-                do { try await Task.sleep(nanoseconds: 10_000_000_000) } catch { return }
+                do { try await Task.sleep(nanoseconds: pollNanoseconds) } catch { return }
             }
         }
     }

@@ -24,7 +24,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
     }
     var subtitle: String? {
         switch self {
-        case .clipboard: return "让常用内容随手可得。"
+        case .clipboard: return nil
         case .shortcuts: return nil
         case .studio: return nil
         case .downloads: return "原始素材的保存位置与本地空间管理。"
@@ -46,7 +46,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     VStack(alignment: .leading, spacing: 7) {
-                        Text(section.title).font(.system(size: 19, weight: .semibold))
+                        Text(section.title).font(.system(size: section == .clipboard ? 17 : 19, weight: .semibold))
                         if let subtitle = section.subtitle { SettingsFootnote(subtitle) }
                     }.padding(.bottom, 4)
                     page
@@ -81,9 +81,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
             Text("v\(SettingsStyle.version)")
                 .font(.system(size: 10, weight: .medium, design: .monospaced))
                 .foregroundStyle(.secondary)
-                .padding(.horizontal, 10).padding(.vertical, 5)
-                .background(Color.primary.opacity(0.045), in: Capsule())
-                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 12)
                 .accessibilityLabel("版本 \(SettingsStyle.version)")
         }.padding(.horizontal, 14).padding(.bottom, 18).frame(width: 174)
             .frame(maxHeight: .infinity).background(.thinMaterial)
@@ -99,19 +97,25 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
         }
     }
     private var clipboardPage: some View {
-        VStack(spacing: 18) {
-            SettingsCard("外观") {
-                HStack(spacing: 10) {
-                    appearanceOption("跟随系统", icon: "circle.lefthalf.filled", value: "system")
-                    appearanceOption("浅色", icon: "sun.max", value: "light")
-                    appearanceOption("深色", icon: "moon", value: "dark")
-                }
+        VStack(alignment: .leading, spacing: 20) {
+            clipboardGroup("外观") {
+                HStack(spacing: 16) {
+                    Text("主题模式").font(.system(size: 13, weight: .medium))
+                    Spacer(minLength: 12)
+                    Picker("主题模式", selection: $settings.appearance) {
+                        Text("跟随系统").tag("system")
+                        Text("浅色").tag("light")
+                        Text("深色").tag("dark")
+                    }.pickerStyle(.segmented).labelsHidden()
+                        .frame(width: 252).controlSize(.regular)
+                        .accessibilityLabel("主题模式")
+                }.padding(.vertical, 3)
             }
-            SettingsCard("使用习惯") {
+            clipboardGroup("使用习惯") {
                 VStack(spacing: 0) {
-                    switchRow("自动粘贴", detail: "选择内容后粘贴回原应用", value: $settings.autoPaste)
+                    switchRow("自动粘贴", value: $settings.autoPaste)
                     Divider()
-                    switchRow("失焦隐藏", detail: "切换到其他应用时收起面板", value: $settings.hideOnBlur)
+                    switchRow("失焦隐藏", value: $settings.hideOnBlur)
                     Divider()
                     switchRow("启动时打开剪贴板", value: $settings.showOnLaunch)
                     Divider()
@@ -119,35 +123,23 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
                 }
             }
             SettingsCard {
-                HStack(spacing: 14) {
-                    Image(systemName: "clock.arrow.circlepath").font(.system(size: 22)).foregroundStyle(.secondary)
-                    VStack(alignment: .leading, spacing: 5) {
-                        HStack(spacing: 8) {
-                            Text("最近 100 条历史").font(.system(size: 13, weight: .semibold))
-                            HistoryCapacityLabel(store: controller.store)
-                        }
-                        SettingsFootnote("固定与收藏独立保留。")
-                    }
-                    Spacer()
+                HStack(spacing: 12) {
+                    Image(systemName: "clock.arrow.circlepath").font(.system(size: 19)).foregroundStyle(.secondary)
+                    Text("最近 100 条历史").font(.system(size: 13, weight: .medium))
+                    HistoryCapacityLabel(store: controller.store)
+                    Spacer(minLength: 12)
                     Button("清空历史…", role: .destructive) { controller.clearHistory() }
+                        .help("固定与收藏独立保留")
                 }
             }
         }
     }
-    private func appearanceOption(_ title: String, icon: String, value: String) -> some View {
-        let selected = settings.appearance == value
-        return Button { settings.appearance = value } label: {
-            VStack(spacing: 10) {
-                Image(systemName: icon).font(.system(size: 20, weight: .light)).frame(height: 24)
-                HStack(spacing: 5) {
-                    Text(title).font(.system(size: 12, weight: .medium))
-                    if selected { Image(systemName: "checkmark.circle.fill").font(.system(size: 10)) }
-                }
-            }.frame(maxWidth: .infinity).padding(.vertical, 12)
-                .foregroundStyle(selected ? SettingsStyle.accent : Color.secondary)
-                .background(selected ? SettingsStyle.accent.opacity(0.065) : Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 9))
-                .overlay { RoundedRectangle(cornerRadius: 9).strokeBorder(selected ? SettingsStyle.accent.opacity(0.5) : Color.primary.opacity(0.06), lineWidth: 1) }
-        }.buttonStyle(.plain).accessibilityAddTraits(selected ? .isSelected : [])
+    private func clipboardGroup<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+                .padding(.leading, 2)
+            SettingsCard { content() }
+        }
     }
     private func switchRow(_ name: String, detail: String? = nil, value: Binding<Bool>) -> some View {
         SettingsRow(name, detail: detail) { Toggle(name, isOn: value).labelsHidden().toggleStyle(.switch).controlSize(.small) }
@@ -247,7 +239,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
             if !controller.shortcutIssues.isEmpty { return "请调整标红的快捷键，再保存。" }
         }
         if !controller.message.isEmpty { return controller.message }
-        return section == .shortcuts ? "" : "更改后点击保存"
+        return ""
     }
     private var footer: some View {
         HStack(spacing: 12) {

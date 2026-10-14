@@ -126,6 +126,9 @@ struct ClassicCliJournal: Codable {
     var submitId: String?
     var file: String?
     var failureCode: String? = nil
+    // nil preserves old journal compatibility; new terminal records remain
+    // unresolved until the original server accepts their failure receipt.
+    var terminalAcknowledged: Bool? = nil
 }
 protocol ClassicCliBridge: Sendable {
     func prepareReferences(task: ClassicVideoTask, directory: URL) async throws -> [URL]
@@ -287,38 +290,119 @@ struct ClassicDreaminaCLI: Sendable {
         return id
     }
     static func validID(_ value: String) -> Bool { !value.isEmpty && value.count <= 200 && value.range(of: "^[a-zA-Z0-9_-]+$", options: .regularExpression) != nil }
-    func query(_ id: String, directory: URL) async throws -> String {
+    struct QueryResult: Sendable {
+        let status: String
+        let file: URL?
+    }
+    static func resultFile(_ file: URL, in directory: URL) throws -> URL {
+        let file = file.standardizedFileURL, directory = directory.standardizedFileURL
+        let parent = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard parent.isDirectory == true, parent.isSymbolicLink != true,
+              file.deletingLastPathComponent() == directory,
+              ["mp4", "mov", "webm"].contains(file.pathExtension.lowercased()) else { throw DreaminaError.invalidResponse }
+        let properties = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        guard properties.isRegularFile == true, properties.isSymbolicLink != true,
+              let bytes = properties.fileSize, bytes > 0, bytes <= 300 * 1024 * 1024 else { throw DreaminaError.invalidResponse }
+        return file
+    }
+    func queryResult(_ id: String, directory: URL) async throws -> QueryResult {
         guard Self.validID(id) else { throw DreaminaError.invalidResponse }
+        let directory = directory.standardizedFileURL
+        let properties = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard properties.isDirectory == true, properties.isSymbolicLink != true else { throw DreaminaError.invalidResponse }
+        // Legacy receipts may expose only video_url. Never mistake a prior
+        // attempt's residual download for the result of this invocation.
+        let before = Set(try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).map(\.lastPathComponent))
         let output = try await runner.run(["query_result", "--submit_id", id, "--download_dir", directory.path], timeout: 120)
+        try Task.checkCancellation()
         let object = try Self.object(output)
         guard object["submit_id"] as? String == id, let status = object["gen_status"] as? String else { throw DreaminaError.invalidResponse }
-        if status == "success" {
-            guard let result = object["result_json"] as? [String: Any], let videos = result["videos"] as? [[String: Any]], videos.count == 1 else { throw DreaminaError.invalidResponse }
-            if let value = videos[0]["path"] as? String {
-                // With --download_dir, the official CLI replaces video_url with
-                // its downloaded path. Accept only this task's direct local file.
-                guard !value.isEmpty, !value.contains("\0") else { throw DreaminaError.invalidResponse }
-                let file = (value.hasPrefix("/") ? URL(fileURLWithPath: value) : directory.appendingPathComponent(value)).standardizedFileURL
-                guard file.deletingLastPathComponent() == directory.standardizedFileURL,
-                      ["mp4", "mov", "webm"].contains(file.pathExtension.lowercased()) else { throw DreaminaError.invalidResponse }
-                let properties = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
-                guard properties.isRegularFile == true, properties.isSymbolicLink != true,
-                      let bytes = properties.fileSize, bytes > 0, bytes <= 300 * 1024 * 1024 else { throw DreaminaError.invalidResponse }
-            } else {
-                guard let value = videos[0]["video_url"] as? String, let url = URL(string: value), url.scheme == "https", url.host != nil, url.user == nil, url.password == nil else { throw DreaminaError.invalidResponse }
+        guard status == "success" else { return QueryResult(status: status, file: nil) }
+        guard let result = object["result_json"] as? [String: Any], let videos = result["videos"] as? [[String: Any]], videos.count == 1 else { throw DreaminaError.invalidResponse }
+        let file: URL
+        if let value = videos[0]["path"] as? String {
+            guard !value.isEmpty, !value.contains("\0") else { throw DreaminaError.invalidResponse }
+            file = try Self.resultFile(value.hasPrefix("/") ? URL(fileURLWithPath: value) : directory.appendingPathComponent(value), in: directory)
+        } else {
+            guard let value = videos[0]["video_url"] as? String, let url = URL(string: value), url.scheme == "https", url.host != nil, url.user == nil, url.password == nil else { throw DreaminaError.invalidResponse }
+            let candidates = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).compactMap { candidate -> URL? in
+                guard !before.contains(candidate.lastPathComponent),
+                      let valid = try? Self.resultFile(candidate, in: directory) else { return nil }
+                return valid
             }
+            guard candidates.count == 1 else { throw DreaminaError.invalidResponse }
+            file = candidates[0]
         }
-        return status
+        return QueryResult(status: status, file: file)
+    }
+    // Retain the readonly status API used by earlier clients and fixtures.
+    func query(_ id: String, directory: URL) async throws -> String {
+        try await queryResult(id, directory: directory).status
     }
 }
 
-/** Durable dispatch intent precedes the only paid command. Reentry can only query or upload. */
+/** Durable intent and the server's one-shot dispatch CAS precede every paid command. */
 actor ClassicCliExecutor {
     let cli: ClassicDreaminaCLI
     let directory: URL
     private var busy = false
     func isIdle() -> Bool { !busy }
     init(cli: ClassicDreaminaCLI, directory: URL) { self.cli = cli; self.directory = directory }
+    nonisolated static func hasUnfinishedTasks(directory: URL, owner: String? = nil) throws -> Bool {
+        var directoryState = stat()
+        guard lstat(directory.path, &directoryState) == 0 else {
+            if errno == ENOENT { return false }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let properties = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard properties.isDirectory == true, properties.isSymbolicLink != true else { throw DreaminaError.invalidResponse }
+        var unfinished = false
+        for file in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]) where file.pathExtension == "json" {
+            let values = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+            guard values.isRegularFile == true, values.isSymbolicLink != true, let bytes = values.fileSize,
+                  bytes > 0, bytes <= 2 * 1024 * 1024 else { throw DreaminaError.invalidResponse }
+            let journal = try JSONDecoder().decode(ClassicCliJournal.self, from: Data(contentsOf: file))
+            guard ClassicDreaminaCLI.validID(journal.task.id), file.lastPathComponent == journal.task.id + ".json",
+                  !journal.owner.isEmpty, !journal.task.projectId.isEmpty, !journal.task.nodeId.isEmpty,
+                  journal.task.payloadHash.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+                  journal.submitId.map(ClassicDreaminaCLI.validID) != false,
+                  ["awaiting-confirmation", "dispatch-intent", "submitted", "unknown", "upload-ready", "completed", "declined", "failed", "preparation-failed"].contains(journal.stage) else { throw DreaminaError.invalidResponse }
+            try journal.task.snapshot.validateRecovery()
+            // Validate every record before ignoring another owner. An unreadable
+            // journal must never permit replacing its original device identity.
+            if owner == nil || owner == journal.owner {
+                let terminal = journal.stage == "completed" ||
+                    ["declined", "failed", "preparation-failed"].contains(journal.stage) && journal.terminalAcknowledged != false
+                if !terminal { unfinished = true }
+            }
+        }
+        return unfinished
+    }
+    nonisolated static func permanentPreparationFailure(_ error: Error) -> Bool {
+        if let error = error as? StudioError {
+            switch error {
+            case .invalidResponse, .invalidURL, .tooLarge: return true
+            case .http(let status, _), .mediaHTTP(let status): return [400, 404, 410, 415, 422].contains(status)
+            default: return false
+            }
+        }
+        if let error = error as? DreaminaError {
+            switch error {
+            case .invalidResponse, .unsupportedCLI, .oversized: return true
+            default: return false
+            }
+        }
+        if let error = error as? ClassicCliUpgradeError, case .required = error { return true }
+        return false
+    }
+    nonisolated private static func recoverableCacheError(_ error: Error) -> Bool {
+        if let error = error as? DreaminaError, case .invalidResponse = error { return true }
+        if let error = error as? StudioError, case .invalidResponse = error { return true }
+        let value = error as NSError
+        return value.domain == "AVFoundationErrorDomain" ||
+            value.domain == NSCocoaErrorDomain && [NSFileReadCorruptFileError, NSFileReadNoSuchFileError].contains(value.code) ||
+            value.domain == NSPOSIXErrorDomain && value.code == Int(ENOENT)
+    }
     private func location(_ task: ClassicVideoTask) throws -> URL {
         guard ClassicDreaminaCLI.validID(task.id) else { throw DreaminaError.invalidResponse }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -340,6 +424,7 @@ actor ClassicCliExecutor {
               isCurrent: @Sendable () async -> Bool,
               validateVideo: @Sendable (URL) async throws -> Void) async throws {
         if busy { return }; busy = true; defer { busy = false }
+        try Task.checkCancellation()
         try task.snapshot.validateRecovery()
         let path = try location(task)
         // A crash can leave prepared inputs, never a reason to re-submit. Delete
@@ -351,7 +436,8 @@ actor ClassicCliExecutor {
         var journal: ClassicCliJournal
         if FileManager.default.fileExists(atPath: path.path) {
             journal = try JSONDecoder().decode(ClassicCliJournal.self, from: Data(contentsOf: path))
-            guard journal.owner == owner, journal.task.payloadHash == task.payloadHash, journal.task.projectId == task.projectId, journal.task.nodeId == task.nodeId, journal.task.snapshot == task.snapshot else { throw DreaminaError.wrongOwner }
+            guard journal.owner == owner, journal.task.id == task.id, journal.task.payloadHash == task.payloadHash,
+                  task.submitId == nil || journal.submitId == nil || task.submitId == journal.submitId, journal.task.projectId == task.projectId, journal.task.nodeId == task.nodeId, journal.task.snapshot == task.snapshot else { throw DreaminaError.wrongOwner }
         } else {
             journal = ClassicCliJournal(task: task, owner: owner, stage: task.stage, submitId: task.submitId)
             // A server dispatch marker survives loss of the local journal. Never replay it.
@@ -361,13 +447,21 @@ actor ClassicCliExecutor {
         guard await isCurrent() else { throw DreaminaError.wrongOwner }
         if journal.stage == "completed" { return }
         if journal.stage == "declined" || journal.stage == "failed" || journal.stage == "preparation-failed" {
-            if let code=journal.failureCode {try await bridge.failure(task:task,event:journal.stage,code:code)} else {try await bridge.event(task: task, event: journal.stage, submitId: journal.submitId)}; return
+            if let code=journal.failureCode {try await bridge.failure(task:task,event:journal.stage,code:code)} else {try await bridge.event(task: task, event: journal.stage, submitId: journal.submitId)}
+            journal.terminalAcknowledged = true; try save(journal); return
+        }
+        if journal.stage == "dispatch-intent", journal.submitId == nil, task.submitId == nil, task.stage == "awaiting-confirmation" {
+            // The authoritative claim proves the server has not yet permitted a
+            // paid invocation. Retry the original task's one-shot dispatch CAS.
+            // A delayed old event or stale claim makes that CAS return conflict;
+            // neither a local unknown nor a server dispatch marker is replayable.
+            journal.stage = "awaiting-confirmation"; try save(journal)
         }
         if journal.stage == "awaiting-confirmation" {
             guard task.snapshot.profile == "resolution-five" else {
-                journal.stage = "preparation-failed"; try save(journal)
+                journal.stage = "preparation-failed"; journal.terminalAcknowledged = false; try save(journal)
                 try await bridge.event(task:task,event:"preparation-failed",submitId:nil)
-                return
+                journal.terminalAcknowledged = true; try save(journal); return
             }
             let inputs = directory.appendingPathComponent(task.id + "-input-" + UUID().uuidString, isDirectory: true)
             try FileManager.default.createDirectory(at: inputs, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
@@ -385,18 +479,28 @@ actor ClassicCliExecutor {
                 }
                 _ = try ClassicDreaminaCLI.arguments(task.snapshot, files: files)
             } catch {
-                journal.stage = "preparation-failed"; try save(journal)
+                try Task.checkCancellation()
+                guard await isCurrent() else { throw DreaminaError.wrongOwner }
+                // Preparation has no paid side effect: temporary transport,
+                // cancellation and identity failures can retry the original task.
+                guard Self.permanentPreparationFailure(error) else { throw error }
+                journal.stage = "preparation-failed"; journal.terminalAcknowledged = false; try save(journal)
                 try await bridge.event(task: task, event: "preparation-failed", submitId: nil)
-                return
+                journal.terminalAcknowledged = true; try save(journal); return
             }
             let approved: Bool
             if let authorize { approved = try await authorize() } else { approved = await isCurrent() }
             guard await isCurrent() else { throw DreaminaError.wrongOwner }
-            if !approved { journal.stage = "declined"; try save(journal); try await bridge.event(task: task, event: "declined", submitId: nil); return }
+            if !approved {
+                journal.stage = "declined"; journal.terminalAcknowledged = false; try save(journal)
+                try await bridge.event(task: task, event: "declined", submitId: nil)
+                journal.terminalAcknowledged = true; try save(journal); return
+            }
             guard await isCurrent() else {throw DreaminaError.wrongOwner}
             journal.stage = "dispatch-intent"; try save(journal)
             // If acknowledgement is lost, leave intent durable and do not spawn.
             try await bridge.event(task: task, event: "dispatch-intent", submitId: nil)
+            try Task.checkCancellation()
             guard await isCurrent() else { throw DreaminaError.wrongOwner }
             do {
                 let id = try await cli.submit(task.snapshot, files: files)
@@ -416,28 +520,68 @@ actor ClassicCliExecutor {
             return
         }
         guard await isCurrent() else { throw DreaminaError.wrongOwner }
-        if journal.stage != "upload-ready" {
-            try await bridge.event(task: task, event: "submitted", submitId: submitId)
-            let downloads = directory.appendingPathComponent(task.id + "-video", isDirectory: true)
-            try FileManager.default.createDirectory(at: downloads, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            let status = try await cli.query(submitId, directory: downloads)
-            if ["fail", "failed", "error"].contains(status) {
-                journal.stage = "failed"; try save(journal); try await bridge.event(task: task, event: "failed", submitId: submitId); return
+        let downloads = directory.appendingPathComponent(task.id + "-video", isDirectory: true).standardizedFileURL
+        try FileManager.default.createDirectory(at: downloads, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let downloadProperties = try downloads.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard downloadProperties.isDirectory == true, downloadProperties.isSymbolicLink != true else { throw DreaminaError.invalidResponse }
+        func localResult(_ path: String?) throws -> URL? {
+            guard let path else { return nil }
+            let file = URL(fileURLWithPath: path).standardizedFileURL, parent = file.deletingLastPathComponent()
+            let direct = parent == downloads
+            let attempt = parent.deletingLastPathComponent() == downloads && UUID(uuidString: parent.lastPathComponent) != nil
+            guard direct || attempt else { throw DreaminaError.invalidResponse }
+            // Missing/truncated cache is recoverable. A linked or out-of-scope
+            // path is never read and never used as a reason to relax isolation.
+            var parentState = stat()
+            if lstat(parent.path, &parentState) == 0 {
+                let parentProperties = try parent.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                guard parentProperties.isDirectory == true, parentProperties.isSymbolicLink != true else { throw DreaminaError.invalidResponse }
+            } else if errno != ENOENT { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            var fileState = stat()
+            guard lstat(file.path, &fileState) == 0 else {
+                if errno == ENOENT { return nil }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
-            guard status == "success" else { return }
-            let files = try FileManager.default.contentsOfDirectory(at: downloads, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
-            let videos = try files.filter { file in
-                let values = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
-                return values.isRegularFile == true && values.isSymbolicLink != true && ["mp4", "mov", "webm"].contains(file.pathExtension.lowercased()) && (values.fileSize ?? 0) > 0 && (values.fileSize ?? 0) <= 300 * 1024 * 1024
-            }
-            guard videos.count == 1 else { throw DreaminaError.invalidResponse }
-            try await validateVideo(videos[0])
-            journal.stage = "upload-ready"; journal.file = videos[0].path; try save(journal)
+            let properties = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+            guard properties.isRegularFile == true, properties.isSymbolicLink != true, let bytes = properties.fileSize else { throw DreaminaError.invalidResponse }
+            guard bytes > 0, bytes <= 300 * 1024 * 1024 else { return nil }
+            return try ClassicDreaminaCLI.resultFile(file, in: parent)
         }
-        guard await isCurrent(), let filePath = journal.file else { throw DreaminaError.wrongOwner }
-        let file = URL(fileURLWithPath: filePath).standardizedFileURL
-        guard file.deletingLastPathComponent() == directory.appendingPathComponent(task.id + "-video", isDirectory: true).standardizedFileURL,
-              (try file.resourceValues(forKeys: [.isSymbolicLinkKey])).isSymbolicLink != true else { throw DreaminaError.invalidResponse }
+        var file = journal.stage == "upload-ready" ? try localResult(journal.file) : nil
+        if let cached = file {
+            do { try await validateVideo(cached) }
+            catch {
+                try Task.checkCancellation()
+                guard await isCurrent() else { throw DreaminaError.wrongOwner }
+                guard Self.recoverableCacheError(error) else { throw error }
+                file = nil
+            }
+        }
+        if file == nil {
+            // The server's upload-ready stage survives local cache/journal loss.
+            // Recover by the original submit ID without regressing its stage.
+            if task.stage != "upload-ready", journal.stage != "upload-ready" {
+                try await bridge.event(task: task, event: "submitted", submitId: submitId)
+            }
+            let attempt = downloads.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: attempt, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            var retained = false
+            defer { if !retained { try? FileManager.default.removeItem(at: attempt) } }
+            let result = try await cli.queryResult(submitId, directory: attempt)
+            guard await isCurrent() else { throw DreaminaError.wrongOwner }
+            if ["fail", "failed", "error"].contains(result.status) {
+                guard task.stage != "upload-ready", journal.stage != "upload-ready" else { throw DreaminaError.invalidResponse }
+                journal.stage = "failed"; journal.terminalAcknowledged = false; try save(journal)
+                try await bridge.event(task: task, event: "failed", submitId: submitId)
+                journal.terminalAcknowledged = true; try save(journal); return
+            }
+            guard result.status == "success", let downloaded = result.file else { return }
+            try await validateVideo(downloaded)
+            guard await isCurrent() else { throw DreaminaError.wrongOwner }
+            journal.stage = "upload-ready"; journal.file = downloaded.path; try save(journal)
+            retained = true; file = downloaded
+        }
+        guard await isCurrent(), let file else { throw DreaminaError.wrongOwner }
         try await validateVideo(file)
         try await bridge.event(task: task, event: "upload-ready", submitId: submitId)
         try await bridge.upload(task: task, submitId: submitId, file: file)

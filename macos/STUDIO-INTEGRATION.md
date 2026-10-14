@@ -147,3 +147,21 @@ Tools 的常规 CLI 适配器保留 `resolution-five` 协议，并在设备注�
 Studio 后续需将这些 ID 纳入服务端模型白名单、任务 snapshot 校验、设备能力筛选及模型菜单，并按模型约束展示清晰度与时长。不可将 VIP ID 自动替换为普通 ID，也不可因会员权限错误自动重投到另一渠道。已有设备恢复接口不重新上报 models；Studio 完成适配后，需明确更新既有设备能力的接口或受控重新关联流程，不能假设旧设备记录会自动扩展。
 
 样片模式尚未接入：本机 CLI 未公开 draft 参数或样片转正片命令，普通2.5的480p不能标成样片。未知样片模型 ID 被拒绝，不上报样片能力；后续必须以官方 CLI 的实际样片/正片协议单独适配。
+
+## 1.5.13 恢复与队列边界
+
+同一 KAKI 账号最多同时处理10个未完成的视频任务，第11个起留在数据库队列；不同画布、工作区和设备共享该账号名额。Studio服务器候选新增 LOCAL_CLI_JOB_CONCURRENCY（1–10，默认10），在专用账号事务 advisory 锁内原子许可首次提交；名额涵盖已提交、上传中及提交结果不确定的原任务，直到服务端确认终态才释放。签名无法验证的旧付费 CLI 任务也保守占槽，不能因授权变化推断其结束。CLI不提供可信即梦账号UID，因此不能合并不同KAKI账号所共用的同一即梦账号；即梦自身更低的限制仍适用。普通平台的 JOB_CONCURRENCY/USER_JOB_CONCURRENCY 等参数不控制此队列。
+
+Tools保留每个连接一个串行执行器，依次提交和查询；远端视频可同时生成。服务器优先填空闲名额，并让已提交任务按原task/submitId轮换、每任务查询间隔至少10秒。顶层 pollAfterMs（200–10000毫秒）提示下一次领取，避免十任务固定每10秒只查一个；缺省或非法提示、执行异常均退避10秒。心跳独立，多个CLI进程不会同时运行。队列是jobs中的queued/running，未使用BullMQ；目前没有队列总容量上限，仅同节点防重复。未权威确认的unknown继续占名额，不能通过重投或强制失败释放。
+
+Tools仅在本地dispatch-intent无提交号，且服务端权威claim仍awaiting-confirmation时恢复原任务首次提交。下一次dispatch-intent必须通过原服务端一次性CAS；服务器已接受、迟到事件或过时claim导致409时不运行付费命令。不得把重复dispatch-intent改成幂等成功许可。
+
+服务器候选进一步在register中阻止替换有未完成任务的原设备，关闭本机journal丢失时的安全缺口。Tools新的未确认终态明确记录terminalAcknowledged=false；旧终态nil兼容依赖此服务端权威检查。
+
+绑定结果上传的服务器候选先持久化原task/submit/hash/owner/device/epoch与唯一私有对象回执，再发布到COS，数据库完成失败重试原对象。一次上传额度预约使用原任务的固定键与精确nonce，真实回滚退回一次，数据库实际提交但回执丢失保留原副本与额度；提交及复核均不确定时等待数据库恢复。此候选需要单独部署后才生效；本机更改不意味着服务器已升级。
+
+连接生命周期在当前进程中等待原pause与独立resume实际回执；回执丢失时不猜测服务端完成，不自动发新的生命周期变更。跨进程极迟到请求的完整协调仍需独立lifecycleRevision/mutationId服务端协议，不能复用模型capability revision。
+
+本轮Tools完整原生回归1852项断言通过，并沿用固定证书安装1.5.13；包含十个独立任务交错返回、同名结果文件隔离和临时查询失败恢复。服务器候选基于Studio main c159bf4fd1040cab7360bfede5956ee977a5f118，仅修改CLI队列与原任务结果回传相关服务端文件；没有部署、运行真实付费生成或修改在线任务。
+
+服务器9个专项文件185项测试、typecheck和diff检查均通过，最终也由主审核独立重跑。使用内存PGlite、模拟COS和原生媒体fixture，Redis仅EVAL合同mock，未验证线上Redis/COS。完整修复源码已保存至 `/Users/alex/Documents/ChatGPT/kaki-studio-cli-recovery-20261013`，同目录旁保留.patch与-manifest.json；测试临时依赖未复制。服务器尚未提交、推送或部署。
