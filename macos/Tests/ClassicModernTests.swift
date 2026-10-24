@@ -1,19 +1,33 @@
 import Foundation
 import AppKit
 import SwiftUI
+import CoreImage
 
 private actor ModernLoginRunner:DreaminaRunning {
     var done=false
     var networkError=false
+    var emptyIdentity=false
+    var reusedSession=false
     var pendingCalls=0
+    var forcedCalls=0
+    func forceCount() -> Int { forcedCalls }
     func configure(done:Bool=false,network:Bool=false) {self.done=done;networkError=network}
+    func useEmptyIdentity() { emptyIdentity = true }
+    func reuseSession() { reusedSession = true }
     func calls()->Int {pendingCalls}
     func run(_ arguments:[String],timeout:TimeInterval) async throws -> DreaminaOutput {
         if arguments == ["user_credit"] {
             if networkError {throw DreaminaError.timedOut}
+            if emptyIdentity {return DreaminaOutput(status:0,data:Data("{\"total_credit\":0,\"user_id\":0}".utf8))}
             return DreaminaOutput(status:done ? 0 : 1,data:Data((done ? "{\"total_credit\":42,\"user_id\":\"fixture-account\"}" : "未检测到有效登录态，请先执行 dreamina login").utf8))
         }
+        if arguments == ["relogin","--help"] {return DreaminaOutput(status:0,data:Data("--headless".utf8))}
+        if arguments == ["relogin","--headless"] {
+            forcedCalls += 1
+            return DreaminaOutput(status:0,data:Data("verification_uri: https://jimeng.jianying.com/ai-tool/cli-auth\nuser_code: TEST-1234\ndevice_code: synthetic-device-session\n".utf8))
+        }
         if arguments == ["login","--help"] {return DreaminaOutput(status:0,data:Data("--headless".utf8))}
+        if arguments == ["login","--headless"], reusedSession {return DreaminaOutput(status:0,data:Data("已复用当前本地 OAuth 登录态。\n".utf8))}
         if arguments == ["login","--headless"] {return DreaminaOutput(status:0,data:Data("verification_uri: https://jimeng.jianying.com/ai-tool/cli-auth\nuser_code: TEST-1234\ndevice_code: synthetic-device-session\n".utf8))}
         guard arguments == ["login","checklogin","--device_code","synthetic-device-session","--poll","0"] else {throw DreaminaError.invalidResponse}
         pendingCalls += 1
@@ -51,6 +65,7 @@ private struct BrokenInspectionRunner:DreaminaRunning {
     try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
     defer {try? FileManager.default.removeItem(at:root)}
     let runner=ModernLoginRunner(), inspector=ModernInspection(), binary=root.appendingPathComponent("dreamina")
+    try Data("isolated CLI identity fixture".utf8).write(to: binary)
     // Inspect must propagate command errors; only a mismatched help contract requests upgrade.
     for failure in 0..<3 {
         do {_ = try await ClassicCliInstaller.inspect(binary,runner:BrokenInspectionRunner(failure:failure));throw NativeTestFailure(description:"inspection failure expected")}
@@ -101,6 +116,72 @@ private struct BrokenInspectionRunner:DreaminaRunning {
     try await until {!connection.busy};connection.login();try await until {!connection.authorizationUserCode.isEmpty};await runner.configure(done:true);try await until {!connection.busy}
     try check(connection.status.contains("即梦已登录") && connection.loginChecked && connection.loggedIn && !connection.connected && connection.authorizationUserCode.isEmpty,"successful login stays unassociated and clears ephemeral authorization")
     let pollCalls=await runner.calls();try check(pollCalls > 0,"login used actual nested checklogin fixed argv")
+    let missing = ClassicCliConnection(studio: studio, directory: root.appendingPathComponent("missing"), enabled: true, locator: { nil })
+    missing.detect()
+    try check(!missing.installed && missing.status.contains("安装"), "missing CLI explicitly offers installation instead of generic connection failure")
+    missing.login()
+    try check(!missing.busy && missing.status.contains("安装"), "login without CLI shows install prerequisite without launching authorization")
+    missing.connect()
+    try check(!missing.busy && missing.status.contains("安装"), "connect without CLI names install prerequisite separately from Studio account")
+    missing.shutdown()
+    connection.identityChanged()
+    await runner.configure(done: false)
+    await runner.useEmptyIdentity()
+    connection.detect(); try await until { !connection.busy }
+    try check(connection.installed && !connection.loggedIn && connection.loginChecked && connection.status.contains("有效账号"), "successful CLI response with zero identity names missing account, preserves installed state and offers login")
+    let opensBeforeEmptyLogin = opens
+    connection.login(); try await until { !connection.authorizationUserCode.isEmpty }
+    try check(opens == opensBeforeEmptyLogin + 1 && !connection.connected, "explicit login can open official authorization after empty successful identity; detection never opens it")
+    connection.cancelOperation()
+    await runner.reuseSession()
+    let opensBeforeReuse = opens
+    connection.login(); try await until { !connection.busy }
+    try check(connection.loggedIn && connection.loginChecked && connection.authorizationURL == nil && opens == opensBeforeReuse, "official reused OAuth acknowledgement completes login without demanding another URL or opening a browser")
+    connection.detect(); try await until { !connection.busy }
+    try check(connection.loggedIn, "fresh explicit login receipt for unchanged binary tolerates unavailable credit identity")
+    connection.identityChanged()
+    connection.detect(); try await until { !connection.busy }
+    try check(!connection.loggedIn && connection.status.contains("有效账号"), "identity changes invalidate temporary login confirmation instead of carrying it to another Studio scope")
+    let forceRoot = root.appendingPathComponent("force-login")
+    let journalDirectory = forceRoot.appendingPathComponent("classic-cli/journal")
+    var allowReauthorization = false, confirmations = 0
+    let forced = ClassicCliConnection(studio: studio, directory: forceRoot, enabled: true, locator: { binary }, runnerFactory: { _ in runner }, loginTimeout: 0.5, pollInterval: 20_000_000, openAuthorization: { _ in true }, reauthorizationConsent: { confirmations += 1; return allowReauthorization }, cliProcessesIdle: { _ in true })
+    forced.reauthorize()
+    let initiallyForced = await runner.forceCount()
+    try check(confirmations == 1 && initiallyForced == 0 && !forced.busy, "declining reauthorization never resets the existing CLI session")
+    allowReauthorization = true
+    try FileManager.default.createDirectory(at: journalDirectory, withIntermediateDirectories: true)
+    let blocked = journalDirectory.appendingPathComponent("unreadable.json")
+    try Data("unreadable private task".utf8).write(to: blocked)
+    forced.reauthorize()
+    let blockedCount = await runner.forceCount()
+    try check(blockedCount == 0 && confirmations == 1 && forced.status.contains("任务记录"), "unreadable original journal fails closed before confirmation or credential reset")
+    try FileManager.default.removeItem(at: blocked)
+    let pendingSnapshot = ClassicVideoSnapshot(prompt: "original", model: "seedance2.0", duration: 5, aspect: "16:9", resolution: "720p", mode: "text", profile: "resolution-five")
+    let pending = ClassicVideoTask(id: "pending-original", projectId: "project", nodeId: "node", payloadHash: String(repeating: "a", count: 64), snapshot: pendingSnapshot, stage: "unknown", submitId: nil)
+    let pendingFile = journalDirectory.appendingPathComponent("pending-original.json")
+    try JSONEncoder().encode(ClassicCliJournal(task: pending, owner: "another-original-owner", stage: "unknown", submitId: nil)).write(to: pendingFile)
+    forced.reauthorize()
+    let unfinishedCount = await runner.forceCount()
+    try check(unfinishedCount == 0 && forced.status.contains("未完成"), "unfinished tasks across all original owners block relogin instead of risking result loss")
+    try FileManager.default.removeItem(at: pendingFile)
+    await runner.configure(done: false)
+    forced.reauthorize(); try await until { forced.authorizationQRURL != nil }
+    let forceStarted = await runner.forceCount()
+    try check(forceStarted == 1 && confirmations == 2 && !forced.loggedIn, "confirmed reauthorization bypasses reuse and starts one official fresh Device Flow")
+    forced.cancelOperation()
+    try check(forced.authorizationURL == nil && forced.authorizationQRURL == nil && forced.authorizationUserCode.isEmpty, "cancelling clears both QR and authorization display from memory")
+    forced.reauthorize(); try await until { forced.authorizationQRURL != nil }
+    await runner.configure(done: true); try await until { !forced.busy }
+    try check(forced.loggedIn && forced.authorizationQRURL == nil && forced.authorizationURL == nil, "fresh login success clears transient QR and allows subsequent Studio connection")
+    forced.shutdown()
+    let deniedForceBefore = await runner.forceCount()
+    do {
+        _ = try await ClassicCliAuthorization.start(runner, force: true, canReset: { false })
+        throw NativeTestFailure(description: "reset predicate unexpectedly allowed relogin")
+    } catch ClassicCliUpgradeError.active { }
+    let deniedForceAfter = await runner.forceCount()
+    try check(deniedForceBefore == deniedForceAfter, "late state checks after help cannot invoke relogin when the original task becomes active")
     let actualShapeCode=String(repeating:"a",count:32)
     func wrapped(_ inner:String,extra:String="") -> String {
         var outer=URLComponents(string:"https://jimeng.jianying.com/ai-tool/cli-auth")!
@@ -114,6 +195,11 @@ private struct BrokenInspectionRunner:DreaminaRunning {
     let actualShapeURI=wrapped(scan)
     let parsed=try ClassicCliAuthorization.parse(authorizationOutput(actualShapeURI))
     try check(parsed.url.absoluteString == actualShapeURI && parsed.userCode == actualShapeCode,"real official nested authorization shape preserves outer URL and matching 32-character code")
+    try check(parsed.qrURL.absoluteString == scan && !parsed.qrURL.absoluteString.contains(parsed.deviceCode), "QR targets the validated official scan URL with public user code, never the private device code")
+    guard let qr = CliAuthorizationQRCode.makeImage(parsed.qrURL), let pixels = qr.tiffRepresentation, let qrInput = CIImage(data: pixels),
+          let detector = CIDetector(ofType: CIDetectorTypeQRCode, context: CIContext(), options: [CIDetectorAccuracy: CIDetectorAccuracyHigh]) else { throw NativeTestFailure(description: "native QR image was not produced") }
+    let messages = detector.features(in: qrInput).compactMap { ($0 as? CIQRCodeFeature)?.messageString }
+    try check(messages == [scan], "native QR raster decodes to the exact official authorization URL")
     for uri in [
         wrapped("https://evil.invalid/passport/open/scan_user_code/?user_code=" + actualShapeCode),
         wrapped("http://jimeng.jianying.com/passport/open/scan_user_code/?user_code=" + actualShapeCode),

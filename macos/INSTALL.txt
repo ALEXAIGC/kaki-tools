@@ -1,4 +1,4 @@
-Kaki Tools 1.5.14 — 原生 macOS 安装说明
+Kaki Tools 1.5.18 — 原生 macOS 安装说明
 
 安装
 1. 从菜单栏 K 选择“退出 Kaki Tools”。

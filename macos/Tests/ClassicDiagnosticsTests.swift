@@ -33,7 +33,7 @@ func runClassicDiagnosticsTests() async throws {
     // An already authorized task must not be blocked by an unreliable budget query.
     for (i,item) in [("{\"total_credit\":0,\"user_id\":0,\"user_name\":\"\",\"vip_level\":\"\"}",Int32(0)),("{}",0),("{\"total_credit\":true,\"user_id\":\"fixture-account\"}",0),("network unavailable",1),("timeout",-1)].enumerated() {
         let runner=CreditFixture(item.0,status:item.1),bridge=DiagnosticBridge(),dir=root.appendingPathComponent(String(i)),cli=ClassicDreaminaCLI(runner:runner)
-        do {_ = try await cli.loginState();throw NativeTestFailure(description:"empty identity or invalid response verified as logged in")} catch DreaminaError.invalidResponse {} catch DreaminaError.timedOut {}
+        do {_ = try await cli.loginState();throw NativeTestFailure(description:"empty identity or invalid response verified as logged in")} catch DreaminaError.invalidResponse {} catch DreaminaError.timedOut {} catch ClassicCliLoginError.unverifiedIdentity {}
         let executor=ClassicCliExecutor(cli:cli,directory:dir)
         let task=ClassicVideoTask(id:"credit",projectId:"project",nodeId:"node",payloadHash:String(repeating:"a",count:64),snapshot:snapshot,stage:"awaiting-confirmation",submitId:nil)
         try await executor.step(task:task,owner:"owner",bridge:bridge,isCurrent:{true},validateVideo:{_ in})
@@ -44,6 +44,12 @@ func runClassicDiagnosticsTests() async throws {
         let journal=try JSONDecoder().decode(ClassicCliJournal.self,from:Data(contentsOf:dir.appendingPathComponent("credit.json")))
         try check(journal.stage == "completed" && journal.failureCode == nil,"authorized task follows its real submit result despite unknown budget")
     }
+    let emptyAccount = ClassicDreaminaCLI(runner: CreditFixture("{\"total_credit\":0,\"user_id\":0}"))
+    let confirmedAccount = try await emptyAccount.loginState(confirmedSession: true)
+    try check(confirmedAccount, "explicit official session confirmation tolerates zero identity without declaring a credit or account ID")
+    let expiredAccount = ClassicDreaminaCLI(runner: CreditFixture("未检测到有效登录态，请先执行 dreamina login", status: 1))
+    let expiredState = try await expiredAccount.loginState(confirmedSession: true)
+    try check(!expiredState, "recent session receipt cannot override a definitive expired login response")
     for data in ["{\"total_credit\":0,\"user_id\":\"fixture-account\"}","{\"total_credit\":0,\"user_id\":42,\"vip_level\":\"\"}"] {
         let runner=CreditFixture(data),cli=ClassicDreaminaCLI(runner:runner)
         let loggedIn=try await cli.loginState();try check(loggedIn,"valid identity with zero credits is logged in; VIP/name is not required")

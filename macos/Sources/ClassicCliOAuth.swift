@@ -33,10 +33,24 @@ struct ClassicCliAuthorization: Sendable {
               inner.count == 1,inner[0].name == "user_code",inner[0].value == userCode else {return false}
         return true
     }
-    static func begin(_ runner:DreaminaRunning) async throws -> Self {
-        let help=try await runner.run(["login","--help"],timeout:5)
+    enum Start: Sendable { case authorization(ClassicCliAuthorization), reusedSession }
+    var qrURL: URL {
+        let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+        return query?.first(where: { $0.name == "verification_uri" })?.value.flatMap(URL.init(string:)) ?? url
+    }
+    static func start(_ runner: DreaminaRunning, force: Bool = false,
+                      canReset: @Sendable () async -> Bool = { true }) async throws -> Start {
+        let command = force ? "relogin" : "login"
+        let help=try await runner.run([command,"--help"],timeout:5)
         guard help.status == 0,String(decoding:help.data,as:UTF8.self).contains("--headless") else {throw ClassicCliUpgradeError.required}
-        return try parse(await runner.run(["login","--headless"],timeout:15))
+        try Task.checkCancellation()
+        if force { guard await canReset() else { throw ClassicCliUpgradeError.active } }
+        try Task.checkCancellation()
+        let output = try await runner.run([command,"--headless"],timeout:15)
+        if !force, output.status == 0, String(decoding: output.data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) == "已复用当前本地 OAuth 登录态。" {
+            return .reusedSession
+        }
+        return .authorization(try parse(output))
     }
     func poll(_ runner:DreaminaRunning) async throws -> Bool {
         let output=try await runner.run(["login","checklogin","--device_code",deviceCode,"--poll","0"],timeout:10)

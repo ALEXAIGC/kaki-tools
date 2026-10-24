@@ -63,6 +63,7 @@ func check(_ condition: @autoclosure () -> Bool, _ message: String, file: Static
             try await runClassicDiagnosticsTests()
             try await runClassicFiveModesTests()
             try await runClassicModernTests()
+            try await runClassicSetupFlowTests()
             try await runClassicCreditTests()
             try await runClassicCapabilityTests()
             try await runConnectionRestoreTests()

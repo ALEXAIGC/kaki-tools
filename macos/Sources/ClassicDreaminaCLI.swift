@@ -143,6 +143,8 @@ extension ClassicCliBridge {
         return []
     }
 }
+enum ClassicCliLoginError: Error { case unverifiedIdentity }
+
 struct ClassicDreaminaCLI: Sendable {
     let runner: DreaminaRunning
     static func locate() -> URL? {
@@ -196,12 +198,12 @@ struct ClassicDreaminaCLI: Sendable {
         return (profile, ClassicVideoModels.supported.filter(models.contains) + ["dreamina-multiframe"])
     }
     func detectedProfile() async throws -> String { try await detectedCapabilities().profile }
-    func verify() async throws -> [String] {
+    func verify(confirmedSession: Bool = false) async throws -> [String] {
         let capabilities = try await detectedCapabilities()
-        guard try await loginState() else {throw DreaminaError.notLinked}
+        guard try await loginState(confirmedSession: confirmedSession) else {throw DreaminaError.notLinked}
         return capabilities.models
     }
-    func loginState() async throws -> Bool {
+    func loginState(confirmedSession: Bool = false) async throws -> Bool {
         let output=try await runner.run(["user_credit"],timeout:15)
         if output.status != 0 {
             let text=String(decoding:output.data,as:UTF8.self)
@@ -209,7 +211,10 @@ struct ClassicDreaminaCLI: Sendable {
             throw DreaminaError.invalidResponse
         }
         let object=try Self.object(output)
-        guard Self.hasAccountIdentity(object), let credit=object["total_credit"] as? NSNumber, CFGetTypeID(credit) != CFBooleanGetTypeID(), credit.doubleValue.isFinite, credit.doubleValue >= 0 else {throw DreaminaError.invalidResponse}
+        guard let credit=object["total_credit"] as? NSNumber, CFGetTypeID(credit) != CFBooleanGetTypeID(), credit.doubleValue.isFinite, credit.doubleValue >= 0 else {throw DreaminaError.invalidResponse}
+        // Credit metadata may lack an identity even when official login reuses a valid OAuth session.
+        // Only a recent explicit login confirmation for this unchanged CLI can tolerate that omission.
+        guard Self.hasAccountIdentity(object) || confirmedSession else { throw ClassicCliLoginError.unverifiedIdentity }
         return true
     }
     static func hasAccountIdentity(_ object: [String: Any]) -> Bool {

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import CoreImage.CIFilterBuiltins
 
 enum AccountConnectionSite: String, CaseIterable, Identifiable {
     case studio, dreamina
@@ -56,7 +57,7 @@ enum AccountConnectionSite: String, CaseIterable, Identifiable {
     private func select(_ site: AccountConnectionSite?) {
         // Cancel before the removal animation: an outgoing view must never cancel
         // a new operation started after the user reopens the same card.
-        if expanded == .dreamina, site != .dreamina, classicCli.busy || classicCli.authorizationURL != nil { classicCli.cancelOperation() }
+        if expanded == .dreamina, site != .dreamina, classicCli.interactionBusy || classicCli.authorizationURL != nil { classicCli.cancelOperation() }
         expanded = site
     }
     private func isSettingsWindow(_ notification: Notification) -> Bool {
@@ -69,12 +70,13 @@ enum AccountConnectionSite: String, CaseIterable, Identifiable {
     private func status(_ site: AccountConnectionSite) -> String {
         if site == .studio { return studio.user != nil ? "已登录" : "未登录" }
         if classicCli.connected { return "已连接" }
-        if classicCli.busy { return "处理中" }
+        if classicCli.interactionBusy { return "处理中" }
         if !classicCli.installed { return "待安装" }
         return classicCli.needsUpgrade ? "待更新" : classicCli.loginChecked && classicCli.loggedIn ? "待连接" : "未连接"
     }
     private func subtitle(_ site: AccountConnectionSite) -> String {
         if site == .studio { return studio.user.map { $0.name ?? $0.email } ?? "素材与工作区" }
+        if !classicCli.installed { return "需先安装本机 CLI" }
         return classicCli.connected ? classicCli.targetWorkspaceName : "本机生成"
     }
     private func details(_ site: AccountConnectionSite) -> some View {
@@ -163,11 +165,8 @@ private struct WebsiteLogo: View {
     private var stage: Int { !connection.installed || connection.needsUpgrade ? 0 : !connection.loginChecked || !connection.loggedIn ? 1 : 2 }
     private var heading: String {
         if connection.connected { return "已连接 Studio" }
-        if connection.busy { return connection.authorizationURL == nil ? connection.actionTitle + "…" : "等待即梦授权" }
-        if !connection.installed { return "安装即梦 CLI" }
-        if connection.needsUpgrade { return "更新即梦 CLI" }
-        if !connection.loginChecked { return "检查本机登录" }
-        return connection.loggedIn ? "连接 Studio" : "登录即梦"
+        if connection.interactionBusy { return connection.authorizationURL == nil ? connection.actionTitle + "…" : "等待即梦授权" }
+        return "连接即梦与 Studio"
     }
     var body: some View {
         VStack(spacing: 20) {
@@ -182,11 +181,19 @@ private struct WebsiteLogo: View {
                 }
             }.padding(.top, 4)
             VStack(spacing: 10) {
-                if connection.busy { ProgressView().controlSize(.regular).frame(height: 36) }
+                if connection.interactionBusy { ProgressView().controlSize(.regular).frame(height: 36) }
                 else { Image(systemName: connection.connected ? "checkmark.circle.fill" : "link.circle.fill")
                     .font(.system(size: 36, weight: .light)).foregroundStyle(connection.connected ? Color.green : SettingsStyle.accent) }
                 Text(heading).font(.system(size: 19, weight: .semibold))
+                if !connection.installed {
+                    Text("首次使用需安装常规 dreamina CLI，网页登录不代表 CLI 已授权。")
+                        .font(.system(size: 12)).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                }
                 if let _ = connection.authorizationURL {
+                    if let qrURL = connection.authorizationQRURL {
+                        CliAuthorizationQRCode(url: qrURL).id(qrURL)
+                        Text("扫码授权，或打开官方页面").font(.system(size: 12)).foregroundStyle(.secondary)
+                    }
                     Text(connection.authorizationUserCode).font(.system(size: 24, weight: .semibold, design: .monospaced)).textSelection(.enabled)
                     HStack {
                         Button("复制授权码") { connection.copyAuthorizationCode() }
@@ -203,10 +210,40 @@ private struct WebsiteLogo: View {
                     .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 10))
             }
             if stage == 2 && !connection.hasStudioAccount { Text("请先登录 Studio").font(.system(size: 12)).foregroundStyle(.secondary) }
-            if !connection.busy && !connection.status.isEmpty && !connection.status.hasPrefix("已") {
+            if !connection.interactionBusy && !connection.status.isEmpty && !connection.status.hasPrefix("已") {
                 Text(connection.status).font(.system(size: 12)).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center).frame(maxWidth: 430)
             }
+            HStack(spacing: 12) {
+                if connection.interactionBusy {
+                    Button("取消") { connection.cancelOperation() }
+                } else if connection.connected {
+                    Label("可在 Studio 中生成视频", systemImage: "play.circle").font(.system(size: 12)).foregroundStyle(.secondary)
+                } else {
+                    Button("授权并连接") { connection.setupConnection() }.buttonStyle(SettingsPrimaryButtonStyle())
+                        .disabled(!connection.hasStudioAccount)
+                }
+            }.frame(maxWidth: .infinity).padding(.bottom, 4)
+            if !connection.connected {
+                Text("使用本机即梦账号，连接当前 Studio 工作区").font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            DisclosureGroup("手动与高级操作") {
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack {
+                        if !connection.installed {
+                            Button("安装 CLI") { connection.install() }
+                        } else {
+                            Button("仅登录即梦") { connection.login() }.disabled(connection.connected || connection.needsUpgrade)
+                            Button("手动连接 Studio") { connection.connect() }.disabled(connection.connected || !connection.hasStudioAccount)
+                            Button("重新授权") { connection.reauthorize() }
+                        }
+                        Menu("更多") {
+                            Button("重新检测") { connection.detect() }
+                            if connection.installed { Button("更新 CLI") { connection.upgrade() }.disabled(connection.connected) }
+                            if connection.connected { Button("断开连接") { connection.disconnect() } }
+                            if !connection.version.isEmpty { Divider(); Text("CLI · " + connection.version) }
+                        }.fixedSize()
+                    }.disabled(connection.interactionBusy)
             VStack(alignment: .leading, spacing: 6) {
                 if let total = connection.creditTotal { Text("即梦积分 " + String(format: "%g", total)) }
                 if let queried = connection.creditQueriedAt, connection.creditTotal != nil { Text("最近查询 " + queried.formatted(date: .omitted, time: .shortened)) }
@@ -216,7 +253,7 @@ private struct WebsiteLogo: View {
             }.font(.system(size: 12)).frame(maxWidth: .infinity, alignment: .leading)
             VStack(alignment: .leading, spacing: 8) {
                 Button("检测并更新设备能力") { connection.detectCapabilities() }
-                    .disabled(connection.busy)
+                    .disabled(connection.interactionBusy)
                 if let preview = connection.capabilityPreview {
                     Text("当前型号（版本 \(preview.current.effectiveRevision)）：" + modelList(preview.current.models))
                     Text("新增：" + modelList(preview.added))
@@ -226,34 +263,16 @@ private struct WebsiteLogo: View {
                     Text("使用本机即梦额度；会员资格独立。移除型号后，尚未提交的对应任务可能终止，已提交任务保留原 ID。")
                     HStack {
                         Button(preview.retry ? "确认重试原请求" : "确认更新设备能力") { connection.confirmCapabilities() }
-                            .buttonStyle(SettingsPrimaryButtonStyle()).disabled(connection.busy)
-                        Button("取消") { connection.discardCapabilityPreview() }.disabled(connection.busy)
+                            .buttonStyle(SettingsPrimaryButtonStyle()).disabled(connection.interactionBusy)
+                        Button("取消") { connection.discardCapabilityPreview() }.disabled(connection.interactionBusy)
                     }
                 }
                 if !connection.capabilityStatus.isEmpty { Text(connection.capabilityStatus) }
                 Text("旧设备：先单独连接原设备再检测；CLI 路径或内容变化需重新授权。不会自动注册或恢复断开。")
                     .foregroundStyle(.secondary)
             }.font(.system(size: 12)).frame(maxWidth: .infinity, alignment: .leading)
-            HStack(spacing: 12) {
-                if connection.busy {
-                    Button("取消") { connection.cancelOperation() }
-                } else if connection.connected {
-                    Label("可在 Studio 中生成视频", systemImage: "play.circle").font(.system(size: 12)).foregroundStyle(.secondary)
-                } else {
-                    Button(heading) { primaryAction() }.buttonStyle(SettingsPrimaryButtonStyle())
-                        .disabled(stage == 2 && !connection.hasStudioAccount)
-                }
-                Menu {
-                    Button("重新检测") { connection.detect() }.disabled(connection.busy)
-                    if connection.installed {
-                        Button("更新 CLI") { connection.upgrade() }.disabled(connection.busy || connection.connected)
-                        Button("登录即梦") { connection.login() }.disabled(connection.busy || connection.connected || connection.needsUpgrade)
-                    }
-                    if connection.connected { Button("断开连接") { connection.disconnect() } }
-                    if !connection.version.isEmpty { Divider(); Text("CLI · " + connection.version) }
-                } label: { Image(systemName: "ellipsis").frame(width: 28, height: 28) }
-                    .menuStyle(.borderlessButton).fixedSize().help("更多操作").accessibilityLabel("即梦连接更多操作")
-            }.frame(maxWidth: .infinity).padding(.bottom, 4)
+                }.padding(.top, 10)
+            }.font(.system(size: 12))
         }.frame(maxWidth: .infinity)
     }
     private func modelList(_ models: [String]) -> String { models.isEmpty ? "无" : models.map(ClassicVideoModels.title).joined(separator: "、") }
@@ -263,11 +282,28 @@ private struct WebsiteLogo: View {
             Text(value).font(.system(size: 12, weight: .medium)).lineLimit(1).help(value)
         }.frame(maxWidth: .infinity)
     }
-    private func primaryAction() {
-        if !connection.installed { connection.install() }
-        else if connection.needsUpgrade { connection.upgrade() }
-        else if !connection.loginChecked { connection.detect() }
-        else if !connection.loggedIn { connection.login() }
-        else { connection.connect() }
+
+}
+
+// Auth URL and raster remain transient view state; never write QR codes or device codes to disk.
+struct CliAuthorizationQRCode: View {
+    let url: URL
+    @State private var image: NSImage?
+    static func makeImage(_ url: URL) -> NSImage? {
+        let filter = CIFilter.qrCodeGenerator()
+        filter.message = Data(url.absoluteString.utf8); filter.correctionLevel = "M"
+        guard let output = filter.outputImage?.transformed(by: CGAffineTransform(scaleX: 6, y: 6)),
+              let raster = CIContext().createCGImage(output, from: output.extent) else { return nil }
+        return NSImage(cgImage: raster, size: NSSize(width: raster.width, height: raster.height))
+    }
+    var body: some View {
+        Group {
+            if let image {
+                Image(nsImage: image).resizable().interpolation(.none).scaledToFit()
+                    .frame(width: 168, height: 168).padding(12).background(.white, in: RoundedRectangle(cornerRadius: 10))
+                    .accessibilityLabel("即梦官方登录授权二维码").accessibilityHint("也可使用打开授权页面按钮完成授权")
+            }
+        }.task(id: url) { image = Self.makeImage(url) }
+            .onDisappear { image = nil }
     }
 }
