@@ -43,7 +43,9 @@ struct ClassicVideoSnapshot: Codable, Equatable, Sendable {
     var references: [ClassicCliReference]? = nil
     var transitions: [ClassicCliTransition]? = nil
     var effectiveMode: String { mode ?? "text" }
+    var isImage: Bool { ClassicImageModels.contains(model) }
     func validate() throws {
+        if isImage { try ClassicImageModels.validate(self); return }
         let refs = references ?? [], images = refs.filter {$0.kind == "image"}, videos = refs.filter {$0.kind == "video"}, audios = refs.filter {$0.kind == "audio"}
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, prompt.count <= 10000,
               ["text", "image", "firstlast", "imageref", "omni"].contains(effectiveMode),
@@ -75,6 +77,7 @@ struct ClassicVideoSnapshot: Codable, Equatable, Sendable {
     }
     // Signed original receipts only; this validator is never used to build paid argv.
     func validateRecovery() throws {
+        if isImage { try ClassicImageModels.validate(self); return }
         let refs = references ?? [], images = refs.filter {$0.kind == "image"}, videos = refs.filter {$0.kind == "video"}, audios = refs.filter {$0.kind == "audio"}
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, prompt.count <= 10000,
               ["text", "image", "firstlast", "imageref", "omni"].contains(effectiveMode),
@@ -195,7 +198,14 @@ struct ClassicDreaminaCLI: Sendable {
                 else { for model in ClassicVideoModels.supported.dropFirst(2) where !tokens.contains(model) { models.remove(model) } }
             }
         }
-        return (profile, ClassicVideoModels.supported.filter(models.contains) + ["dreamina-multiframe"])
+        // Optional image commands must never disable an otherwise compatible video CLI.
+        var images: [String] = []
+        do {
+            let textHelp = try await runner.run(["text2image", "--help"], timeout: 15)
+            let imageHelp = try await runner.run(["image2image", "--help"], timeout: 15)
+            images = ClassicImageModels.detected(textHelp: textHelp, imageHelp: imageHelp)
+        } catch { try Task.checkCancellation() }
+        return (profile, ClassicVideoModels.supported.filter(models.contains) + ["dreamina-multiframe"] + images)
     }
     func detectedProfile() async throws -> String { try await detectedCapabilities().profile }
     func verify(confirmedSession: Bool = false) async throws -> [String] {
@@ -234,6 +244,7 @@ struct ClassicDreaminaCLI: Sendable {
         return object
     }
     static func arguments(_ snapshot: ClassicVideoSnapshot, files: [URL]) throws -> [String] {
+        if snapshot.isImage { return try ClassicImageModels.arguments(snapshot, files: files) }
         try snapshot.validate()
         let refs = snapshot.references ?? []
         guard files.count == refs.count, files.allSatisfy({$0.isFileURL && !$0.path.contains(",") && !$0.path.contains("\n")}) else {throw DreaminaError.invalidResponse}
@@ -299,18 +310,18 @@ struct ClassicDreaminaCLI: Sendable {
         let status: String
         let file: URL?
     }
-    static func resultFile(_ file: URL, in directory: URL) throws -> URL {
+    static func resultFile(_ file: URL, in directory: URL, image: Bool = false) throws -> URL {
         let file = file.standardizedFileURL, directory = directory.standardizedFileURL
         let parent = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
         guard parent.isDirectory == true, parent.isSymbolicLink != true,
               file.deletingLastPathComponent() == directory,
-              ["mp4", "mov", "webm"].contains(file.pathExtension.lowercased()) else { throw DreaminaError.invalidResponse }
+              (image ? ["png", "jpg", "jpeg", "webp"] : ["mp4", "mov", "webm"]).contains(file.pathExtension.lowercased()) else { throw DreaminaError.invalidResponse }
         let properties = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
         guard properties.isRegularFile == true, properties.isSymbolicLink != true,
               let bytes = properties.fileSize, bytes > 0, bytes <= 300 * 1024 * 1024 else { throw DreaminaError.invalidResponse }
         return file
     }
-    func queryResult(_ id: String, directory: URL) async throws -> QueryResult {
+    func queryResult(_ id: String, directory: URL, image: Bool = false) async throws -> QueryResult {
         guard Self.validID(id) else { throw DreaminaError.invalidResponse }
         let directory = directory.standardizedFileURL
         let properties = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
@@ -323,16 +334,16 @@ struct ClassicDreaminaCLI: Sendable {
         let object = try Self.object(output)
         guard object["submit_id"] as? String == id, let status = object["gen_status"] as? String else { throw DreaminaError.invalidResponse }
         guard status == "success" else { return QueryResult(status: status, file: nil) }
-        guard let result = object["result_json"] as? [String: Any], let videos = result["videos"] as? [[String: Any]], videos.count == 1 else { throw DreaminaError.invalidResponse }
+        guard let result = object["result_json"] as? [String: Any], let videos = result[image ? "images" : "videos"] as? [[String: Any]], videos.count == 1 else { throw DreaminaError.invalidResponse }
         let file: URL
         if let value = videos[0]["path"] as? String {
             guard !value.isEmpty, !value.contains("\0") else { throw DreaminaError.invalidResponse }
-            file = try Self.resultFile(value.hasPrefix("/") ? URL(fileURLWithPath: value) : directory.appendingPathComponent(value), in: directory)
+            file = try Self.resultFile(value.hasPrefix("/") ? URL(fileURLWithPath: value) : directory.appendingPathComponent(value), in: directory, image: image)
         } else {
-            guard let value = videos[0]["video_url"] as? String, let url = URL(string: value), url.scheme == "https", url.host != nil, url.user == nil, url.password == nil else { throw DreaminaError.invalidResponse }
+            guard let value = videos[0][image ? "image_url" : "video_url"] as? String, let url = URL(string: value), url.scheme == "https", url.host != nil, url.user == nil, url.password == nil else { throw DreaminaError.invalidResponse }
             let candidates = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).compactMap { candidate -> URL? in
                 guard !before.contains(candidate.lastPathComponent),
-                      let valid = try? Self.resultFile(candidate, in: directory) else { return nil }
+                      let valid = try? Self.resultFile(candidate, in: directory, image: image) else { return nil }
                 return valid
             }
             guard candidates.count == 1 else { throw DreaminaError.invalidResponse }
@@ -550,7 +561,7 @@ actor ClassicCliExecutor {
             let properties = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
             guard properties.isRegularFile == true, properties.isSymbolicLink != true, let bytes = properties.fileSize else { throw DreaminaError.invalidResponse }
             guard bytes > 0, bytes <= 300 * 1024 * 1024 else { return nil }
-            return try ClassicDreaminaCLI.resultFile(file, in: parent)
+            return try ClassicDreaminaCLI.resultFile(file, in: parent, image: task.snapshot.isImage)
         }
         var file = journal.stage == "upload-ready" ? try localResult(journal.file) : nil
         if let cached = file {
@@ -572,7 +583,7 @@ actor ClassicCliExecutor {
             try FileManager.default.createDirectory(at: attempt, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
             var retained = false
             defer { if !retained { try? FileManager.default.removeItem(at: attempt) } }
-            let result = try await cli.queryResult(submitId, directory: attempt)
+            let result = try await cli.queryResult(submitId, directory: attempt, image: task.snapshot.isImage)
             guard await isCurrent() else { throw DreaminaError.wrongOwner }
             if ["fail", "failed", "error"].contains(result.status) {
                 guard task.stage != "upload-ready", journal.stage != "upload-ready" else { throw DreaminaError.invalidResponse }

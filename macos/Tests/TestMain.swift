@@ -15,6 +15,12 @@ func check(_ condition: @autoclosure () -> Bool, _ message: String, file: Static
         setbuf(stdout, nil)
         do {
             _ = NSApplication.shared
+            if ProcessInfo.processInfo.environment["KAKI_TEST_SCOPE"] == "images" {
+                try await runClassicImageTests()
+                print("IMAGE_TESTS_PASSED \(checkCount) assertions")
+                return
+            }
+            try await runClassicImageTests()
             if ProcessInfo.processInfo.environment["KAKI_TEST_SCOPE"] == "results" {
                 try await runClassicCliTests()
                 try await runClassicLocalResultTests()

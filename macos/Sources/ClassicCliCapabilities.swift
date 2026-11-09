@@ -9,10 +9,10 @@ struct ClassicCliPublicDevice: Codable, Equatable, Sendable {
     let profile: String?
     var effectiveRevision: Int { revision ?? 0 }
     func validate(for device: ClassicCliDevice, minimumRevision: Int = 0) throws {
-        let allowed = Set(ClassicVideoModels.supported + ["dreamina-multiframe"])
+        let allowed = Set(ClassicVideoModels.supported + ["dreamina-multiframe"] + ClassicImageModels.supported)
         guard id == device.id, epoch == device.epoch,
               effectiveRevision >= minimumRevision, effectiveRevision <= 9_007_199_254_740_991,
-              !models.isEmpty, models.count <= 7, Set(models).count == models.count,
+              !models.isEmpty, models.count <= 7 + ClassicImageModels.supported.count, Set(models).count == models.count,
               Set(models).isSubset(of: allowed) else { throw DreaminaError.wrongOwner }
     }
 }
@@ -23,8 +23,8 @@ struct ClassicCliCapabilityPayload: Codable, Equatable, Sendable {
     init(current: ClassicCliPublicDevice, models: [String]) throws {
         guard current.effectiveRevision >= 0, current.effectiveRevision < 9_007_199_254_740_991 else { throw DreaminaError.invalidResponse }
         let sorted = Array(Set(models)).sorted()
-        guard !sorted.isEmpty, sorted.count <= 7,
-              Set(sorted).isSubset(of: Set(ClassicVideoModels.supported + ["dreamina-multiframe"])) else { throw DreaminaError.invalidResponse }
+        guard !sorted.isEmpty, sorted.count <= 7 + ClassicImageModels.supported.count,
+              Set(sorted).isSubset(of: Set(ClassicVideoModels.supported + ["dreamina-multiframe"] + ClassicImageModels.supported)) else { throw DreaminaError.invalidResponse }
         expectedRevision = current.effectiveRevision; profile = "resolution-five"; self.models = sorted
     }
     func validateReceipt(_ receipt: ClassicCliPublicDevice, device: ClassicCliDevice) throws {

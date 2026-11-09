@@ -38,7 +38,8 @@ struct ClassicStudioBridge: ClassicCliBridge, @unchecked Sendable {
         var request = client.request(path: "api/local-cli/tasks/" + task.id + "/result-upload", method: "POST", session: session, workspace: workspace,
                                      query: [URLQueryItem(name: "name", value: "result." + file.pathExtension), URLQueryItem(name: "size", value: String(size)), URLQueryItem(name: "projectId", value: task.projectId)])
         request.httpBody = try Data(contentsOf: file, options: .mappedIfSafe)
-        request.setValue(file.pathExtension == "webm" ? "video/webm" : file.pathExtension == "mov" ? "video/quicktime" : "video/mp4", forHTTPHeaderField: "Content-Type")
+        let contentType = task.snapshot.isImage ? try ClassicImageModels.contentType(file) : file.pathExtension == "webm" ? "video/webm" : file.pathExtension == "mov" ? "video/quicktime" : "video/mp4"
+        request.setValue(contentType, forHTTPHeaderField: "Content-Type")
         request.setValue(String(size), forHTTPHeaderField: "Content-Length")
         request.setValue(device.id, forHTTPHeaderField: "X-Local-CLI-Device")
         request.setValue(device.secret, forHTTPHeaderField: "X-Local-CLI-Secret")
@@ -799,8 +800,8 @@ struct ClassicCliClaimResponse: Decodable {
                     if let task = claim.task {
                         self.claimed=true
                         defer {self.claimed=false}
-                        self.status = task.submitId == nil && task.stage != "awaiting-confirmation" ? "提交结果待核对，请勿重新生成" : "本机视频处理中"
-                        try await executor.step(task: task, owner: owner, bridge: bridge, isCurrent: bridge.current, validateVideo: { try await Self.validateVideo($0) })
+                        self.status = task.submitId == nil && task.stage != "awaiting-confirmation" ? "提交结果待核对，请勿重新生成" : task.snapshot.isImage ? "本机图片处理中" : "本机视频处理中"
+                        try await executor.step(task: task, owner: owner, bridge: bridge, isCurrent: bridge.current, validateVideo: { file in if task.snapshot.isImage { try ClassicImageModels.validateResult(file) } else { try await Self.validateVideo(file) } })
                     } else { self.status = "已连接 · 使用本机即梦登录" }
                     // Apply hints only after a successful serial step or an acknowledged idle claim.
                     // Failed preparation/query/upload always retains the ten-second backoff.
@@ -842,6 +843,7 @@ struct ClassicCliClaimResponse: Decodable {
 enum ClassicCliConfirmation {
     static func text(_ snapshot: ClassicVideoSnapshot) -> String {
         let mode = snapshot.effectiveMode
+        if snapshot.isImage { return "\(mode == "text2image" ? "文生图" : "图生图") · \(ClassicImageModels.title(snapshot.model)) · \(snapshot.aspect) · \(snapshot.resolution.uppercased()) · 1张\n参考图片：\((snapshot.references ?? []).count)张\n\(snapshot.prompt.prefix(500))\n使用当前本机即梦额度；画布点击生成后直接执行。" }
         let title = ["text":"文生视频", "image":"单图视频", "firstlast":"首尾帧", "imageref":"多帧故事", "omni":"全能参考"][mode] ?? mode
         let references = snapshot.references ?? []
         let counts = ["image":"图", "video":"视频", "audio":"音频"]
