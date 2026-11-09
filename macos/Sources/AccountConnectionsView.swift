@@ -275,7 +275,7 @@ private struct WebsiteLogo: View {
             }.font(.system(size: 12))
         }.frame(maxWidth: .infinity)
     }
-    private func modelList(_ models: [String]) -> String { models.isEmpty ? "无" : models.map(ClassicVideoModels.title).joined(separator: "、") }
+    private func modelList(_ models: [String]) -> String { models.isEmpty ? "无" : models.map { ClassicImageModels.contains($0) ? ClassicImageModels.title($0) : ClassicVideoModels.title($0) }.joined(separator: "、") }
     private func context(_ label: String, value: String) -> some View {
         VStack(spacing: 4) {
             Text(label).font(.system(size: 10)).foregroundStyle(.secondary)

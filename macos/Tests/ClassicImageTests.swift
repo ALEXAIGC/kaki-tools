@@ -36,6 +36,19 @@ private actor ImageFixtureBridge: ClassicCliBridge {
     try snapshot.validate(); try snapshot.validateRecovery()
     let argv = try ClassicDreaminaCLI.arguments(snapshot, files: [])
     try check(argv == ["text2image","--prompt",snapshot.prompt,"--model_version","5.0","--resolution_type","2k","--ratio","1:1","--generate_num","1","--poll","0"], "image argv is explicit, single-result and uses no shell/video arguments")
+    let reference = ClassicCliReference(nodeId:"ref",kind:"image",source:"/api/private-files/00000000-0000-4000-8000-000000000001.png",sha256:String(repeating:"a",count:64),bytes:10,mediaType:"image/png",extension:"png",duration:nil)
+    var withImage = snapshot
+    withImage.mode = "image2image"; withImage.references = [reference]
+    let referenceFile = URL(fileURLWithPath:"/tmp/kaki-image-reference.png")
+    let referenceArgs = try ClassicDreaminaCLI.arguments(withImage, files:[referenceFile])
+    try check(referenceArgs.first == "image2image" && Array(referenceArgs.suffix(2)) == ["--images",referenceFile.path], "image reference uses the image command and local files")
+    do { _ = try ClassicDreaminaCLI.arguments(withImage, files:[]); throw NativeTestFailure(description:"image accepted missing reference file") } catch DreaminaError.invalidResponse {}
+    withImage.references = [reference,reference]
+    do { try withImage.validate(); throw NativeTestFailure(description:"image accepted duplicate references") } catch DreaminaError.invalidResponse {}
+    let video = ClassicVideoSnapshot(prompt:"video remains available",model:"seedance2.0fast",duration:5,aspect:"16:9",resolution:"720p",mode:"text",profile:"resolution-five")
+    try video.validate()
+    let videoArgs = try ClassicDreaminaCLI.arguments(video, files:[])
+    try check(videoArgs.first == "text2video" && videoArgs.contains("--video_resolution") && !videoArgs.contains("--generate_num"), "existing video command keeps its video contract")
     let help = DreaminaOutput(status:0,data:Data("--images --prompt --model_version --resolution_type --ratio --generate_num --poll 2k 4k 4.0 5.0 5.0Pro".utf8))
     try check(ClassicImageModels.detected(textHelp:help,imageHelp:help) == ["seedream-4.0","seedream-5.0","seedream-5.0Pro"],"only exact model tokens advertised")
     try check(ClassicImageModels.detected(textHelp:help,imageHelp:DreaminaOutput(status:1,data:Data())).isEmpty,"old CLI never advertises images")

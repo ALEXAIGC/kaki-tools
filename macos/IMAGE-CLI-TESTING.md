@@ -1,6 +1,6 @@
 # 即梦图片候选 · Mac 测试
 
-本候选为 Frame 图片节点增加本机 text2image / image2image 执行。没有改变安装包版本，也没有发布安装包。Windows 已完成 Studio 定向类型与任务测试；本仓库 Swift 编译和以下原生测试须在 Mac 上执行。
+1.5.19 源码在原有视频能力上增加 Frame 图片节点的本机 text2image / image2image 执行，共用现有 Studio 连接和任务恢复流程。尚未发布1.5.19安装包。Windows 已完成 Studio 定向类型与任务测试；本仓库 Swift 编译和以下原生测试须在 Mac 上执行。
 
 ## 本机自动测试（不调用真实 CLI、不消耗即梦额度）
 
@@ -26,7 +26,7 @@ bash scripts/run-macos-native.sh
 
 ## 实机联调前提
 
-Studio 必须包含本次图片 CLI 后端和前端改动。仅更新 Tools 不能令旧版 Studio 支持图片。当前 Studio 改动保留在 Windows 活动工作区，尚未部署，因此暂不能把正式站作为本候选的完整联调环境。
+Studio 对应前后端已于2026-11-09 20:37（北京时间）部署到 https://kakitv.com，网站候选334c087692b3cc949ca9。网站端类型、构建、66项浏览器、97项Linux相关测试与207项公网检查通过；这不代表 Mac 原生编译或真实 CLI 生成已验证。
 
 在 Tools 的账号与连接页面重新检测 CLI，连接本人 Studio 账号和目标工作区。只会公布 text2image、image2image 两个 help 都支持的型号。旧 CLI 仍可用视频能力，不会伪报图片支持。
 

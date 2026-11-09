@@ -327,7 +327,7 @@ struct ClassicCliClaimResponse: Decodable {
         guard !busy else {return}
         guard let executable = locator() else {installed = false; loggedIn = false; loginChecked = false; needsUpgrade = false; version = ""; status = "未安装即梦 CLI，请点击安装；网页登录不能替代本机 CLI"; return}
         installed = true
-        busy = true; actionTitle = "检查连接"; loginChecked = false; status = "检查 CLI 与五种视频方式…"
+        busy = true; actionTitle = "检查连接"; loginChecked = false; status = "检查 CLI 图片与视频能力…"
         let ticket = generation, op=UUID();operationID=op
         operation = Task { [weak self] in
             guard let self else {return}
