@@ -43,7 +43,7 @@ private func studioLoginStep(delay: UInt64 = 0) -> StudioStubStep {
     let secret = StudioSession(value: "test-session", expiresAt: Date().addingTimeInterval(600))
     let api = StudioClient(environment: .test, transport: StudioStubTransport([]))
     let privateRequest = try api.mediaRequest("/api/private-files/asset-a", session: secret, workspace: "ws-a")
-    try check(privateRequest.url?.absoluteString == "https://test.kakiai.xin/api/private-files/asset-a", "relative private media stays on the chosen origin")
+    try check(privateRequest.url?.absoluteString == "https://test.kakitv.com/api/private-files/asset-a", "relative private media stays on the chosen origin")
     try check(privateRequest.value(forHTTPHeaderField: "Cookie") == "kaki_session=test-session", "private media carries Studio cookie")
     try check(privateRequest.value(forHTTPHeaderField: "X-Workspace-Id") == "ws-a", "private media carries selected workspace")
     let external = try api.mediaRequest("https://example.invalid/image.jpg", session: secret, workspace: "ws-a")
@@ -88,7 +88,7 @@ private func studioLoginStep(delay: UInt64 = 0) -> StudioStubStep {
     try check(firstRequests[2].url?.query?.contains("pageSize=40") == true && firstRequests[2].value(forHTTPHeaderField: "X-Workspace-Id") == "ws-a", "asset list uses explicit pagination and selected membership")
     let referenceText = try store.referenceText(ids: ["asset-a"])
     let envelope = try JSONDecoder().decode(StudioReferenceEnvelope.self, from: Data(referenceText.dropFirst(StudioReferenceEnvelope.prefix.count).utf8))
-    try check(envelope.items == [StudioMaterialReference(source: "asset", id: "asset-a", workspaceId: "ws-a")] && envelope.origin == "https://test.kakiai.xin", "asset clipboard contains only scoped canonical ids")
+    try check(envelope.items == [StudioMaterialReference(source: "asset", id: "asset-a", workspaceId: "ws-a")] && envelope.origin == "https://test.kakitv.com", "asset clipboard contains only scoped canonical ids")
     try check(!referenceText.contains("private-a") && !referenceText.contains("session") && !referenceText.contains("人物"), "references contain no bytes, URLs, names or credentials")
     let afterReference = await transport.requests.count
     try check(afterReference == firstRequests.count, "copying a reference performs no media or metadata requests")
@@ -211,7 +211,7 @@ private func studioLoginStep(delay: UInt64 = 0) -> StudioStubStep {
     await deniedStore.login(email: "a@example.invalid", password: "test", code: "")
     let deniedPoster = await deniedStore.thumbnail(deniedStore.assets[0])
     try check(deniedPoster == nil && deniedStore.user == nil && credentials.sessions[.test] == nil, "one-byte video probe preserves 401 handling and removes expired credentials")
-    let late = StudioStubTransport([studioLoginStep(), StudioStubStep(path: "/api/workspaces", json: studioWorkspaceJSON), StudioStubStep(path: "/api/assets", json: videoPage), StudioStubStep(path: "/api/private-files/video-a", status: 206, headers: ["Content-Type":"video/mp4", "Content-Range":"bytes 0-0/100"], json: "x", delay: 120_000_000), StudioStubStep(path: "/api/jobs", json: "[]")])
+    let late = StudioStubTransport([studioLoginStep(), StudioStubStep(path: "/api/workspaces", json: studioWorkspaceJSON), StudioStubStep(path: "/api/assets", json: videoPage), StudioStubStep(path: "/api/private-files/video-a", status: 206, headers: ["Content-Type":"video/mp4", "Content-Range":"bytes 0-0/100"], json: "x", delay: 120_000_000), StudioStubStep(path: "/api/material-references/recent", json: "[]")])
     let store = StudioStore(directory: directory, credentials: StudioMemoryCredentials(), transport: late)
     await store.login(email: "a@example.invalid", password: "test", code: "")
     let stream = try store.videoStream(store.assets[0])
@@ -272,11 +272,11 @@ private func studioLoginStep(delay: UInt64 = 0) -> StudioStubStep {
     let justDone = #"[{"id":"pending-job","type":"image","status":"done","model":"NewModel","outputUrl":"/api/private-files/just-done","createdAt":"2026-10-03T00:02:00Z"}]"#
     let recent = StudioStubTransport([
         studioLoginStep(), StudioStubStep(path: "/api/workspaces", json: studioWorkspaceJSON), StudioStubStep(path: "/api/assets", json: empty),
-        StudioStubStep(path: "/api/jobs", json: jobs), StudioStubStep(path: "/api/jobs", json: jobs),
-        StudioStubStep(path: "/api/jobs", json: justDone),
-        StudioStubStep(path: "/api/jobs", json: jobs, delay: 120_000_000),
+        StudioStubStep(path: "/api/material-references/recent", json: jobs), StudioStubStep(path: "/api/material-references/recent", json: jobs),
+        StudioStubStep(path: "/api/material-references/recent", json: justDone),
+        StudioStubStep(path: "/api/material-references/recent", json: jobs, delay: 120_000_000),
         StudioStubStep(path: "/api/assets", json: try page(["saved"], total: 1)),
-        StudioStubStep(path: "/api/jobs", status: 401, json: #"{"error":"expired"}"#)
+        StudioStubStep(path: "/api/material-references/recent", status: 401, json: #"{"error":"expired"}"#)
     ])
     let recentStore = StudioStore(directory: directory, credentials: StudioMemoryCredentials(), transport: recent)
     await recentStore.login(email: "a@example.invalid", password: "test", code: "")
@@ -299,8 +299,8 @@ private func studioLoginStep(delay: UInt64 = 0) -> StudioStubStep {
     try check(recentStore.user == nil && recentStore.assets.isEmpty && recentStore.source == .library, "generation endpoint expiry clears identity and all prior material")
     await recentStore.logout()
     let requests = await recent.requests
-    let jobRequests = requests.filter { $0.url?.path == "/api/jobs" }
-    try check(jobRequests.count == 5 && jobRequests.allSatisfy { $0.httpMethod == "GET" && $0.value(forHTTPHeaderField: "Cookie") != nil && $0.value(forHTTPHeaderField: "X-Workspace-Id") == nil && $0.url?.query == nil }, "generation history uses authenticated account scope, without falsely claiming workspace or server search filters")
+    let jobRequests = requests.filter { $0.url?.path == "/api/material-references/recent" }
+    try check(jobRequests.count == 5 && jobRequests.allSatisfy { $0.httpMethod == "GET" && $0.value(forHTTPHeaderField: "Cookie") != nil && $0.value(forHTTPHeaderField: "X-Workspace-Id") == "ws-a" && $0.url?.query == nil }, "generation history uses the dedicated authenticated workspace endpoint")
     try check(requests.allSatisfy { $0.httpMethod == "GET" || ["/api/auth/login", "/api/auth/logout"].contains($0.url?.path) }, "sync never saves assets, triggers generation or writes Studio data")
     try check(recentStore.assets.isEmpty && recentStore.source == .library, "logout clears recent generated results and source state")
 }
@@ -377,7 +377,7 @@ private func studioLoginStep(delay: UInt64 = 0) -> StudioStubStep {
     defer { try? FileManager.default.removeItem(at: directory) }
     let history = HistoryStore(directory: directory)
     let clipboard = ClipboardService(store: history, pasteboard: board)
-    let text = try StudioReferenceEnvelope(version: 1, origin: "https://test.kakiai.xin", items: [StudioMaterialReference(source: "job", id: "abc", workspaceId: nil)]).clipboardText()
+    let text = try StudioReferenceEnvelope(version: 1, origin: "https://test.kakitv.com", items: [StudioMaterialReference(source: "job", id: "abc", workspaceId: nil)]).clipboardText()
     try check(clipboard.writeStudioReferences(text) != nil && board.string(forType: .string) == text && board.data(forType: .png) == nil, "reference write is browser-readable text without image data")
     clipboard.captureNow()
     try check(history.items.isEmpty, "own reference write is not recaptured as clipboard history")

@@ -87,10 +87,10 @@ private struct BrokenInspectionRunner:DreaminaRunning {
     connection.identityChanged()
     try await Task.sleep(nanoseconds:150_000_000)
     try check(!connection.connected && !connection.busy && connection.status.contains("重新连接"), "identity invalidation clears connection and prevents stale detection callback")
-    try check(connection.targetDescription.contains("测试站 · test.kakiai.xin") && connection.targetDescription.contains("未选择工作区"), "unassociated CLI names the exact current site and workspace")
+    try check(connection.targetDescription.contains("测试站 · test.kakitv.com") && connection.targetDescription.contains("未选择工作区"), "unassociated CLI names the exact current site and workspace")
     await studio.changeEnvironment(.production)
     connection.identityChanged()
-    try check(connection.targetDescription.contains("正式站 · kakiai.xin") && !connection.targetDescription.contains("test.kakiai.xin"), "production target never displays the old test origin")
+    try check(connection.targetDescription.contains("正式站 · kakitv.com") && !connection.targetDescription.contains("test.kakitv.com"), "production target never displays the old test origin")
     await inspector.configure(hang:false)
     connection.detect();try await until {!connection.busy}
     try check(connection.status == "已安装 · 请登录即梦" && connection.loginChecked && !connection.loggedIn,"real not logged in outcome without swallowing network errors")

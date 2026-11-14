@@ -230,7 +230,7 @@ import ImageIO
         defer { if generation == revision && searchGeneration == searchRevision { loadingAssets = false } }
         do {
             let page: StudioAssetPage
-            if source == .recent { page = try await api.recent(saved, query: text) }
+            if source == .recent { page = try await api.recent(saved, workspace: ws, query: text) }
             else { page = try await api.assets(saved, workspace: ws, query: text, cursor: cursor) }
             guard generation == revision && searchGeneration == searchRevision else { return }
             var result = page.items, resultCursor = page.nextCursor

@@ -8,7 +8,7 @@ enum StudioEnvironment: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var label: String { self == .test ? "测试环境" : "正式环境" }
     var siteLabel: String { self == .test ? "测试站" : "正式站" }
-    var baseURL: URL { URL(string: self == .test ? "https://test.kakiai.xin" : "https://kakiai.xin")! }
+    var baseURL: URL { URL(string: self == .test ? "https://test.kakitv.com" : "https://kakitv.com")! }
 }
 struct StudioUser: Codable, Equatable {
     let id: String
@@ -321,9 +321,8 @@ struct StudioClient {
         let (data, _) = try await json(request(path: "api/assets", session: session, workspace: workspace, query: params))
         return try JSONDecoder().decode(StudioAssetPage.self, from: data)
     }
-    func recent(_ session: StudioSession, query: String) async throws -> StudioAssetPage {
-        // Do not send workspace/search parameters: the existing API ignores them.
-        let (data, _) = try await json(request(path: "api/jobs", session: session))
+    func recent(_ session: StudioSession, workspace: String, query: String) async throws -> StudioAssetPage {
+        let (data, _) = try await json(request(path: "api/material-references/recent", session: session, workspace: workspace))
         let items = try JSONDecoder().decode([StudioJob].self, from: data).prefix(50).compactMap(\.asset)
         let matches = items.filter { query.isEmpty || $0.title.localizedStandardContains(query) }
         return StudioAssetPage(items: matches, total: matches.count, nextCursor: nil)
@@ -334,7 +333,10 @@ struct StudioClient {
         guard let url = URL(string: raw, relativeTo: environment.baseURL)?.absoluteURL, url.scheme == "https", url.user == nil, url.password == nil, url.port == nil || url.port == 443, let host = url.host else { throw StudioError.invalidURL }
         // Test and production identities/objects must never be mixed.
         let other = environment == .test ? StudioEnvironment.production : .test
-        guard host != other.baseURL.host, host != (environment == .test ? "media-studio.kakiai.xin" : "media-studio-test.kakiai.xin") else { throw StudioError.invalidURL }
+        let otherHosts: Set<String> = environment == .test
+            ? ["kakitv.com", "kakiai.xin", "media-studio.kakiai.xin"]
+            : ["test.kakitv.com", "test.kakiai.xin", "media-studio-test.kakiai.xin"]
+        guard host != other.baseURL.host, !otherHosts.contains(host) else { throw StudioError.invalidURL }
         var request = URLRequest(url: url)
         if host == environment.baseURL.host {
             guard url.path.hasPrefix("/api/private-files/") || url.path.hasPrefix("/api/files/") else { throw StudioError.invalidURL }
